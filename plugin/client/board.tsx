@@ -349,7 +349,7 @@ function SectionView({ section, theme, styles }: { section: Section; theme: Plug
       k.endsWith("_profile") ? profileNames
       : k === "max_parallel_threads" ? num([1, 2, 3, 4, 5, 6, 8, 10])
       : k === "auto_resolve_days" ? num([0, 1, 2, 3, 5, 7, 14, 30], "不自动")
-      : k === "nudge" || k === "mute" ? onOff : null;
+      : k === "nudge" || k === "mute" || k === "pr_checks" ? onOff : null;
     return (
       <View>
         <Text style={styles.meta}>点一行展开，点选项就保存。项目设置直接生效；安全设置和 profile 只能由你改，保存时会弹出 macOS 对话框，点 Allow 才生效。</Text>

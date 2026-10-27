@@ -37,7 +37,7 @@ Say what you want once. The coordinator proposes threads and waits for your go-a
 
 ### 💬 Know when a thread needs an answer
 
-Agents report their own progress, so a thread that asked you something shows `needs you` even when it looks idle. A background ticker copies reports home, writes inbox items when a thread changes state, follows pull requests (failing checks and review comments go back to the thread), resolves a thread when its pull request is merged, runs routines, and nudges the coordinator when its inbox has something new.
+Agents report their own progress, so a thread that asked you something shows `needs you` even when it looks idle. A background ticker copies reports home, writes inbox items when a thread changes state, follows pull requests (failing checks and review comments go back to the thread; `pr_checks = false` ignores CI results), resolves a thread when its pull request is merged, runs routines, and nudges the coordinator when its inbox has something new.
 
 ### 🔁 Pick up where an agent left off
 

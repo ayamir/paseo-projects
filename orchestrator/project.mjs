@@ -21,7 +21,7 @@ asking the coordinator.
 `;
 const PR_FOLLOWUP_TEMPLATE = '+++\non = "pr"\nevents = ["checks-failed", "review"]\nenabled = true\n+++\n\nFix the failing checks and address the new review comments on your pull request. Read them with `gh`, push the fixes, reply where a reviewer asked something, and then rewrite your report. If a comment asks for something outside your task, say so in the report instead of doing it.\n';
 
-export const DEFAULT_SETTINGS = { name: "", goal: "", repos: [], coordinator_profile: "", thread_profile: "", max_parallel_threads: 10, auto_resolve_days: 7, nudge: true, mute: false };
+export const DEFAULT_SETTINGS = { name: "", goal: "", repos: [], coordinator_profile: "", thread_profile: "", max_parallel_threads: 10, auto_resolve_days: 7, nudge: true, mute: false, pr_checks: true };
 
 export function rootOf(opts = {}) {
   return resolve(opts.root ?? defaultRoot());
@@ -104,7 +104,7 @@ export function writeAgentsMd(project) {
 }
 
 export function frontMatter(settings) {
-  const lines = ["name", "goal", "coordinator_profile", "thread_profile", "max_parallel_threads", "auto_resolve_days", "nudge", "mute"].map((k) => tomlLine(k, settings[k] ?? DEFAULT_SETTINGS[k]));
+  const lines = ["name", "goal", "coordinator_profile", "thread_profile", "max_parallel_threads", "auto_resolve_days", "nudge", "mute", "pr_checks"].map((k) => tomlLine(k, settings[k] ?? DEFAULT_SETTINGS[k]));
   for (const r of settings.repos ?? []) {
     lines.push("", "[[repos]]", tomlLine("path", r.path));
     if (r.machine) lines.push(tomlLine("machine", r.machine));
@@ -146,6 +146,7 @@ export function writeSettings(project, settings) {
 export const SET_KEYS = {
   name: "text", goal: "text", coordinator_profile: "profile name", thread_profile: "profile name",
   max_parallel_threads: "number", auto_resolve_days: "number (0 = never)", nudge: "true/false", mute: "true/false",
+  pr_checks: "true/false (false: CI check results are ignored: no inbox item, notification or checks-failed routine)",
   "repos.add": "PATH or PATH@MACHINE", "repos.remove": "PATH",
 };
 export function applySetting(settings, key, value) {
@@ -156,7 +157,7 @@ export function applySetting(settings, key, value) {
     case "name": case "goal": case "coordinator_profile": case "thread_profile": s[key] = value; break;
     case "max_parallel_threads": s[key] = Math.max(1, num(value)); break;
     case "auto_resolve_days": s[key] = num(value); break;
-    case "nudge": case "mute": s[key] = bool(value); break;
+    case "nudge": case "mute": case "pr_checks": s[key] = bool(value); break;
     case "repos.add": {
       const r = parseRepoArg(value);
       if (!r.path.startsWith("/")) throw new Error("a repo path must be absolute");

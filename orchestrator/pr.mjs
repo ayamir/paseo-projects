@@ -105,6 +105,9 @@ export function findByBranch(origin, branch) {
   return listed[0]?.url ?? null;
 }
 
+/** With `pr_checks = false` CI results are left out, so a check-only change is no change at all. */
+export const withChecks = (s, on = true) => (on ? s : { ...s, failing_checks: [] });
+
 /** One line of what changed between two summaries; fields only. */
 export function describeChange(old, s) {
   const parts = [`state ${s.state}`];

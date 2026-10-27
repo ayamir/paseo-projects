@@ -9,7 +9,7 @@ import * as tasks from "./tasks.mjs";
 import * as routines from "./routines.mjs";
 
 export const SECTIONS = ["tasks", "routines", "settings", "memory"];
-const SETTING_KEYS = ["name", "goal", "coordinator_profile", "thread_profile", "max_parallel_threads", "auto_resolve_days", "nudge", "mute"];
+const SETTING_KEYS = ["name", "goal", "coordinator_profile", "thread_profile", "max_parallel_threads", "auto_resolve_days", "nudge", "mute", "pr_checks"];
 
 export function boardData(root, section, kinds) {
   if (!SECTIONS.includes(section)) throw new Error(`usage: pp board ${SECTIONS.join("|")}`);

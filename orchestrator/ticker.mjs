@@ -186,7 +186,7 @@ async function followPrs(project, settings, state, agents, at) {
         }
         continue;
       }
-      const s = reduced.summary;
+      const s = pr.withChecks(reduced.summary, settings.pr_checks);
       const old = t.pr === url ? t.pr_summary ?? null : null;
       if (JSON.stringify(old) !== JSON.stringify(s)) {
         const events = pr.prEvents(old, s, ownOf(t.origin));

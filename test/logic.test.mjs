@@ -281,3 +281,12 @@ test("board editArgs: each scope maps to its pp command; nothing reads as a flag
   assert.throws(() => editArgs({ scope: "project", target: "../x", key: "name", value: "n" }), /not a project/);
   assert.throws(() => editArgs({ scope: "profile", target: "rev", key: "arg", value: "" }), /not a profile field/);
 });
+
+test("pr_checks off: a check-only change is no change, so no inbox item, event or routine", () => {
+  const old = { state: "OPEN", review_decision: "", failing_checks: [], comment_count: 0, commenters: [], activity: {} };
+  const now = { ...old, failing_checks: ["ci"] };
+  assert.deepEqual(pr.prEvents(old, pr.withChecks(now, true), "me"), ["checks-failed"]);
+  assert.deepEqual(pr.withChecks(now, false), old);
+  assert.deepEqual(pr.prEvents(old, pr.withChecks(now, false), "me"), []);
+  assert.equal(applySetting({ repos: [] }, "pr_checks", "false").pr_checks, false);
+});

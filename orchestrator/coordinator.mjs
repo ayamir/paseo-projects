@@ -124,7 +124,7 @@ export async function context(project, { peek = false } = {}) {
   if (error) out.push(`PROJECT.md does not parse: ${error}. Fix it before anything else; defaults are used meanwhile.`);
   out.push(`Name: ${project.displayName(settings)}`);
   out.push(`Goal: ${settings.goal.trim() || "(none set)"}`);
-  out.push(`Settings: coordinator_profile=${settings.coordinator_profile || "-"} thread_profile=${settings.thread_profile || "-"} max_parallel_threads=${settings.max_parallel_threads} auto_resolve_days=${settings.auto_resolve_days} nudge=${settings.nudge} mute=${settings.mute}`);
+  out.push(`Settings: coordinator_profile=${settings.coordinator_profile || "-"} thread_profile=${settings.thread_profile || "-"} max_parallel_threads=${settings.max_parallel_threads} auto_resolve_days=${settings.auto_resolve_days} nudge=${settings.nudge} mute=${settings.mute} pr_checks=${settings.pr_checks}`);
   out.push(`Safety: yolo=${onOff(safety.yolo)} start_threads=${safety.start_threads} routine_commands=${onOff(safety.routine_commands)}`);
   const profiles = usable(config, safety, "thread");
   out.push("Thread profiles:" + (profiles.length ? "" : " (none in config.json; the built-in provider names work)"));
