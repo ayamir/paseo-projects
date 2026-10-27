@@ -1,0 +1,16 @@
+{
+  "name": "paseo-projects",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "bin": {
+    "pp": "bin/pp.mjs"
+  },
+  "scripts": {
+    "pp": "node bin/pp.mjs",
+    "test": "node --test test/"
+  },
+  "dependencies": {
+    "@getpaseo/client": "^0.13.2"
+  }
+}

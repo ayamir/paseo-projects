@@ -1,0 +1,13 @@
+node_modules/
+# Your own data and config: never commit them.
+projects/
+config.json
+config.json.*
+approved-routines.json
+*.log
+.state/
+# Old prototypes and their runs
+.trash/
+step0/
+tasks/
+.DS_Store

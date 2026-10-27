@@ -1,0 +1,8 @@
+{
+  "id": "paseo-projects",
+  "media": [],
+  "requirements": {
+    "paseo": ">=0.13.2"
+  },
+  "name": "Paseo Projects"
+}
