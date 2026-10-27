@@ -180,6 +180,7 @@ function SectionView({ section, theme, styles }: { section: Section; theme: Plug
   const editRpc = useRpc(boardEditRpc);
   const [editing, setEditing] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
+  const [pick, setPick] = useState("");
   const q = useQuery({ queryKey: ["pp-board", section], queryFn: () => load({ section }), refetchInterval: 10000 });
   const [shown, setShown] = useState<string | null>(null);
   const run = useMutation({
@@ -266,71 +267,166 @@ function SectionView({ section, theme, styles }: { section: Section; theme: Plug
   }
 
   if (section === "settings") {
+    type Opt = { value: string; label: string };
+    const ch = data.choices ?? { providers: [], repos: [] };
+    const kindOf = (prov: string) => prov.split("/")[0];
+    const modelOf = (prov: string) => prov.split("/").slice(1).join("/");
+    const providerOf = (kind: string) => ch.providers.find((p: any) => p.kind === kind) ?? { kind, models: [], modes: [] };
+    const profileNames: Opt[] = data.profiles.map((p: any) => ({ value: p.name, label: p.name }));
+    const onOff: Opt[] = [{ value: "true", label: "开" }, { value: "false", label: "关" }];
+    const inherit: Opt = { value: "default", label: "跟随上级" };
+    const withCurrent = (opts: Opt[], cur: string) => (cur && !opts.some((o) => o.value === cur) ? [{ value: cur, label: cur }, ...opts] : opts);
     const input = { color: theme.colors.foreground, borderColor: theme.colors.surface1, borderWidth: 1, borderRadius: 6, padding: 6, fontSize: 13, marginVertical: 6 } as const;
-    // One editable row: tap it, change the text, save. `initial` is what the box starts with.
-    const field = (e: Omit<Edit, "value">, label: string, shownValue: string, initial: string, hint = "") => {
-      const k = `${e.scope}/${e.target}/${e.key}`;
+    const chip = (o: Opt, on: boolean, onPress: () => void) => (
+      <Pressable key={o.value} accessibilityRole="button" accessibilityState={{ selected: on }} accessibilityLabel={o.label} disabled={edit.isPending} onPress={onPress}
+        style={{ paddingVertical: 4, paddingHorizontal: 10, borderRadius: 999, marginRight: 6, marginBottom: 6, backgroundColor: on ? theme.colors.accent : theme.colors.surface1, opacity: edit.isPending ? 0.5 : 1 }}>
+        <Text style={{ fontSize: 12, color: on ? theme.colors.accentForeground : theme.colors.foreground }}>{o.label}</Text>
+      </Pressable>
+    );
+    const chips = (opts: Opt[], cur: string, onPick: (v: string) => void) => (
+      <View style={{ flexDirection: "row", flexWrap: "wrap" as const, marginTop: 6 }}>{opts.map((o) => chip(o, o.value === cur, () => onPick(o.value)))}</View>
+    );
+    // A row that opens on tap; `body` is what it shows open.
+    const row = (k: string, label: string, shown: string, body: () => any, open?: () => void) => (
+      <View key={k}>
+        <Pressable accessibilityRole="button" accessibilityLabel={`修改 ${label}`} onPress={() => { if (editing === k) setEditing(null); else { setEditing(k); open?.(); } }}>
+          <Text style={styles.mono}>{label.padEnd(22)} {shown || "—"}  {editing === k ? "▾" : "▸"}</Text>
+        </Pressable>
+        {editing === k && <View style={{ marginBottom: 6 }}>{body()}</View>}
+      </View>
+    );
+    // Choosing one option saves it at once.
+    const choose = (e: Omit<Edit, "value">, label: string, shown: string, cur: string, opts: Opt[], hint = "") =>
+      row(`${e.scope}/${e.target}/${e.key}`, label, shown, () => (<>{hint ? <Text style={styles.meta}>{hint}</Text> : null}{chips(withCurrent(opts, cur), cur, (v) => edit.mutate({ ...e, value: v }))}</>));
+    // Free text has no options: a name, a goal, a description.
+    const text = (e: Omit<Edit, "value">, label: string, cur: string) =>
+      row(`${e.scope}/${e.target}/${e.key}`, label, cur, () => (
+        <>
+          <TextInput style={input} value={draft} onChangeText={setDraft} autoFocus multiline={e.key === "goal"} accessibilityLabel={label} />
+          <View style={{ flexDirection: "row" }}>
+            <Btn label="保存" primary theme={theme} disabled={edit.isPending} onPress={() => edit.mutate({ ...e, value: draft.trim() })} />
+            <Btn label="取消" theme={theme} onPress={() => setEditing(null)} />
+          </View>
+        </>
+      ), () => setDraft(cur));
+    // Several profile names; saved with one button. Empty means any profile.
+    const many = (e: Omit<Edit, "value">, label: string, shown: string, cur: string[]) => {
+      const set = draft.split(" ").filter(Boolean);
+      return row(`${e.scope}/${e.target}/${e.key}`, label, shown, () => (
+        <>
+          <View style={{ flexDirection: "row", flexWrap: "wrap" as const, marginTop: 6 }}>
+            {profileNames.map((o) => chip(o, set.includes(o.value), () => setDraft((set.includes(o.value) ? set.filter((x) => x !== o.value) : [...set, o.value]).join(" "))))}
+          </View>
+          <View style={{ flexDirection: "row", flexWrap: "wrap" as const }}>
+            <Btn label={set.length ? `只允许这 ${set.length} 个` : "任意 profile"} primary theme={theme} disabled={edit.isPending} onPress={() => edit.mutate({ ...e, value: set.join(" ") })} />
+            <Btn label="跟随上级" theme={theme} disabled={edit.isPending} onPress={() => edit.mutate({ ...e, value: "default" })} />
+          </View>
+        </>
+      ), () => setDraft(cur.join(" ")));
+    };
+    // Provider in two steps: the kind, then its model ("默认模型": the kind alone).
+    const providerPicker = (cur: string, onPick: (prov: string) => void) => {
+      const kind = pick || kindOf(cur);
+      const models: Opt[] = [{ value: "", label: "默认模型" }, ...providerOf(kind).models.map((m: any) => ({ value: m.id, label: m.label }))];
       return (
-        <View key={k}>
-          <Pressable accessibilityRole="button" accessibilityLabel={`修改 ${label}`} onPress={() => { setEditing(editing === k ? null : k); setDraft(initial); }}>
-            <Text style={styles.mono}>{label.padEnd(22)} {shownValue || "—"}  ✎</Text>
-          </Pressable>
-          {editing === k && (
-            <View>
-              {hint ? <Text style={styles.meta}>{hint}</Text> : null}
-              <TextInput style={input} value={draft} onChangeText={setDraft} autoFocus multiline={e.key === "goal"} accessibilityLabel={label} />
-              <View style={{ flexDirection: "row" }}>
-                <Btn label="保存" primary theme={theme} disabled={edit.isPending} onPress={() => { const w = draft.trim().split(/\s+/); edit.mutate(e.key === "add" ? { ...e, target: w[0] ?? "", value: w.slice(1).join(" ") } : { ...e, value: draft.trim() }); }} />
-                <Btn label="取消" theme={theme} onPress={() => setEditing(null)} />
-              </View>
-            </View>
-          )}
-        </View>
+        <>
+          <Text style={styles.meta}>provider</Text>
+          {chips(withCurrent(ch.providers.map((p: any) => ({ value: p.kind, label: p.kind })), kindOf(cur)), kind, setPick)}
+          <Text style={styles.meta}>模型</Text>
+          {chips(kind === kindOf(cur) ? withCurrent(models, modelOf(cur)) : models, kind === kindOf(cur) ? modelOf(cur) : "\u0000", (m) => onPick(m ? `${kind}/${m}` : kind))}
+        </>
       );
     };
-    const safetyText = (v: unknown) => (typeof v === "boolean" ? (v ? "on" : "off") : Array.isArray(v) ? v.join(" ") : v == null ? "" : String(v));
+    const safetyText = (v: unknown) => (typeof v === "boolean" ? (v ? "开" : "关") : Array.isArray(v) ? v.join(" ") || "任意" : v == null ? "任意" : String(v));
+    const SAFETY_OPTS: Record<string, Opt[]> = {
+      yolo: [{ value: "on", label: "开" }, { value: "off", label: "关" }, inherit],
+      routine_commands: [{ value: "on", label: "开" }, { value: "off", label: "关" }, inherit],
+      start_threads: [{ value: "propose", label: "先提议" }, { value: "auto", label: "直接开" }, inherit],
+    };
+    const safetyCur = (v: unknown) => (typeof v === "boolean" ? (v ? "on" : "off") : String(v ?? ""));
+    const num = (ns: number[], zero = "") => ns.map((n) => ({ value: String(n), label: n === 0 && zero ? zero : String(n) }));
+    const projectOpts = (k: string): Opt[] | null =>
+      k.endsWith("_profile") ? profileNames
+      : k === "max_parallel_threads" ? num([1, 2, 3, 4, 5, 6, 8, 10])
+      : k === "auto_resolve_days" ? num([0, 1, 2, 3, 5, 7, 14, 30], "不自动")
+      : k === "nudge" || k === "mute" ? onOff : null;
     return (
       <View>
-        <Text style={styles.meta}>点一行就能改。项目设置直接生效；安全设置和 profile 只能由你改，保存后会弹出 macOS 对话框，点"Allow"才生效。</Text>
+        <Text style={styles.meta}>点一行展开，点选项就保存。项目设置直接生效；安全设置和 profile 只能由你改，保存时会弹出 macOS 对话框，点 Allow 才生效。</Text>
         <Text style={[styles.groupTitle, { marginTop: 12 }]}>新项目的默认 profile</Text>
         <View style={styles.card}>
-          {(["thread", "coordinator"] as const).map((r) => field({ scope: "default", target: r, key: "profile" }, `${r}_profile`, data.defaults[`${r}_profile`] ?? "claude", data.defaults[`${r}_profile`] ?? ""))}
+          {(["thread", "coordinator"] as const).map((r) => {
+            const cur = data.defaults[`${r}_profile`] ?? "";
+            return choose({ scope: "default", target: r, key: "profile" }, `${r}_profile`, cur || "claude", cur, profileNames);
+          })}
         </View>
         <Text style={[styles.groupTitle, { marginTop: 8 }]}>Profiles</Text>
-        {data.profiles.map((p: any) => (
-          <View key={p.name} style={styles.card}>
-            <Text style={styles.title}>{p.name}{p.builtin ? "（内置，不能改）" : ""}</Text>
-            {p.builtin ? <Text style={styles.meta}>{p.summary}</Text> : (
-              <>
-                {["provider", "mode", "thinking", "yolo_mode", "description"].map((f) => field({ scope: "profile", target: p.name, key: f }, f, p[f], p[f], f === "provider" ? "KIND/MODEL，例如 claude/claude-opus-5-5" : "留空表示清除"))}
-                <View style={{ flexDirection: "row", marginTop: 6 }}>
-                  <Btn label="删除" theme={theme} disabled={edit.isPending} onPress={() => edit.mutate({ scope: "profile", target: p.name, key: "remove", value: "" })} />
-                </View>
-              </>
-            )}
-          </View>
-        ))}
-        <View style={styles.card}>
-          {field({ scope: "profile", target: "_new", key: "add" }, "新建 profile", "", "", "名字 和 provider，空格隔开，例如：reviewer claude/claude-opus-5-5")}
-        </View>
-        {data.projects.map((p: any) => (
-          <View key={p.project}>
-            <Text style={[styles.groupTitle, { marginTop: 8 }]}>{p.project} · {p.status}</Text>
-            <View style={styles.card}>
-              {Object.entries(p.settings).filter(([k]) => k !== "repos").map(([k, v]) => field({ scope: "project", target: p.project, key: k }, k, v == null ? "" : String(v), v == null ? "" : String(v), data.hints[k]))}
-              <Text style={[styles.meta, { marginTop: 6 }]}>repos</Text>
-              {p.settings.repos.map((r: string) => (
-                <View key={r} style={{ flexDirection: "row", alignItems: "center" }}>
-                  <Text style={[styles.mono, { flex: 1 }]}>{r}</Text>
-                  <Btn label="移除" theme={theme} disabled={edit.isPending} onPress={() => edit.mutate({ scope: "project", target: p.project, key: "repos.remove", value: r.replace(/@[^/@]*$/, "") })} />
-                </View>
-              ))}
-              {field({ scope: "project", target: p.project, key: "repos.add" }, "添加 repo", "", "", data.hints["repos.add"])}
-              <Text style={[styles.meta, { marginTop: 6, marginBottom: 4 }]}>安全设置（括号里是来源；填 default 表示跟随上一级）</Text>
-              {Object.entries(p.safety).map(([k, s]: [string, any]) => field({ scope: "safety", target: p.project, key: k }, k, `${safetyText(s.value) || "any"} (${s.source})`, safetyText(s.value), s.hint))}
+        {data.profiles.map((p: any) => {
+          const e = (key: string) => ({ scope: "profile" as const, target: p.name, key });
+          const model = providerOf(kindOf(p.provider)).models.find((m: any) => m.id === modelOf(p.provider));
+          const thinking: Opt[] = [{ value: "", label: "默认" }, ...(model?.thinking ?? []).map((t: any) => ({ value: t.id, label: t.label }))];
+          const modes: Opt[] = [{ value: "", label: "默认" }, ...providerOf(kindOf(p.provider)).modes.map((m: any) => ({ value: m.id, label: m.label }))];
+          return (
+            <View key={p.name} style={styles.card}>
+              <Text style={styles.title}>{p.name}{p.builtin ? "（内置）" : ""}</Text>
+              {p.builtin ? <Text style={styles.meta}>{p.summary}</Text> : (
+                <>
+                  {row(`profile/${p.name}/provider`, "provider", p.provider, () => providerPicker(p.provider, (v) => edit.mutate({ ...e("provider"), value: v })), () => setPick(""))}
+                  {choose(e("thinking"), "thinking", p.thinking || "默认", p.thinking, thinking)}
+                  {choose(e("mode"), "mode", p.mode || "默认", p.mode, modes)}
+                  {choose(e("yolo_mode"), "yolo_mode", p.yolo_mode || "默认", p.yolo_mode, modes, "yolo 开启时用的 mode")}
+                  {text(e("description"), "description", p.description)}
+                  <View style={{ flexDirection: "row", marginTop: 6 }}>
+                    <Btn label="删除" theme={theme} disabled={edit.isPending} onPress={() => edit.mutate({ ...e("remove"), value: "" })} />
+                  </View>
+                </>
+              )}
             </View>
-          </View>
-        ))}
+          );
+        })}
+        <View style={styles.card}>
+          {row("profile/_new/add", "新建 profile", "", () => (
+            <>
+              <TextInput style={input} value={draft} onChangeText={setDraft} placeholder="名字，例如 reviewer" autoFocus accessibilityLabel="新 profile 的名字" />
+              {providerPicker("", (prov) => edit.mutate({ scope: "profile", target: draft.trim(), key: "add", value: prov }))}
+              <Text style={styles.meta}>选好模型就会创建。</Text>
+            </>
+          ), () => { setDraft(""); setPick(ch.providers[0]?.kind ?? ""); })}
+        </View>
+        {data.projects.map((p: any) => {
+          const repoPaths = p.settings.repos.map((r: string) => r.replace(/@[^/@]*$/, ""));
+          const addable: Opt[] = ch.repos.filter((r: string) => !repoPaths.includes(r)).map((r: string) => ({ value: r, label: r.split("/").pop() || r }));
+          return (
+            <View key={p.project}>
+              <Text style={[styles.groupTitle, { marginTop: 8 }]}>{p.project} · {p.status}</Text>
+              <View style={styles.card}>
+                {Object.entries(p.settings).filter(([k]) => k !== "repos").map(([k, v]) => {
+                  const cur = v == null ? "" : String(v);
+                  const e = { scope: "project" as const, target: p.project, key: k };
+                  const opts = projectOpts(k);
+                  const shown = opts?.find((o) => o.value === cur)?.label ?? cur;
+                  return opts ? choose(e, k, shown, cur, opts, data.hints[k]) : text(e, k, cur);
+                })}
+                <Text style={[styles.meta, { marginTop: 6 }]}>repos</Text>
+                {p.settings.repos.map((r: string, i: number) => (
+                  <View key={r} style={{ flexDirection: "row", alignItems: "center" }}>
+                    <Text style={[styles.mono, { flex: 1 }]}>{r}</Text>
+                    <Btn label="移除" theme={theme} disabled={edit.isPending} onPress={() => edit.mutate({ scope: "project", target: p.project, key: "repos.remove", value: repoPaths[i] })} />
+                  </View>
+                ))}
+                {row(`project/${p.project}/repos.add`, "添加 repo", "", () => (addable.length
+                  ? chips(addable, "", (v) => edit.mutate({ scope: "project", target: p.project, key: "repos.add", value: v }))
+                  : <Text style={styles.meta}>Paseo 里的仓库都已加入。别的仓库先在 Paseo 里打开，或在终端用 pp set … repos.add。</Text>))}
+                <Text style={[styles.meta, { marginTop: 6, marginBottom: 4 }]}>安全设置（括号里是来源）</Text>
+                {Object.entries(p.safety).map(([k, s]: [string, any]) => {
+                  const e = { scope: "safety" as const, target: p.project, key: k };
+                  const shown = `${safetyText(s.value)} (${s.source})`;
+                  return SAFETY_OPTS[k] ? choose(e, k, shown, s.source === "project" ? safetyCur(s.value) : "", SAFETY_OPTS[k], s.hint) : many(e, k, shown, Array.isArray(s.value) ? s.value : []);
+                })}
+              </View>
+            </View>
+          );
+        })}
       </View>
     );
   }

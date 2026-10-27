@@ -123,7 +123,7 @@ test("routines: schedules and parse", () => {
 test("migrate: herdr tables, thread records, profiles", () => {
   const c = parseToml('[safety."/h/p"]\nyolo = true\n\n[profiles.worker]\nagent = "claude"\nmodel = "group/group[1m]"');
   assert.deepEqual(c, { safety: { "/h/p": { yolo: true } }, profiles: { worker: { agent: "claude", model: "group/group[1m]" } } });
-  assert.deepEqual(convertProfile(c.profiles.worker), { provider: "claude/group/group[1m]", mode: "auto" });
+  assert.deepEqual(convertProfile(c.profiles.worker), { provider: "claude/group/group[1m]" });
   const t = convertThread({ id: "t-0007", kind: "tab", cwd: "/h/p/threads/t-0007", thread_dir: "/h/p/threads/t-0007/.herdr-project/p-t-0007", pane_id: "w:p1", status: "open" }, "/h/p", "/n/p");
   assert.equal(t.cwd, "/n/p/threads/t-0007");
   assert.equal(t.thread_dir, "/n/p/threads/t-0007/.herdr-project/p-t-0007");
@@ -196,7 +196,8 @@ test("migrate-herdr in place: herdr's colliding files set aside, records convert
   writeFileSync(join(d, ".state", "coordinator.json"), JSON.stringify({ pane_id: "w:p1", agent: "claude", agent_session: "s-1" }));
   writeFileSync(join(d, ".state", "ticker.json"), "{}");
   writeFileSync(join(d, "threads", "t-0001.toml"), 'id = "t-0001"\ntitle = "x"\nstatus = "open"\nkind = "tab"\ncwd = "/nowhere"\nagent = "codex"\n');
-  const run = () => execFileSync(process.execPath, ["bin/pp.mjs", "--root", h, "migrate-herdr", h], { encoding: "utf8", env: { ...process.env, PP_CONFIG: join(h, "c.json") } });
+  writeFileSync(join(h, "hp.toml"), '[defaults]\nthread_profile = "omp"\n\n[profiles.opus]\nagent = "claude"\nmodel = "claude-opus-5-5"\ndescription = "big"\n');
+  const run = () => execFileSync(process.execPath, ["bin/pp.mjs", "--root", h, "migrate-herdr", h], { encoding: "utf8", env: { ...process.env, PP_CONFIG: join(h, "c.json"), HP_CONFIG: join(h, "hp.toml") } });
   assert.match(run(), /convert .* in place, 1 thread record/);
   assert.deepEqual(readdirSync(join(d, ".state", "herdr")).sort(), ["AGENTS.md", "coordinator.json", "ticker.json"]);
   assert.equal(readFileSync(join(d, ".state", "herdr", "AGENTS.md"), "utf8"), "herdr agents\n");
@@ -205,6 +206,9 @@ test("migrate-herdr in place: herdr's colliding files set aside, records convert
   assert.deepEqual(JSON.parse(readFileSync(join(d, ".state", "coordinator.json"), "utf8")).session, { provider: "claude", id: "s-1", from: "herdr" });
   assert.equal(JSON.parse(readFileSync(join(d, "threads", "t-0001.json"), "utf8")).cwd, "/nowhere");
   assert.ok(existsSync(join(d, "threads", "t-0001.toml")));
+  // herdr's profiles and defaults come over as they are.
+  const c = JSON.parse(readFileSync(join(h, "c.json"), "utf8"));
+  assert.deepEqual([c.profiles, c.defaults], [{ opus: { provider: "claude/claude-opus-5-5", description: "big" } }, { thread_profile: "omp" }]);
   assert.match(run(), /skipped, already converted/);
 });
 

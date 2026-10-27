@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { closeClients, readText, writeAtomic, splitFront, requirePerson, ask } from "../orchestrator/lib.mjs";
-import { loadConfig, loadSafety, setSafety, parseSafetyValue, SAFETY_KEYS, canonical, listedNames, getProfile, profileSummary, storeApproval, isApproved, yoloKnown, validateProfileName, ROLES, allowed, agentConfig, editConfig, changeProfile, BUILTINS, kindOf } from "../orchestrator/config.mjs";
+import { loadConfig, loadSafety, setSafety, parseSafetyValue, SAFETY_KEYS, canonical, listedNames, installedKinds, getProfile, profileSummary, storeApproval, isApproved, yoloKnown, validateProfileName, ROLES, allowed, agentConfig, editConfig, changeProfile, BUILTINS, kindOf } from "../orchestrator/config.mjs";
 import { Project, rootOf, create, listSlugs, parseRepoArg, applySetting, writeSettings, writeAgentsMd, SET_KEYS, prefix } from "../orchestrator/project.mjs";
 import * as threads from "../orchestrator/threads.mjs";
 import * as coordinator from "../orchestrator/coordinator.mjs";
@@ -15,7 +15,7 @@ import * as routines from "../orchestrator/routines.mjs";
 import * as ticker from "../orchestrator/ticker.mjs";
 import * as lifecycle from "../orchestrator/lifecycle.mjs";
 import { migrate } from "../orchestrator/migrate.mjs";
-import { boardData, editArgs } from "../orchestrator/board.mjs";
+import { boardData, boardChoices, editArgs } from "../orchestrator/board.mjs";
 
 const HELP = `pp [--root DIR] <command>
 
@@ -215,6 +215,7 @@ async function main() {
     case "safety": return safetyCommand(pos.slice(1), f, root, proj);
     case "profile": return profileCommand(pos.slice(1), f, root, proj);
     case "board": {
+      if (a1 === "settings") { const choices = await boardChoices(root); console.log(JSON.stringify({ ...boardData(root, a1, choices.kinds), choices })); return; }
       if (a1 !== "edit") { console.log(JSON.stringify(boardData(root, a1))); return; }
       // Runs the edit as its own command line, so the dialog and the error name that command.
       process.argv = [...process.argv.slice(0, 2), "--root", root, ...editArgs(JSON.parse(need(a2, "board edit <json>")))];
@@ -336,13 +337,15 @@ function routineCommand(sub, slug, name, value, root, proj) {
   throw new Error("usage: pp routine list|approve|toggle <slug> [name]");
 }
 
-function profileCommand([sub = "list", ...rest], f, root, proj) {
+async function profileCommand([sub = "list", ...rest], f, root, proj) {
   const config = loadConfig();
   const exists = (n) => { validateProfileName(n); if (!getProfile(config, n)) throw new Error(`no profile \`${n}\`; profiles: ${listedNames(config).join(", ")}`); return n; };
   const roleOf = (r) => { if (!ROLES[r]) throw new Error(`\`${r}\` is not a role: thread, coordinator`); return ROLES[r]; };
   const p = f.project ? proj(f.project, `profile ${sub} --project <slug>`) : null;
   if (sub === "list") {
-    for (const n of listedNames(config)) console.log(`${n}\t${profileSummary(getProfile(config, n))}${config.profiles[n] ? "" : " (built-in)"}`);
+    const kinds = await installedKinds();
+    console.log(`built-ins: the providers installed and signed in here: ${kinds.join(", ")}`);
+    for (const n of listedNames(config, kinds)) console.log(`${n}\t${profileSummary(getProfile(config, n))}${config.profiles[n] ? "" : " (built-in)"}`);
     if (!p) return;
     const safety = loadSafety(config, p.dir);
     for (const [role, r] of Object.entries(ROLES)) console.log(`${role}s in ${p.slug}: ${allowed(safety, role)?.join(", ") ?? "any"} (${safety.source[r.list]}); default ${p.settings()[r.def] || "none"}`);

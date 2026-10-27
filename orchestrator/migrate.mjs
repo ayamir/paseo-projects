@@ -10,7 +10,7 @@ import { CONFIG_PATH, canonical } from "./config.mjs";
 import { Project, SUBDIRS, writeAgentsMd } from "./project.mjs";
 import { latestSession } from "./threads.mjs";
 
-const HERDR_CONFIG = join(homedir(), ".config", "herdr-projects", "config.toml");
+const HERDR_CONFIG = process.env.HP_CONFIG ?? join(homedir(), ".config", "herdr-projects", "config.toml");
 const SAFETY = ["yolo", "start_threads", "routine_commands", "thread_profiles", "coordinator_profiles"];
 // Left behind: herdr's pane records and ticker state mean nothing to Paseo.
 const EXCLUDE = [".state/lock", ".state/coordinator.json", ".state/coordinators.json", ".state/ticker.json", ".claude/settings.local.json"];
@@ -49,7 +49,6 @@ function livePaneSession(paneId, cwd) {
 /** herdr profiles `{ agent, model }` → `{ provider: "agent/model" }`; Claude ones in auto mode. */
 export function convertProfile(p) {
   const out = { provider: p.model ? `${p.agent}/${p.model}` : p.agent };
-  if (p.agent === "claude") out.mode = "auto";
   if (p.description) out.description = p.description;
   return out;
 }
@@ -63,6 +62,11 @@ function mergeConfig(herdr, moves) {
     if (raw.profiles[name] || !p.agent) continue;
     raw.profiles[name] = convertProfile(p);
     added.push(`profile ${name}`);
+  }
+  for (const [k, v] of Object.entries(herdr.defaults ?? {})) {
+    if (!["thread_profile", "coordinator_profile"].includes(k) || (raw.defaults ??= {})[k]) continue;
+    raw.defaults[k] = v;
+    added.push(`default ${k}`);
   }
   raw.safety ??= {};
   for (const [from, to] of [["default", "default"], ...moves]) {

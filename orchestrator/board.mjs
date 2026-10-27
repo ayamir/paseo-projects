@@ -1,7 +1,7 @@
 // What the board plugin's tasks, routines, settings and memory tabs show: `pp board <section>`
 // prints it as JSON, the same data `context` and `routine list` read. Archived projects are left out.
 import { readdirSync } from "node:fs";
-import { readText } from "./lib.mjs";
+import { client, readText } from "./lib.mjs";
 import { loadConfig, loadSafety, listedNames, getProfile, profileSummary, SAFETY_KEYS } from "./config.mjs";
 import { Project, listSlugs, SET_KEYS } from "./project.mjs";
 import { readTickerState } from "./coordinator.mjs";
@@ -11,7 +11,7 @@ import * as routines from "./routines.mjs";
 export const SECTIONS = ["tasks", "routines", "settings", "memory"];
 const SETTING_KEYS = ["name", "goal", "coordinator_profile", "thread_profile", "max_parallel_threads", "auto_resolve_days", "nudge", "mute"];
 
-export function boardData(root, section) {
+export function boardData(root, section, kinds) {
   if (!SECTIONS.includes(section)) throw new Error(`usage: pp board ${SECTIONS.join("|")}`);
   const projects = listSlugs(root).map((s) => new Project(root, s)).filter((p) => p.status !== "archived");
   if (section === "tasks") {
@@ -32,7 +32,7 @@ export function boardData(root, section) {
   if (section === "settings") {
     const config = loadConfig();
     return {
-      profiles: listedNames(config).map((n) => ({ ...getProfile(config, n), summary: profileSummary(getProfile(config, n)), builtin: !config.profiles[n] })),
+      profiles: listedNames(config, kinds).map((n) => ({ ...getProfile(config, n), summary: profileSummary(getProfile(config, n)), builtin: !config.profiles[n] })),
       defaults: config.defaults,
       hints: SET_KEYS,
       projects: projects.map((p) => {
@@ -88,4 +88,30 @@ export function editArgs({ scope, target, key, value = "" }) {
     return ["profile", "default", target, value];
   }
   return bad(`\`${scope}\` is not a scope`);
+}
+
+/**
+ * What the settings tab offers to pick from, read from the local daemon: each installed provider with its
+ * models (and their thinking levels) and modes, and the repositories Paseo knows as projects.
+ * shortcut: local daemon only; a machine's own providers and repos are typed at a terminal (`pp profile`, `repos.add P@M`).
+ */
+export async function boardChoices(root = "") {
+  const late = new Promise((_, no) => setTimeout(() => no(new Error("no daemon")), 5000).unref());
+  try {
+    return await Promise.race([late, (async () => {
+      const c = await client();
+      const kinds = (await c.providers.listAvailable()).providers.filter((p) => p.available).map((p) => p.provider);
+      const providers = await Promise.all(kinds.map(async (kind) => {
+        const [m, md] = await Promise.all([c.providers.listModels(kind).catch(() => ({ models: [] })), c.providers.listModes(kind).catch(() => ({ modes: [] }))]);
+        return {
+          kind,
+          models: (m.models ?? []).map((x) => ({ id: x.id, label: x.label ?? x.id, thinking: (x.thinkingOptions ?? []).map((t) => ({ id: t.id, label: t.label ?? t.id })) })),
+          modes: (md.modes ?? []).map((x) => ({ id: x.id, label: x.label ?? x.id })),
+        };
+      }));
+      const repos = (await c.projects.list()).projects.filter((p) => p.projectKind === "git").map((p) => p.projectRootPath)
+        .filter((r) => !root || (r !== root && !r.startsWith(`${root}/`)));
+      return { kinds, providers, repos };
+    })()]);
+  } catch { return { kinds: undefined, providers: [], repos: [] }; }
 }

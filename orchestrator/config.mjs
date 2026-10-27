@@ -13,13 +13,13 @@
 import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { REPO, readJson, writeJson, now, sha256 } from "./lib.mjs";
+import { REPO, client, readJson, writeJson, now, sha256 } from "./lib.mjs";
 
 export const CONFIG_PATH = process.env.PP_CONFIG ?? join(REPO, "config.json");
 export const APPROVALS_PATH = join(REPO, "approved-routines.json");
 
 // Every Paseo provider is also a built-in profile of the same name.
-export const BUILTINS = ["claude", "codex", "pi", "opencode", "gemini", "copilot", "cursor"];
+export const BUILTINS = ["claude", "codex", "pi", "omp", "opencode", "gemini", "copilot", "cursor"];
 // The mode that skips permission prompts, per provider (yolo).
 const YOLO_MODES = { claude: "bypassPermissions" };
 
@@ -134,7 +134,15 @@ export function resolveProfile(config, safety, settings, role, requested, slug) 
   return profile;
 }
 
-export const listedNames = (config) => [...new Set([...Object.keys(config.profiles), ...BUILTINS])];
+/** The user's profiles, then the built-ins: every kind pp knows, or only `kinds` (those installed here). */
+export const listedNames = (config, kinds = BUILTINS) => [...new Set([...Object.keys(config.profiles), ...kinds])];
+
+/** Like herdr-projects' built-ins: the providers the local daemon has installed and signed in; all kinds when it can't say. */
+export async function installedKinds() {
+  const late = new Promise((_, no) => setTimeout(() => no(new Error("no daemon")), 3000).unref());
+  try { return (await Promise.race([client().then((c) => c.providers.listAvailable()), late])).providers.filter((p) => p.available).map((p) => p.provider); }
+  catch { return BUILTINS; }
+}
 
 /** Profiles `role` may use in a project, the user's first. */
 export function usable(config, safety, role) {
