@@ -29,7 +29,7 @@ The coordinator never does the work itself, so it's always free to answer you. E
 
 ### 📈 See every thread at a glance
 
-The board (the Tasks icon at the top of the Paseo sidebar) has six tabs: threads, tasks, inbox, routines, settings and memory. Threads are grouped by what needs you first: waiting for you, ready for review, ready to merge, working, idle, resolved. Each shows its own progress line and its list of next steps. Every button on the board runs one `pp` command, so the board can do nothing the CLI can't. Settings are edited in place: tap a row, change it, save.
+The board (the Tasks icon at the top of the Paseo sidebar) has six tabs: threads, tasks, inbox, routines, settings and memory. Threads are grouped by what needs you first: waiting for you, ready for review, ready to merge, working, idle, resolved. Each shows its own progress line and its list of next steps. Every button on the board runs one `pp` command, so the board can do nothing the CLI can't. Settings are edited in place: tap a row and pick a value. The choices come from Paseo: the installed providers with their models, thinking levels and modes, and the repositories Paseo knows. Only names, goals and descriptions are typed.
 
 ### ⚡ Stop briefing every agent yourself
 
@@ -97,7 +97,7 @@ Commands that widen what agents may do refuse unless they run at a terminal: `pp
 
 ### What are profiles?
 
-A named launch config in `config.json`: a provider and model (`claude/claude-opus-5-5`), a mode, a thinking level and the mode that skips permission prompts. Every Paseo provider is also a built-in profile of the same name. The coordinator picks a profile for each thread; you choose which ones it may pick with `pp profile allow`.
+A named launch config in `config.json`: a provider and model (`claude/claude-opus-5-5`), a mode, a thinking level and the mode that skips permission prompts. Like herdr-projects, the built-in profiles are the providers installed and signed in here, as the local Paseo daemon reports them. `migrate-herdr` brings herdr-projects' profiles and defaults over as they are. The coordinator picks a profile for each thread; you choose which ones it may pick with `pp profile allow`.
 
 ```sh
 pp profile add reviewer --provider claude/claude-opus-5-5 --thinking high --description "Hard reviews"

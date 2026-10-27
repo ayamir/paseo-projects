@@ -74,6 +74,7 @@ profile 存在 `config.json`。下面这些命令只能由人在终端执行，c
 - `pp profile remove <name>`：如果 defaults、allow-list 或某个项目的 `thread_profile`/`coordinator_profile` 还在用它，就拒绝。
 - `pp profile allow <slug>|--global thread|coordinator <名字...>`：限定可用的 profile。不给名字表示都可以，`default` 表示继承上一级。
 - `pp profile default thread|coordinator <name>`：新项目的默认值。已有项目用 `pp set <slug> thread_profile <name>` 改。
+- 内置 profile 和 HP 一样，只列出本机已安装并登录的 provider（以 Paseo daemon 的报告为准）。`migrate-herdr` 会把 HP 的 profile 和默认值原样搬过来，`config.json` 里已有的同名项不会被覆盖。
 - `pp profile list [--project <slug>]`、`pp profile resolve [name] [--project <slug>]`：查看 profile，以及它启动时用的 agent 配置（JSON）。
 
 ## 线程分组
@@ -95,7 +96,7 @@ profile 存在 `config.json`。下面这些命令只能由人在终端执行，c
 
 - 任务：派工、完成、放弃。三个按钮都是把请求发给 coordinator，由它来改 TASKS.md。
 - Routines：开启或关闭。
-- 设置：点一行就能改。项目设置（`pp set`）直接生效。安全设置、profile 和新项目的默认 profile 只能由人改：保存后弹出 macOS 对话框，上面写着完整命令，点 Allow 才执行，取消或 100 秒没点就拒绝。
+- 设置：点一行展开，点选项就保存。可选项来自 Paseo：已安装的 provider 及其模型、thinking、mode，以及 Paseo 认识的仓库。只有名字、goal、描述要打字。项目设置（`pp set`）直接生效。安全设置、profile 和新项目的默认 profile 只能由人改：保存后弹出 macOS 对话框，上面写着完整命令，点 Allow 才执行，取消或 100 秒没点就拒绝。
 - 记忆：只读，要改跟 coordinator 说。
 
 `pp board tasks|routines|settings|memory` 输出看板读取的 JSON。
