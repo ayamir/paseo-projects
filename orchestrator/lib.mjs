@@ -238,9 +238,21 @@ export function slugify(text) {
 }
 export const humanize = (slug) => slug.split("-").filter(Boolean).map((w) => w[0].toUpperCase() + w.slice(1)).join(" ");
 
-/** Asks a person at a terminal; refuses when standard input is not one. */
+/**
+ * Asks a person at a terminal; refuses when standard input is not one. With PP_ASK=dialog (the board sets it)
+ * a macOS dialog naming the exact command asks instead: an agent setting PP_ASK only raises a dialog you answer.
+ */
 export function requirePerson(what) {
-  if (!process.stdin.isTTY) throw new Error(`${what} must be run by a person at a terminal; standard input is not a terminal`);
+  if (process.stdin.isTTY) return;
+  if (process.env.PP_ASK === "dialog" && process.platform === "darwin") {
+    const text = `Allow this change?\n\npp ${process.argv.slice(2).filter((a, i, all) => a !== "--root" && all[i - 1] !== "--root").join(" ")}`;
+    const r = spawnSync("osascript", ["-e", "on run argv", "-e",
+      'display dialog (item 1 of argv) with title "paseo-projects" buttons {"Cancel", "Allow"} default button "Cancel" cancel button "Cancel" with icon caution giving up after 100',
+      "-e", "end run", text], { encoding: "utf8" });
+    if (r.status === 0 && /button returned:Allow/.test(r.stdout) && !/gave up:true/.test(r.stdout)) return;
+    throw new Error(`${what} was not allowed in the dialog`);
+  }
+  throw new Error(`${what} must be run by a person at a terminal; standard input is not a terminal`);
 }
 export function ask(question) {
   process.stdout.write(question);

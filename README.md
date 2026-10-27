@@ -29,7 +29,7 @@ The coordinator never does the work itself, so it's always free to answer you. E
 
 ### 📈 See every thread at a glance
 
-The board (the Tasks icon at the top of the Paseo sidebar) has six tabs: threads, tasks, inbox, routines, settings and memory. Threads are grouped by what needs you first: waiting for you, ready for review, ready to merge, working, idle, resolved. Each shows its own progress line and its list of next steps. Every button on the board runs one `pp` command, so the board can do nothing the CLI can't.
+The board (the Tasks icon at the top of the Paseo sidebar) has six tabs: threads, tasks, inbox, routines, settings and memory. Threads are grouped by what needs you first: waiting for you, ready for review, ready to merge, working, idle, resolved. Each shows its own progress line and its list of next steps. Every button on the board runs one `pp` command, so the board can do nothing the CLI can't. Settings are edited in place: tap a row, change it, save.
 
 ### ⚡ Stop briefing every agent yourself
 
@@ -93,7 +93,7 @@ In the root set by `root` in `config.json` (default `projects/` in this reposito
 
 ### What does only a person do?
 
-Commands that widen what agents may do refuse unless they run at a terminal: `pp safety set|yolo`, `pp routine approve`, and `pp profile add|edit|remove|allow|default`. The board shows settings read only for the same reason.
+Commands that widen what agents may do refuse unless they run at a terminal: `pp safety set|yolo`, `pp routine approve`, and `pp profile add|edit|remove|allow|default`. The board can change these too: on macOS it opens a system dialog naming the exact command, and the change happens only when you click Allow. An agent calling the board's RPC itself only raises that dialog. Project settings (`pp set`) change straight from the board.
 
 ### What are profiles?
 

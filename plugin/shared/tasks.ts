@@ -74,3 +74,15 @@ export const boardActionRpc = defineRpc({
   input: z.object({ project: z.string(), kind: z.enum(["task", "routine"]), action: z.enum(["delegate", "done", "drop", "toggle"]), target: z.string() }),
   output: z.object({ ok: z.boolean(), message: z.string() }),
 });
+
+/** A settings edit; the server runs it as `pp board edit`, which asks you in a dialog for the user's own settings. */
+export const boardEditRpc = defineRpc({
+  name: "paseo-projects.board.edit",
+  input: z.object({
+    scope: z.enum(["project", "safety", "profile", "default"]),
+    target: z.string().max(80),
+    key: z.string().max(40),
+    value: z.string().max(2000),
+  }),
+  output: z.object({ ok: z.boolean(), message: z.string() }),
+});

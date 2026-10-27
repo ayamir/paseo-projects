@@ -15,7 +15,7 @@ import * as routines from "../orchestrator/routines.mjs";
 import * as ticker from "../orchestrator/ticker.mjs";
 import * as lifecycle from "../orchestrator/lifecycle.mjs";
 import { migrate } from "../orchestrator/migrate.mjs";
-import { boardData } from "../orchestrator/board.mjs";
+import { boardData, editArgs } from "../orchestrator/board.mjs";
 
 const HELP = `pp [--root DIR] <command>
 
@@ -37,6 +37,7 @@ Projects
   doctor [--fix]
   migrate-herdr [HERDR_ROOT] [--dry-run]   copy herdr-projects projects here (default ~/.herdr-projects)
   board tasks|routines|settings|memory     what the board plugin shows, as JSON
+  board edit <json>              a settings edit from the board, as the command it maps to
 
 Threads
   thread start <slug> --title T (--task T | --task-file F|- | --from-task TITLE) [--repo PATH] [--kind worktree|tab|checkout] [--machine M] [--profile P] [--base REF]
@@ -213,7 +214,12 @@ async function main() {
     case "routine": return routineCommand(a1, a2, a3, pos[4], root, proj);
     case "safety": return safetyCommand(pos.slice(1), f, root, proj);
     case "profile": return profileCommand(pos.slice(1), f, root, proj);
-    case "board": console.log(JSON.stringify(boardData(root, a1))); return;
+    case "board": {
+      if (a1 !== "edit") { console.log(JSON.stringify(boardData(root, a1))); return; }
+      // Runs the edit as its own command line, so the dialog and the error name that command.
+      process.argv = [...process.argv.slice(0, 2), "--root", root, ...editArgs(JSON.parse(need(a2, "board edit <json>")))];
+      return main();
+    }
     default: throw new Error(`unknown command \`${cmd}\`; \`pp help\` lists them`);
   }
 }

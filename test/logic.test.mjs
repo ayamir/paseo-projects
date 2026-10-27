@@ -264,3 +264,16 @@ test("tabWorkspace: in the repo's Paseo project, reused on restart, none without
   assert.equal(await threads.tabWorkspace(c, "/p/threads/t-0003", "", "z"), null);
   assert.equal(await threads.tabWorkspace(c, "/p/threads/t-0003", "/other", "z"), null);
 });
+
+test("board editArgs: each scope maps to its pp command; nothing reads as a flag", async () => {
+  const { editArgs } = await import("../orchestrator/board.mjs");
+  assert.deepEqual(editArgs({ scope: "project", target: "demo", key: "max_parallel_threads", value: "3" }), ["set", "demo", "max_parallel_threads", "3"]);
+  assert.deepEqual(editArgs({ scope: "safety", target: "demo", key: "thread_profiles", value: "a, b" }), ["safety", "set", "demo", "thread_profiles", "a", "b"]);
+  assert.deepEqual(editArgs({ scope: "profile", target: "rev", key: "yolo_mode", value: "--x" }), ["profile", "edit", "rev", "--yolo-mode=--x"]);
+  assert.deepEqual(editArgs({ scope: "profile", target: "rev", key: "add", value: "claude/m" }), ["profile", "add", "rev", "--provider=claude/m"]);
+  assert.deepEqual(editArgs({ scope: "default", target: "thread", key: "profile", value: "rev" }), ["profile", "default", "thread", "rev"]);
+  assert.throws(() => editArgs({ scope: "project", target: "demo", key: "goal", value: "--root /x" }), /cannot start/);
+  assert.throws(() => editArgs({ scope: "safety", target: "demo", key: "yolo", value: "on --global" }), /cannot start/);
+  assert.throws(() => editArgs({ scope: "project", target: "../x", key: "name", value: "n" }), /not a project/);
+  assert.throws(() => editArgs({ scope: "profile", target: "rev", key: "arg", value: "" }), /not a profile field/);
+});

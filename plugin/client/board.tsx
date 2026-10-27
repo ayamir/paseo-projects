@@ -2,9 +2,9 @@ import type { PluginScreenProps } from "@getpaseo/plugin/client";
 import { useRpc } from "@getpaseo/plugin/client";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
-import { Pressable, ScrollView, Text, View } from "react-native";
+import { Pressable, ScrollView, Text, TextInput, View } from "react-native";
 import { openExternal } from "./web";
-import { boardActionRpc, boardSectionRpc, inboxDoneRpc, inboxListRpc, tasksRpc, threadActionRpc, threadDetailRpc } from "../shared/tasks";
+import { boardActionRpc, boardEditRpc, boardSectionRpc, inboxDoneRpc, inboxListRpc, tasksRpc, threadActionRpc, threadDetailRpc } from "../shared/tasks";
 
 // The thread groups of `pp`, most urgent first.
 const GROUPS = [
@@ -177,11 +177,19 @@ function SectionView({ section, theme, styles }: { section: Section; theme: Plug
   const client = useQueryClient();
   const load = useRpc(boardSectionRpc);
   const act = useRpc(boardActionRpc);
+  const editRpc = useRpc(boardEditRpc);
+  const [editing, setEditing] = useState<string | null>(null);
+  const [draft, setDraft] = useState("");
   const q = useQuery({ queryKey: ["pp-board", section], queryFn: () => load({ section }), refetchInterval: 10000 });
   const [shown, setShown] = useState<string | null>(null);
   const run = useMutation({
     mutationFn: (v: { project: string; kind: "task" | "routine"; action: "delegate" | "done" | "drop" | "toggle"; target: string }) => act(v),
     onSuccess: () => client.invalidateQueries({ queryKey: ["pp-board", section] }),
+  });
+  type Edit = { scope: "project" | "safety" | "profile" | "default"; target: string; key: string; value: string };
+  const edit = useMutation({
+    mutationFn: (v: Edit) => editRpc(v),
+    onSuccess: () => { setEditing(null); client.invalidateQueries({ queryKey: ["pp-board", section] }); },
   });
   const data = q.data?.data;
   if (q.isError) return <Text style={styles.note}>{String((q.error as Error).message).slice(0, 200)}</Text>;
@@ -192,6 +200,8 @@ function SectionView({ section, theme, styles }: { section: Section; theme: Plug
     <>
       {run.isError && <Text style={styles.note}>{String((run.error as Error).message).slice(0, 200)}</Text>}
       {run.isSuccess && <Text style={styles.note}>{run.data.message.slice(0, 120) || "已发送"}</Text>}
+      {edit.isError && <Text style={styles.note}>{String((edit.error as Error).message).slice(0, 200)}</Text>}
+      {edit.isSuccess && <Text style={styles.note}>{edit.data.message.slice(0, 160) || "已修改"}</Text>}
     </>
   );
 
@@ -256,19 +266,68 @@ function SectionView({ section, theme, styles }: { section: Section; theme: Plug
   }
 
   if (section === "settings") {
-    const line = (k: string, v: unknown) => <Text key={k} style={styles.mono}>{k.padEnd(22)} {typeof v === "string" ? v : JSON.stringify(v)}</Text>;
+    const input = { color: theme.colors.foreground, borderColor: theme.colors.surface1, borderWidth: 1, borderRadius: 6, padding: 6, fontSize: 13, marginVertical: 6 } as const;
+    // One editable row: tap it, change the text, save. `initial` is what the box starts with.
+    const field = (e: Omit<Edit, "value">, label: string, shownValue: string, initial: string, hint = "") => {
+      const k = `${e.scope}/${e.target}/${e.key}`;
+      return (
+        <View key={k}>
+          <Pressable accessibilityRole="button" accessibilityLabel={`修改 ${label}`} onPress={() => { setEditing(editing === k ? null : k); setDraft(initial); }}>
+            <Text style={styles.mono}>{label.padEnd(22)} {shownValue || "—"}  ✎</Text>
+          </Pressable>
+          {editing === k && (
+            <View>
+              {hint ? <Text style={styles.meta}>{hint}</Text> : null}
+              <TextInput style={input} value={draft} onChangeText={setDraft} autoFocus multiline={e.key === "goal"} accessibilityLabel={label} />
+              <View style={{ flexDirection: "row" }}>
+                <Btn label="保存" primary theme={theme} disabled={edit.isPending} onPress={() => { const w = draft.trim().split(/\s+/); edit.mutate(e.key === "add" ? { ...e, target: w[0] ?? "", value: w.slice(1).join(" ") } : { ...e, value: draft.trim() }); }} />
+                <Btn label="取消" theme={theme} onPress={() => setEditing(null)} />
+              </View>
+            </View>
+          )}
+        </View>
+      );
+    };
+    const safetyText = (v: unknown) => (typeof v === "boolean" ? (v ? "on" : "off") : Array.isArray(v) ? v.join(" ") : v == null ? "" : String(v));
     return (
       <View>
-        <Text style={styles.meta}>只读。改设置请在终端执行 pp set / pp safety / pp profile（只能由人执行）。</Text>
-        <Text style={[styles.groupTitle, { marginTop: 12 }]}>Profiles（默认：线程 {data.defaults.thread_profile ?? "claude"}，coordinator {data.defaults.coordinator_profile ?? "claude"}）</Text>
-        <View style={styles.card}>{data.profiles.map((p: any) => <Text key={p.name} style={styles.mono}>{p.name.padEnd(10)} {p.summary}{p.builtin ? " (built-in)" : ""}</Text>)}</View>
+        <Text style={styles.meta}>点一行就能改。项目设置直接生效；安全设置和 profile 只能由你改，保存后会弹出 macOS 对话框，点"Allow"才生效。</Text>
+        <Text style={[styles.groupTitle, { marginTop: 12 }]}>新项目的默认 profile</Text>
+        <View style={styles.card}>
+          {(["thread", "coordinator"] as const).map((r) => field({ scope: "default", target: r, key: "profile" }, `${r}_profile`, data.defaults[`${r}_profile`] ?? "claude", data.defaults[`${r}_profile`] ?? ""))}
+        </View>
+        <Text style={[styles.groupTitle, { marginTop: 8 }]}>Profiles</Text>
+        {data.profiles.map((p: any) => (
+          <View key={p.name} style={styles.card}>
+            <Text style={styles.title}>{p.name}{p.builtin ? "（内置，不能改）" : ""}</Text>
+            {p.builtin ? <Text style={styles.meta}>{p.summary}</Text> : (
+              <>
+                {["provider", "mode", "thinking", "yolo_mode", "description"].map((f) => field({ scope: "profile", target: p.name, key: f }, f, p[f], p[f], f === "provider" ? "KIND/MODEL，例如 claude/claude-opus-5-5" : "留空表示清除"))}
+                <View style={{ flexDirection: "row", marginTop: 6 }}>
+                  <Btn label="删除" theme={theme} disabled={edit.isPending} onPress={() => edit.mutate({ scope: "profile", target: p.name, key: "remove", value: "" })} />
+                </View>
+              </>
+            )}
+          </View>
+        ))}
+        <View style={styles.card}>
+          {field({ scope: "profile", target: "_new", key: "add" }, "新建 profile", "", "", "名字 和 provider，空格隔开，例如：reviewer claude/claude-opus-5-5")}
+        </View>
         {data.projects.map((p: any) => (
           <View key={p.project}>
             <Text style={[styles.groupTitle, { marginTop: 8 }]}>{p.project} · {p.status}</Text>
             <View style={styles.card}>
-              {Object.entries(p.settings).map(([k, v]) => line(k, v))}
-              <Text style={[styles.meta, { marginBottom: 4 }]}>安全设置</Text>
-              {Object.entries(p.safety).map(([k, v]) => line(k, v))}
+              {Object.entries(p.settings).filter(([k]) => k !== "repos").map(([k, v]) => field({ scope: "project", target: p.project, key: k }, k, v == null ? "" : String(v), v == null ? "" : String(v), data.hints[k]))}
+              <Text style={[styles.meta, { marginTop: 6 }]}>repos</Text>
+              {p.settings.repos.map((r: string) => (
+                <View key={r} style={{ flexDirection: "row", alignItems: "center" }}>
+                  <Text style={[styles.mono, { flex: 1 }]}>{r}</Text>
+                  <Btn label="移除" theme={theme} disabled={edit.isPending} onPress={() => edit.mutate({ scope: "project", target: p.project, key: "repos.remove", value: r.replace(/@[^/@]*$/, "") })} />
+                </View>
+              ))}
+              {field({ scope: "project", target: p.project, key: "repos.add" }, "添加 repo", "", "", data.hints["repos.add"])}
+              <Text style={[styles.meta, { marginTop: 6, marginBottom: 4 }]}>安全设置（括号里是来源；填 default 表示跟随上一级）</Text>
+              {Object.entries(p.safety).map(([k, s]: [string, any]) => field({ scope: "safety", target: p.project, key: k }, k, `${safetyText(s.value) || "any"} (${s.source})`, safetyText(s.value), s.hint))}
             </View>
           </View>
         ))}

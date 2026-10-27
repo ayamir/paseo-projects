@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import type { RpcInput } from "@getpaseo/plugin";
-import { threadActionRpc, threadDetailRpc, inboxDoneRpc, inboxListRpc, tasksRpc, boardSectionRpc, boardActionRpc } from "../shared/tasks";
+import { threadActionRpc, threadDetailRpc, inboxDoneRpc, inboxListRpc, tasksRpc, boardSectionRpc, boardActionRpc, boardEditRpc } from "../shared/tasks";
 
 const run = promisify(execFile);
 
@@ -45,7 +45,8 @@ function projectDirs(root: string): Array<[string, string]> {
 /** Runs `<pp> --root <root> <args...>`; an Electron daemon needs its own binary as node. */
 function pp(root: string, ...args: string[]) {
   const node = process.versions.electron ? process.execPath : "node";
-  const env = process.versions.electron ? { ...process.env, ELECTRON_RUN_AS_NODE: "1" } : process.env;
+  // PP_ASK: a command only you may run asks you in a macOS dialog instead of refusing.
+  const env = { ...process.env, PP_ASK: "dialog", ...(process.versions.electron ? { ELECTRON_RUN_AS_NODE: "1" } : {}) };
   return run(node, [join(pluginDir(), "..", "bin", "pp.mjs"), "--root", root, ...args], { env, timeout: 120_000 });
 }
 
@@ -157,4 +158,8 @@ export async function boardAction({ project, kind, action, target }: RpcInput<ty
   }
   if (action === "toggle") throw new Error("a task does not toggle");
   return via(`${action} task`, pp(rootDir(), "coordinator", "prompt", project, "--text", `(from the board) ${TASK_VERBS[action]} the task "${target}" in TASKS.md.`));
+}
+
+export async function boardEdit(edit: RpcInput<typeof boardEditRpc>) {
+  return via(`${edit.scope} ${edit.key}`, pp(rootDir(), "board", "edit", JSON.stringify(edit)));
 }

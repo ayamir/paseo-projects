@@ -95,7 +95,8 @@ profile 存在 `config.json`。下面这些命令只能由人在终端执行，c
 
 - 任务：派工、完成、放弃。三个按钮都是把请求发给 coordinator，由它来改 TASKS.md。
 - Routines：开启或关闭。
-- 设置和记忆：只读。设置要在终端里用 `pp set|safety|profile` 修改，记忆要跟 coordinator 说。
+- 设置：点一行就能改。项目设置（`pp set`）直接生效。安全设置、profile 和新项目的默认 profile 只能由人改：保存后弹出 macOS 对话框，上面写着完整命令，点 Allow 才执行，取消或 100 秒没点就拒绝。
+- 记忆：只读，要改跟 coordinator 说。
 
 `pp board tasks|routines|settings|memory` 输出看板读取的 JSON。
 
@@ -103,9 +104,11 @@ profile 存在 `config.json`。下面这些命令只能由人在终端执行，c
 
 以下命令要求在终端里由人执行，agent 调用会被拒绝：
 
-- `pp safety set|yolo`；
+- `pp safety set|yolo`、`pp profile add|edit|remove|allow|default`；
 - `pp routine approve`；
 - 编辑 `config.json` 和 `approved-routines.json`。
+
+这些命令设了 `PP_ASK=dialog`（看板就是这样调用的）时，在 macOS 上会弹对话框问你，而不是直接拒绝。agent 自己设这个变量，也只是弹出一个要你确认的对话框。
 
 ## 测试
 
