@@ -283,9 +283,11 @@ export function copyHome(project, t, withLibrary = false, exclude = []) {
   let h;
   try { h = host(t.machine); } catch (e) { return { outcome: "failed", error: e.message, notes: [] }; }
   if (!h.isDir(t.thread_dir)) {
-    // Gone before a final copy. Only a recorded complete one proves the library home whole: a library folder home
-    // may be a copy that failed part way, and a record without `archive` (older pp) a `--force` that skipped it.
-    if (!withLibrary || readJson(project.path("threads", `${t.id}.cleanup.json`))?.archive === "complete") return { outcome: "complete", notes: [], hash: null };
+    // Gone before a final copy. Only a complete one recorded for this agent proves the library home whole: a library
+    // folder home may be a copy that failed part way, a record without `archive` (older pp) a `--force` that skipped
+    // it, and one of an earlier agent the round before `restart` (which always gives a new agent, maybe on the same path).
+    const rec = withLibrary ? readJson(project.path("threads", `${t.id}.cleanup.json`)) : null;
+    if (!withLibrary || (rec?.archive === "complete" && rec.archive_agent === (t.agent_id ?? ""))) return { outcome: "complete", notes: [], hash: null };
     // The report comes home as it changes, the library only with a final copy: what is not home now is lost.
     const reportHome = existsSync(homeReportPath(project, t.id));
     const libraryHome = isDir(project.path("library", t.id));

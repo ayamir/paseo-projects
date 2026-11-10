@@ -33,11 +33,16 @@ out("unknown tool", true);
 chmodSync(FAKE_CBM, 0o755);
 
 // A fake Paseo daemon on the SDK's wire protocol: it reads daemon.autoArchiveAfterMerge as `on`/`off`, refuses the
-// read (`reject`), answers it in a shape the SDK rejects (`malformed`), and archives workspaces. Port 1 is no daemon.
+// read (`reject`), answers it in a shape the SDK rejects (`malformed`), and archives workspaces. It also gives a
+// `thread restart` its agent: none listed, a create that checks the branch out again (where the fixture's worktree
+// was: Paseo names a worktree after its branch), a refresh, a send and its archive. Port 1 is no daemon.
 const NO_DAEMON = "ws://127.0.0.1:1/ws";
 const WS = createRequire(fileURLToPath(import.meta.resolve("@getpaseo/client"))).resolve("ws");
 const FAKE_DAEMON = join(BASE, "fake-daemon.mjs");
 writeFileSync(FAKE_DAEMON, `import ws from ${JSON.stringify(pathToFileURL(WS).href)};
+import { execFileSync } from "node:child_process";
+import { dirname, join } from "node:path";
+const agents = new Map(), at = new Date().toISOString();
 const mode = process.env.FAKE_DAEMON_MODE, wss = new ws.WebSocketServer({ port: 0, host: "127.0.0.1" });
 wss.on("listening", () => console.log(wss.address().port));
 wss.on("connection", (s) => s.on("message", (raw) => {
@@ -48,6 +53,19 @@ wss.on("connection", (s) => s.on("message", (raw) => {
   if (r.type === "get_daemon_config_request" && mode === "reject") return send({ type: "rpc_error", payload: { requestId, requestType: r.type, error: "permission denied" } });
   if (r.type === "get_daemon_config_request") return send({ type: "get_daemon_config_response", payload: { requestId, config: mode === "malformed" ? "nope" : { mcp: { injectIntoAgents: false }, autoArchiveAfterMerge: mode === "on" } } });
   if (r.type === "archive_workspace_request") return send({ type: "archive_workspace_response", payload: { requestId, workspaceId: r.workspaceId, archivedAt: new Date().toISOString(), error: null } });
+  if (r.type === "fetch_agents_request") return send({ type: "fetch_agents_response", payload: { requestId, entries: [], pageInfo: { nextCursor: null, prevCursor: null, hasMore: false } } });
+  if (r.type === "create_agent_request") {
+    const cwd = join(dirname(r.config.cwd), "wt"), id = "agent-" + (agents.size + 1);
+    execFileSync("git", ["-C", r.config.cwd, "worktree", "add", "-q", cwd, r.worktree.branch], { stdio: "ignore" });
+    const agent = { id, provider: "claude", cwd, workspaceId: "wks_restarted", model: null, createdAt: at, updatedAt: at, lastUserMessageAt: null, status: "idle",
+      capabilities: { supportsStreaming: false, supportsSessionPersistence: false, supportsDynamicModes: false, supportsMcpServers: false, supportsReasoningStream: false, supportsToolInvocations: false },
+      currentModeId: null, availableModes: [], pendingPermissions: [], persistence: null, title: null, labels: r.labels ?? {} };
+    agents.set(id, agent);
+    return send({ type: "status", payload: { status: "agent_created", requestId, agentId: id, agent } });
+  }
+  if (r.type === "fetch_agent_request") return send({ type: "fetch_agent_response", payload: { requestId, agent: agents.get(r.agentId) ?? null, error: null } });
+  if (r.type === "archive_agent_request" && agents.has(r.agentId)) return send({ type: "agent_archived", payload: { requestId, agentId: r.agentId, archivedAt: new Date().toISOString() } });
+  if (r.type === "send_agent_message_request") return send({ type: "send_agent_message_response", payload: { requestId, agentId: r.agentId, accepted: true, error: null } });
   if (requestId) send({ type: "rpc_error", payload: { requestId, requestType: r.type, error: "not faked" } });
 }));
 `);
@@ -486,6 +504,31 @@ test("a retry after pp archived and removed the worktree does not call the archi
   assert.ok(r.ok, r.out);
   assert.doesNotMatch(r.out, /not copied home/);
   assert.equal(f.cleanup().archive, "complete");
+});
+
+test("a complete archive does not vouch for the round after reopen and restart: its new library lost is unknown", async () => {
+  const d = await fakeDaemon("off");
+  try {
+    const f = fixture({ daemon: d.url });
+    write(join(f.td, "library", "a.txt"), "round 1\n");
+    const first = f.pp("thread", "resolve", "demo", f.id);
+    assert.ok(first.ok, first.out);
+    assert.equal(f.cleanup().archive, "complete");
+    assert.ok(!existsSync(f.wt));
+    writeFileSync(process.env.PP_CONFIG, JSON.stringify({ profiles: { fake: { provider: "claude/fake-model" } } })); // the isolated config
+    for (const args of [["resolve", "demo", f.id, "--reopen"], ["restart", "demo", f.id, "--profile", "fake"]]) { const r = f.pp("thread", ...args); assert.ok(r.ok, r.out); }
+    assert.ok(existsSync(join(f.td, "brief.md")), "the restart checked the branch out again");
+    write(join(f.td, "library", "b.txt"), "round 2\n");
+    paseoArchives(f);
+    for (const args of [["resolve", "demo", f.id], ["cleanup", "demo", f.id]]) {
+      const r = f.pp("thread", ...args);
+      assert.ok(r.ok, r.out);
+      assert.match(r.out, /thread folder was already gone: whether the library home is complete is unknown/, args[0]);
+      assert.equal(f.cleanup().archive, "unknown", args[0]);
+      assert.deepEqual(f.cleanup().archive_unknown, ["library"]);
+    }
+    assert.ok(!existsSync(f.p.path("library", f.id, "b.txt")));
+  } finally { d.stop(); }
 });
 
 test("a library copy that failed part way, then the folder gone: the archive is unknown, never complete", () => {

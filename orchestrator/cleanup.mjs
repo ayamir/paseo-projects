@@ -346,7 +346,7 @@ function record(project, t, items, decl, archive) {
   const failed = merged.filter((i) => i.status === "failed").length;
   const rec = {
     thread: t.id, project: project.slug, run: (prev?.run ?? 0) + 1, at, state: failed ? "partial" : "complete",
-    archive: archive.outcome, ...(archive.missing?.length ? { archive_missing: archive.missing } : {}), ...(archive.unknown?.length ? { archive_unknown: archive.unknown } : {}),
+    archive: archive.outcome, archive_agent: t.agent_id ?? "", ...(archive.missing?.length ? { archive_missing: archive.missing } : {}), ...(archive.unknown?.length ? { archive_unknown: archive.unknown } : {}),
     removed_kib: merged.filter((i) => i.status === "removed").reduce((s, i) => s + (i.kib ?? 0), 0),
     measure: "du -sk before removal; shared or cloned blocks mean it is not a promise of freed disk",
     items: merged, declaration: decl,
