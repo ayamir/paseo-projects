@@ -1,7 +1,7 @@
 // Project lifecycle: pause, archive, delete, rename; sweep and doctor.
 import { existsSync, mkdirSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { client, sh, readText, readJson, writeJson, isFile, isDir, secondsSince } from "./lib.mjs";
+import { client, autoArchiveAfterMerge, sh, readText, readJson, writeJson, isFile, isDir, secondsSince } from "./lib.mjs";
 import { CONFIG_PATH, canonical, loadConfig, moveApprovals } from "./config.mjs";
 import { Project, SUBDIRS, TASKS_TEMPLATE, writeAgentsMd, writeSettings, listSlugs } from "./project.mjs";
 import * as threads from "./threads.mjs";
@@ -16,19 +16,24 @@ async function liveAgents(project) {
   return r.entries.map((e) => e.agent).filter((a) => !a.archivedAt && a.status !== "closed" && ["thread", "coordinator"].includes(a.labels?.role));
 }
 
+/** Throws unless every one was archived, so a caller changes nothing on disk while agents still run. */
 async function archiveAgents(project) {
   const c = await client();
   const agents = await liveAgents(project);
-  for (const a of agents) await c.agents.ref(a.id).archive().catch(() => {});
+  const failed = [];
+  for (const a of agents) await c.agents.ref(a.id).archive().catch((e) => failed.push(`${a.id}: ${e.message}`));
+  if (failed.length) throw new Error(`${failed.length} of ${agents.length} agent(s) were not archived (${failed.join("; ")})`);
   return agents.length;
 }
 
 export function pause(project) { project.setState({ status: "paused" }); }
 export function resume(project) { project.setState({ status: "active" }); }
 
+/** Archived only once its agents are: a daemon that does not answer leaves the project as it was. */
 export async function archive(project) {
+  const n = await archiveAgents(project);
   project.setState({ status: "archived" });
-  return archiveAgents(project);
+  return n;
 }
 export function unarchive(project) { project.setState({ status: "active" }); }
 
@@ -109,10 +114,18 @@ export async function doctor(root, fix) {
   const out = [];
   const config = loadConfig();
   for (const [name, p] of Object.entries(config.profiles)) if (!p.provider) out.push(`config.json: profile \`${name}\` has no provider`);
-  try { await client(); } catch (e) { out.push(`the local Paseo daemon does not answer (${e.message}); \`paseo start\` starts it`); }
+  // A second remover of thread worktrees, one that skips pp's checks and keeps; the setting is host-wide.
+  // Not read is unknown, said as such: it may still be on.
+  const autoArchives = async (url, where) => {
+    await client(url);
+    const a = await autoArchiveAfterMerge(url);
+    if (a.on) out.push(`${where}: Paseo's daemon.autoArchiveAfterMerge is on; it removes a merged thread's worktree with --force whatever pp keeps, often before pp copies its library home. \`paseo daemon config set daemon.autoArchiveAfterMerge false\`, then \`paseo daemon reload\`, leaves the removal to pp (it also stops it for workspaces pp does not manage)`);
+    else if (a.on === null) out.push(`${where}: Paseo's daemon.autoArchiveAfterMerge could not be read (${a.why}); whether it removes merged thread worktrees that pp keeps is unknown`);
+  };
+  try { await autoArchives(undefined, "the local Paseo daemon"); } catch (e) { out.push(`the local Paseo daemon does not answer (${e.message}); \`paseo start\` starts it`); }
   for (const [name, m] of Object.entries(config.machines)) {
     if (!m.url) out.push(`config.json: machine \`${name}\` has no url`);
-    else { try { await client(m.url); } catch (e) { out.push(`machine \`${name}\` (${m.url}) does not answer: ${e.message}`); } }
+    else { try { await autoArchives(m.url, `machine \`${name}\``); } catch (e) { out.push(`machine \`${name}\` (${m.url}) does not answer: ${e.message}`); } }
   }
   if (!ticker.runningPid(root)) {
     out.push("the ticker is not running");

@@ -4,7 +4,7 @@
 import { mkdirSync, readdirSync, readFileSync, existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { REPO, client, importSession, sh, now, readText, readJson, writeJson, writeAtomic, sha256, secondsSince, slugify, claudeDir } from "./lib.mjs";
+import { REPO, client, autoArchiveAfterMerge, importSession, sh, now, readText, readJson, writeJson, writeAtomic, sha256, secondsSince, slugify, claudeDir, isDir } from "./lib.mjs";
 import { loadConfig, loadSafety, resolveProfile, agentConfig, kindOf, modelOf, canonical, machine as machineOf } from "./config.mjs";
 import { prefix } from "./project.mjs";
 import * as inbox from "./inbox.mjs";
@@ -282,7 +282,19 @@ export function copyHome(project, t, withLibrary = false, exclude = []) {
   if (!t.thread_dir) return { outcome: "complete", notes: [], hash: null };
   let h;
   try { h = host(t.machine); } catch (e) { return { outcome: "failed", error: e.message, notes: [] }; }
-  if (!h.isDir(t.thread_dir)) return { outcome: "complete", notes: [], hash: null };
+  if (!h.isDir(t.thread_dir)) {
+    // Gone before a final copy. Only a complete one recorded for this agent proves the library home whole: a library
+    // folder home may be a copy that failed part way, a record without `archive` (older pp) a `--force` that skipped
+    // it, and one of an earlier agent the round before `restart` (which always gives a new agent, maybe on the same path).
+    const rec = withLibrary ? readJson(project.path("threads", `${t.id}.cleanup.json`)) : null;
+    if (!withLibrary || (rec?.archive === "complete" && rec.archive_agent === (t.agent_id ?? ""))) return { outcome: "complete", notes: [], hash: null };
+    // The report comes home as it changes, the library only with a final copy: what is not home now is lost.
+    const reportHome = existsSync(homeReportPath(project, t.id));
+    const libraryHome = isDir(project.path("library", t.id));
+    const missing = [...(reportHome ? [] : ["report"]), ...(libraryHome ? [] : ["library"])];
+    const said = [...(missing.length ? [`${missing.join(" and ")} not copied home`] : []), ...(libraryHome ? ["whether the library home is complete is unknown"] : [])];
+    return { outcome: missing.length ? "missing" : "unknown", missing, unknown: libraryHome ? ["library"] : [], hash: null, notes: [`the thread folder was already gone: ${said.join("; ")}${reportHome ? "; the report home is pp's last copy" : ""}`] };
+  }
   const notes = [];
   const report = h.read(`${t.thread_dir}/report.md`);
   let hash = null;
@@ -599,7 +611,7 @@ export function refreshBranch(project, t) {
  * in it would be lost), the indexes rooted in what went; then deletes a merged branch. `retry`: the agent
  * is already archived. `dryRun`: a preview through the same checks.
  */
-export async function clean(project, t, { keepWorktree = false, copyComplete = true, mergedHead = "", retry = false, dryRun = false } = {}) {
+export async function clean(project, t, { keepWorktree = false, copyComplete = true, archive, mergedHead = "", retry = false, dryRun = false } = {}) {
   const notes = [];
   let h;
   try { h = host(t.machine); } catch (e) { return [e.message]; }
@@ -609,8 +621,10 @@ export async function clean(project, t, { keepWorktree = false, copyComplete = t
   }
   // A tab thread's workspace goes with it (its folder stays); a worktree's goes with the worktree below.
   if (t.kind === "tab" && t.workspace_id && !dryRun) { try { const c = await client(h.url); await c.workspaces.archive(t.workspace_id); } catch {} }
+  // Paseo's merge auto-archive removes a workspace's worktree whatever pp keeps, so a kept one says so (or that it is unknown).
+  const paseoAutoArchive = t.kind === "worktree" && t.workspace_id ? await autoArchiveAfterMerge(h.url) : { on: false };
   let done;
-  try { done = await cleanup.run(project, t, h, { keepWorktree, copyComplete, dryRun }); }
+  try { done = await cleanup.run(project, t, h, { keepWorktree, copyComplete, archive, dryRun, paseoAutoArchive }); }
   catch (e) { return [...notes, `cleanup failed: ${e.message}; \`thread cleanup ${project.slug} ${t.id}\` retries`]; }
   notes.push(...done.notes);
   if (dryRun || t.kind !== "worktree" || !done.worktreeGone) return notes;
@@ -637,7 +651,7 @@ export async function resolve(project, id, { keepWorktree = false, force = false
     r.status = "resolved"; r.resolved_reason = reason; r.kept_worktree = keepWorktree;
     if (copied.hash) r.report_hash = copied.hash;
   });
-  const notes = [...copied.notes, ...(await clean(project, resolved, { keepWorktree, copyComplete: copied.outcome === "complete" || force, mergedHead }))];
+  const notes = [...copied.notes, ...(await clean(project, resolved, { keepWorktree, copyComplete: copied.outcome === "complete" || force, archive: skipCopy ? { outcome: "skipped" } : copied, mergedHead }))];
   inbox.write(project, "thread-state", id, "resolved", `${id} "${t.title}" ${why ?? "was resolved"}: ${notes.join("; ")}`);
   return notes;
 }
@@ -653,14 +667,13 @@ function finalCopy(project, t) {
 export async function cleanupAgain(project, id, { dryRun = false } = {}) {
   const t = load(project, id);
   if (t.status !== "resolved" && !dryRun) throw new Error(`${id} is not resolved; \`thread resolve\` cleans up (\`thread cleanup --dry-run\` previews)`);
-  let copyComplete = true;
+  let copied;
   const notes = [];
   if (!dryRun) {
-    const copied = finalCopy(project, t);
-    copyComplete = copied.outcome === "complete";
+    copied = finalCopy(project, t);
     notes.push(...copied.notes, ...(copied.error ? [`the copy home failed: ${copied.error}`] : []));
   } else notes.push("preview: assumes the final copy completes");
-  return [...notes, ...(await clean(project, t, { keepWorktree: t.status === "resolved" && t.kept_worktree, copyComplete, retry: true, dryRun }))];
+  return [...notes, ...(await clean(project, t, { keepWorktree: t.status === "resolved" && t.kept_worktree, copyComplete: !copied || copied.outcome === "complete", archive: copied, retry: true, dryRun }))];
 }
 
 export function reopen(project, id) {

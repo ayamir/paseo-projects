@@ -54,7 +54,7 @@ worktree 删除前要满足这些条件，任何一条不满足就保留并写�
 
 ## 保留的（写明原因）
 
-- `--keep-worktree`，或 `cleanup.json` 里有 `keep`：worktree 保留。sweep 和重试也不会删它。
+- `--keep-worktree`，或 `cleanup.json` 里有 `keep`：worktree 保留。sweep 和重试也不会删它（Paseo 的合并自动归档会绕过保留，见下文）。
 - 最终拷贝不完整：worktree 保留。`thread resolve --force` 可以删。
 - `cleanup.json` 解析不了：不知道哪些要保留，所以全部保留。
 - worktree 里有原因的内容：untracked、未提交改动、不认识的 ignored 内容（trace、log、报告、out/ 等）、其他线程的目录。
@@ -87,7 +87,7 @@ worktree 删除前要满足这些条件，任何一条不满足就保留并写�
 
 每次运行都会重写这两个文件：
 
-- `threads/<id>.cleanup.json`：`run`、`state`（`complete`，或有 failed 时为 `partial`）、`removed_kib`，以及每一项的 kind、target、status（removed、gone、kept、failed、skipped）、reason、kib，还有这次用的声明。
+- `threads/<id>.cleanup.json`：`run`、`state`（`complete`，或有 failed 时为 `partial`）、`archive`（这次最终拷贝的结果：`complete`、`partial`、`missing`（附 `archive_missing`）、`unknown`（家里有 library 但没有完整拷贝的记录，附 `archive_unknown`）、重试时可能是 `failed`，用 `--skip-copy` 时为 `skipped`）、`archive_agent`（写这条记录时线程的 agent id）、`removed_kib`，以及每一项的 kind、target、status（removed、gone、kept、failed、skipped）、reason、kib，还有这次用的声明。
 - `threads/<id>.cleanup.md`：同样内容的表格。
 
 几个规则：
@@ -98,6 +98,21 @@ worktree 删除前要满足这些条件，任何一条不满足就保留并写�
 - 再次 `thread resolve` 会报错，并提示改用 `thread cleanup`。
 - `--dry-run` 走同样的检查，会列出 would-remove，不删东西，也不写记录。它不会重新拷贝，所以 library 里的成品可能还没归档。
 - `pp sweep` 会对 resolved 线程残留的 worktree 再跑一次 `thread cleanup`，跳过保留的。不属于任何线程的 `pp-<slug>-t-NNNN` worktree 也走同样的 worktree 检查。
+
+## 和 Paseo 的合并自动归档冲突
+
+Paseo daemon 的 `daemon.autoArchiveAfterMerge`（默认关闭）打开时，会在 PR 合并后自动归档 workspace。触发条件只有这几条：PR 合并、git 不脏、没有领先 origin、worktree 归 Paseo 所有。满足后它用 `git worktree remove --force`、`rm -rf` 和 `git worktree prune` 删掉 worktree。它不看 pp 的保留决定，不看 ignored 内容（`.paseo-project/` 也在其中），也不看占用的进程。pp 的线程 worktree 都是 Paseo 创建的，所以这个设置打开时，删 worktree 的就不止 pp 一家：
+
+- pp 先 resolve、决定保留时：保留守不住。记录里 worktree 的 kept 原因会写明这一点，`pp doctor` 也会提示。
+- 读不到这个设置时（daemon 连不上、拒绝读取，或者回了 SDK 不认的格式），按「未知」处理，不当作关闭：kept 原因写「is unknown (原因)」，`pp doctor` 写「could not be read (原因)」。读设置失败不会挡住清理。
+- daemon 连不上时，SDK 会一直重连、不会报错，所以 pp 建立连接最多等 15 秒就放弃。这个上限只管建立连接：连上之后的单个请求按 SDK 自己的请求超时，接回已保存会话时（`importSession`，thread 和 coordinator 的重启会用到）用的独立 client 也不受这个上限约束。
+- daemon 不答时，ticker 不知道线程的 agent 是否还在工作。未知不算空闲：合并的线程和空闲超过 `auto_resolve_days` 的线程都不自动 resolve，等 daemon 能答再决定。`pp archive` 只在 agent 全部归档成功后才把项目记为 archived，否则项目状态不变。
+- Paseo 先删时（合并后 pp 要等报告完成或 10 分钟宽限，所以这是常见顺序）：最终拷贝什么也拿不到。没拷回家的部分会写进说明，比如「the thread folder was already gone: report and library not copied home」。报告平时会随更新拷回，所以家里如果有报告，那是 pp 最后一次拷的；library 只在最终拷贝时拷。清理记录里，`state` 仍然只表示清理本身是否完成，另外记 `archive: "missing"` 和 `archive_missing`。
+- 完整拷贝的证明只对写下它的那个 agent 有效（记录里的 `archive_agent` 等于线程当前的 `agent_id`）。`thread resolve --reopen` 之后 `thread restart` 总会换一个新 agent，新一轮写进新 worktree 的 library 不能拿上一轮的 `complete` 来证明；新 worktree 在最终拷贝前没了，就按下一条记为未知。不绑定线程目录，是因为重启后 Paseo 可能把分支检出到同一个路径。
+- 家里已经有 `library/<id>/`，但清理记录里没有本 agent 的 `archive: "complete"` 时，不能证明它是完整的。它可能是中途失败的 rsync 留下的（本机和远端一样），也可能来自旧版 pp：旧版的记录没有 `archive` 字段，`resolve --force` 还会在 library 超限没拷时照样删掉 worktree。这种情况记 `archive: "unknown"` 和 `archive_unknown`，说明写「whether the library home is complete is unknown」。
+- 之后的 `pp thread cleanup` 重试按磁盘实际状态记录：保留过的 worktree 不在了，就记 gone，不再记 kept。记录里写着 `archive: "complete"`、且 agent 没换过的线程，目录被删掉不算缺失。
+
+要让 pp 成为唯一的删除方，就关掉这个设置：`paseo daemon config set daemon.autoArchiveAfterMerge false`，然后 `paseo daemon reload`。这个设置对整台主机生效，pp 管不到的 workspace 也会一起停止合并后自动归档。Paseo 没有给单个 workspace 豁免的接口。
 
 ## 限制
 
