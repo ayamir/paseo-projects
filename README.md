@@ -74,7 +74,8 @@ pp thread list <slug>                         # grouped by what needs you
 pp thread prompt <slug> <id> --text "…"       # steer a thread
 pp thread permissions|allow|deny <slug> <id>  # answer its permission requests
 pp thread restart <slug> <id> [--fresh]       # bring it back on its old session
-pp thread resolve <slug> <id>                 # report copied home, worktree removed
+pp thread resolve <slug> <id>                 # report copied home, then cleanup (docs/cleanup.md)
+pp thread cleanup <slug> <id> [--dry-run]     # retry or preview that cleanup
 pp ticker start|stop|status
 pp doctor [--fix]
 ```
@@ -119,7 +120,7 @@ No. A project is a folder on your machine, `pp` talks to your own Paseo daemons,
 
 ### Will it touch my branches or worktrees on its own?
 
-Only to clean up after a thread is resolved: by you, when its pull request is merged, or after `auto_resolve_days` idle. It removes the worktree (never forced, so uncommitted changes keep it) and, only if the pull request is merged, the local branch. The report and the thread's files are copied home first.
+Only to clean up after a thread is resolved: by you, when its pull request is merged, or after `auto_resolve_days` idle. The report and the thread's files are copied home first. Then it removes the worktree with a plain `git worktree remove`, only when nothing in it would be lost (no uncommitted, untracked or unknown ignored files, no checked-out submodule, nothing using it), the paths the thread declared disposable, the Codebase Memory indexes rooted in what went, and, only if the pull request is merged, the local branch. What it keeps it says why; see [docs/cleanup.md](docs/cleanup.md).
 
 ### What is known not to work yet?
 

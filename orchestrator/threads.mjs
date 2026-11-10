@@ -8,6 +8,7 @@ import { REPO, client, importSession, sh, now, readText, readJson, writeJson, wr
 import { loadConfig, loadSafety, resolveProfile, agentConfig, kindOf, modelOf, canonical, machine as machineOf } from "./config.mjs";
 import { prefix } from "./project.mjs";
 import * as inbox from "./inbox.mjs";
+import * as cleanup from "./cleanup.mjs";
 
 
 export const STARTING_TIMEOUT_SECS = 300;
@@ -276,8 +277,8 @@ export async function rows(project) {
 
 // ------------------------------------------------------------ copy home
 
-/** Copies a thread's report home (and, with `withLibrary`, its library). */
-export function copyHome(project, t, withLibrary = false) {
+/** Copies a thread's report home (and, with `withLibrary`, its library less the `exclude` paths, relative to it). */
+export function copyHome(project, t, withLibrary = false, exclude = []) {
   if (!t.thread_dir) return { outcome: "complete", notes: [], hash: null };
   let h;
   try { h = host(t.machine); } catch (e) { return { outcome: "failed", error: e.message, notes: [] }; }
@@ -292,15 +293,17 @@ export function copyHome(project, t, withLibrary = false) {
   if (withLibrary && h.isDir(`${t.thread_dir}/library`)) {
     const lib = `${t.thread_dir}/library`;
     const du = h.shell(`du -sk ${q(lib)}`);
-    const kb = Number(du.stdout.split(/\s+/)[0]);
+    const left = exclude.reduce((s, x) => s + (Number(h.shell(`du -sk ${q(`${lib}/${x}`)}`).stdout.split(/\s+/)[0]) || 0), 0);
+    const kb = Number(du.stdout.split(/\s+/)[0]) - left;
     if (!du.ok || Number.isNaN(kb)) return { outcome: "failed", error: "could not measure the library folder", notes, hash };
     if (kb > LIBRARY_CAP_KB) notes.push(`the library is ${Math.floor(kb / 1024)} MB, over the ${LIBRARY_CAP_KB / 1024} MB cap; nothing from it was copied`);
-    else if (kb > 4) { // an empty folder is 0–4 KB
+    // Any file at all: one small file measures 4 KB, like an empty folder, and would be lost with the worktree.
+    else if (h.shell(`find ${q(lib)} -type f -print -quit`).stdout.trim()) {
       const target = project.path("library", t.id);
       mkdirSync(target, { recursive: true });
       // `-rt` without `-l`: symbolic links are skipped, never followed.
       const src = h.remote ? `${h.ssh}:${lib}/` : `${lib}/`;
-      const r = sh(["rsync", "-rt", ...(h.remote ? ["-e", "ssh -o BatchMode=yes"] : []), src, `${target}/`], undefined, undefined, { timeout: 120_000 });
+      const r = sh(["rsync", "-rt", ...exclude.map((x) => `--exclude=/${x.replace(/[*?[\\]/g, "\\$&")}`), ...(h.remote ? ["-e", "ssh -o BatchMode=yes"] : []), src, `${target}/`], undefined, undefined, { timeout: 120_000 });
       if (!r.ok) return { outcome: "failed", error: `rsync failed: ${r.out}`, notes, hash };
       if (/skipping non-regular/.test(r.out)) notes.push("symbolic links in the library were not copied");
     }
@@ -591,28 +594,26 @@ export function refreshBranch(project, t) {
   return t;
 }
 
-/** Archives the agent, removes the worktree (never forced), deletes a merged branch. */
-export async function clean(project, t, { keepWorktree = false, copyComplete = true, mergedHead = "" } = {}) {
+/**
+ * Archives the agent, then cleanup.run: declared discards, the worktree (never forced, only once nothing
+ * in it would be lost), the indexes rooted in what went; then deletes a merged branch. `retry`: the agent
+ * is already archived. `dryRun`: a preview through the same checks.
+ */
+export async function clean(project, t, { keepWorktree = false, copyComplete = true, mergedHead = "", retry = false, dryRun = false } = {}) {
   const notes = [];
   let h;
   try { h = host(t.machine); } catch (e) { return [e.message]; }
-  if (t.agent_id) {
+  if (t.agent_id && !retry && !dryRun) {
     try { const c = await client(h.url); await c.agents.ref(t.agent_id).archive(); notes.push("agent archived"); }
     catch (e) { notes.push(`agent not archived: ${e.message}`); }
   }
   // A tab thread's workspace goes with it (its folder stays); a worktree's goes with the worktree below.
-  if (t.kind === "tab" && t.workspace_id) { try { const c = await client(h.url); await c.workspaces.archive(t.workspace_id); } catch {} }
-  if (t.kind !== "worktree" || !t.cwd) return notes;
-  if (keepWorktree) { notes.push(`worktree kept at ${t.cwd}`); return notes; }
-  if (!copyComplete) { notes.push(`worktree kept at ${t.cwd}: the final copy was partial (\`thread resolve --force\` removes it)`); return notes; }
-  if (h.isDir(t.cwd)) {
-    const r = h.shell(`git worktree remove -- ${q(t.cwd)}`, t.repo);
-    if (!r.ok) { notes.push(`worktree kept: ${r.out}`); return notes; }
-    notes.push("worktree removed");
-  } else {
-    h.shell("git worktree prune", t.repo);
-    notes.push("worktree folder was already gone; pruned");
-  }
+  if (t.kind === "tab" && t.workspace_id && !dryRun) { try { const c = await client(h.url); await c.workspaces.archive(t.workspace_id); } catch {} }
+  let done;
+  try { done = await cleanup.run(project, t, h, { keepWorktree, copyComplete, dryRun }); }
+  catch (e) { return [...notes, `cleanup failed: ${e.message}; \`thread cleanup ${project.slug} ${t.id}\` retries`]; }
+  notes.push(...done.notes);
+  if (dryRun || t.kind !== "worktree" || !done.worktreeGone) return notes;
   if (t.workspace_id) { try { const c = await client(h.url); await c.workspaces.archive(t.workspace_id); } catch {} }
   if (mergedHead && t.branch) {
     const tip = h.shell(`git rev-parse --verify -q ${q(`refs/heads/${t.branch}`)}`, t.repo);
@@ -626,10 +627,10 @@ export async function clean(project, t, { keepWorktree = false, copyComplete = t
 /** Final copy, then resolved, then cleanup, then one inbox item. */
 export async function resolve(project, id, { keepWorktree = false, force = false, skipCopy = false, reason = "user", mergedHead = "", why } = {}) {
   const t = refreshBranch(project, load(project, id));
-  if (t.status === "resolved") throw new Error(`${id} is already resolved; \`sweep ${project.slug}\` cleans what is left of it`);
+  if (t.status === "resolved") throw new Error(`${id} is already resolved; \`thread cleanup ${project.slug} ${id}\` cleans what is left of it`);
   let copied = { outcome: "complete", notes: [] };
   if (!skipCopy) {
-    copied = copyHome(project, t, true);
+    copied = finalCopy(project, t);
     if (copied.outcome === "failed") throw new Error(`the final copy failed (${copied.error}); not resolving. \`--skip-copy\` resolves without it.`);
   }
   const resolved = update(project, id, (r) => {
@@ -639,6 +640,27 @@ export async function resolve(project, id, { keepWorktree = false, force = false
   const notes = [...copied.notes, ...(await clean(project, resolved, { keepWorktree, copyComplete: copied.outcome === "complete" || force, mergedHead }))];
   inbox.write(project, "thread-state", id, "resolved", `${id} "${t.title}" ${why ?? "was resolved"}: ${notes.join("; ")}`);
   return notes;
+}
+
+/** Report and library home, less the library paths the thread declared disposable. */
+function finalCopy(project, t) {
+  let excludes = [];
+  try { excludes = t.machine ? [] : cleanup.libraryExcludes(project, t, host(t.machine)); } catch {}
+  return copyHome(project, t, true, excludes);
+}
+
+/** `thread cleanup`: copy home again, then the same cleanup for a resolved thread; `dryRun` previews any thread. */
+export async function cleanupAgain(project, id, { dryRun = false } = {}) {
+  const t = load(project, id);
+  if (t.status !== "resolved" && !dryRun) throw new Error(`${id} is not resolved; \`thread resolve\` cleans up (\`thread cleanup --dry-run\` previews)`);
+  let copyComplete = true;
+  const notes = [];
+  if (!dryRun) {
+    const copied = finalCopy(project, t);
+    copyComplete = copied.outcome === "complete";
+    notes.push(...copied.notes, ...(copied.error ? [`the copy home failed: ${copied.error}`] : []));
+  } else notes.push("preview: assumes the final copy completes");
+  return [...notes, ...(await clean(project, t, { keepWorktree: t.status === "resolved" && t.kept_worktree, copyComplete, retry: true, dryRun }))];
 }
 
 export function reopen(project, id) {

@@ -9,6 +9,7 @@ You are one thread of a paseo-projects project. A coordinator agent gave you the
 - The project instructions and memory below apply to everything you do.
 - Do not edit the project's memory. Put lessons worth keeping under `## Remember` in your report; the coordinator decides what to keep.
 - Never commit anything under `.paseo-project/`; it is excluded from git for you.
+- When resolved, your worktree is removed only if nothing in it would be lost. List what may go in `cleanup.json` next to this brief: `{"discard": [{"path": "/tmp/<thread id>-…", "why": "…"}, {"path": "library/frames", "product": "library/demo.gif"}], "keep": [{"path": ".", "why": "…"}]}`. Library paths need the finished product they became.
 
 ## Report
 

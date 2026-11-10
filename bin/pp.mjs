@@ -49,6 +49,9 @@ Threads
   thread restart <slug> <id> [--profile P] [--fresh | --session ID|latest]
                                  picks up the old session unless --fresh; latest: the newest Claude session in its folder
   thread resolve <slug> <id> [--reopen] [--keep-worktree] [--skip-copy] [--force]
+                                 report and library home, then the cleanup (docs/cleanup.md)
+  thread cleanup <slug> <id> [--dry-run]
+                                 the same cleanup again for a resolved thread; --dry-run previews it for any thread
   thread permissions <slug> <id>
   thread allow <slug> <id> [--request R] [--action A] [--answers JSON]
   thread deny <slug> <id> [--request R] [--action A] [--message M]
@@ -184,7 +187,7 @@ async function main() {
       plan.forEach((s) => console.log(`- ${s.what}`));
       if (f["dry-run"]) return;
       if (!f.yes) { requirePerson("sweep without --yes"); if (ask("do these? [y/N] ").toLowerCase() !== "y") return; }
-      for (const s of plan) { const r = s.run(); console.log(`${r.ok ? "done" : `failed: ${r.out}`}: ${s.what}`); }
+      for (const s of plan) { const r = await s.run(); console.log(`${r.ok ? "done" : `failed: ${r.out}`}: ${s.what}`); }
       return;
     }
     case "migrate-herdr": {
@@ -279,6 +282,11 @@ async function threadCommand([sub, slug, id], f, root, proj) {
       if (f.reopen) { threads.reopen(p, tid()); console.log(`${id} is open again; \`thread restart\` gives it an agent`); return; }
       const notes = await threads.resolve(p, tid(), { keepWorktree: Boolean(f["keep-worktree"]), skipCopy: Boolean(f["skip-copy"]), force: Boolean(f.force) });
       console.log(`${id} resolved: ${notes.join("; ") || "nothing to clean"}`);
+      return;
+    }
+    case "cleanup": {
+      const notes = await threads.cleanupAgain(p, tid(), { dryRun: Boolean(f["dry-run"]) });
+      console.log(`${id}${f["dry-run"] ? " cleanup preview" : " cleaned up"}: ${notes.join("; ") || "nothing to clean"}`);
       return;
     }
     case "permissions": {
