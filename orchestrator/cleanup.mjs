@@ -267,7 +267,7 @@ function cleanIndexes(snap, roots, retry, dryRun) {
  * Checks everything first, lists the indexes, then deletes: declared discards, the worktree, the indexes
  * rooted in what went. Kept and skipped items are decisions, failed ones are errors; none stops the rest.
  */
-export async function run(project, t, h, { keepWorktree = false, copyComplete = true, dryRun = false } = {}) {
+export async function run(project, t, h, { keepWorktree = false, copyComplete = true, dryRun = false, paseoArchivesMerged = false } = {}) {
   const decl = declaration(project, t, h);
   const before = readJson(recordPath(project, t.id))?.items ?? [];
   const removedBefore = new Set(before.filter((i) => i.kind === "discard" && i.status === "removed").map((i) => i.target));
@@ -277,7 +277,8 @@ export async function run(project, t, h, { keepWorktree = false, copyComplete = 
     : decl.error ? `${decl.error}; its keep list is unknown`
     : decl.keep.length ? `declared kept: ${decl.keep.map((k) => k.why || k.path).join("; ")}`
     : !copyComplete ? "the final copy was partial (`thread resolve --force` removes it)" : "";
-  const worktreeKept = t.kind === "worktree" && Boolean(keepReason);
+  // A keep is about the folder: once something else removed it, the worktree step records what is there.
+  const worktreeKept = t.kind === "worktree" && Boolean(keepReason) && Boolean(t.cwd) && h.isDir(t.cwd);
   const lib = t.thread_dir ? join(canon(t.thread_dir), "library") : "";
   const items = decl.discard.map((e) => {
     const d = checkDiscard(t, e, { keeps: keepsOf(t, decl), removedBefore });
@@ -313,6 +314,7 @@ export async function run(project, t, h, { keepWorktree = false, copyComplete = 
     }
   }
   const wt = items.find((i) => i.kind === "worktree");
+  if (wt?.status === "kept" && paseoArchivesMerged) wt.reason += "; but Paseo's daemon.autoArchiveAfterMerge is on: once its pull request merges Paseo removes it with --force, without these checks (turned off, pp alone removes worktrees)";
   // Only what this run removed: a path that was already gone proves nothing about what an index pointed at.
   const roots = items.filter((i) => ["removed", "would-remove"].includes(i.status)).map((i) => i.real ?? i.target);
   items.push(...cleanIndexes(snap, roots, retry, dryRun));

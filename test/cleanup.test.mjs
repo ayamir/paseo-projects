@@ -373,6 +373,45 @@ test("a failed index retry deletes it while its root still resolves as before, n
   rmSync(g.scratch);
 });
 
+// Paseo's daemon.autoArchiveAfterMerge archives a merged workspace with deletePaseoWorktree: `git worktree
+// remove --force`, `rm -rf`, `git worktree prune`, whatever pp decided. These run exactly that on the fixture.
+const paseoArchives = (f) => { git(f.repo, "worktree", "remove", "--force", f.wt); git(f.repo, "worktree", "prune"); };
+
+test("a kept worktree that Paseo's merge auto-archive removed is recorded gone on the retry, not kept", () => {
+  for (const flags of [["--keep-worktree"], []]) {
+    const f = fixture();
+    if (!flags.length) write(join(f.td, "cleanup.json"), JSON.stringify({ keep: [{ path: ".", why: "the user wants to look at it" }] }));
+    const r = f.pp("thread", "resolve", "demo", f.id, ...flags);
+    assert.equal(f.item("worktree").status, "kept", r.out);
+    paseoArchives(f);
+    const again = f.pp("thread", "cleanup", "demo", f.id);
+    assert.ok(again.ok, again.out);
+    assert.equal(f.item("worktree").status, "gone", again.out);
+    assert.match(again.out, /worktree was already gone/);
+  }
+});
+
+test("a kept worktree's record says Paseo's merge auto-archive will still remove it", async () => {
+  const { run } = await import("../orchestrator/cleanup.mjs");
+  const { host } = await import("../orchestrator/threads.mjs");
+  for (const on of [true, false]) {
+    const f = fixture();
+    const t = JSON.parse(readFileSync(f.p.path("threads", `${f.id}.json`), "utf8"));
+    const done = await run(f.p, t, host(null), { keepWorktree: true, paseoArchivesMerged: on });
+    assert.equal(f.item("worktree").status, "kept");
+    assert.equal(/autoArchiveAfterMerge/.test(f.item("worktree").reason), on, f.item("worktree").reason);
+    assert.equal(/autoArchiveAfterMerge/.test(done.notes.join("; ")), on);
+  }
+});
+
+test("a thread folder Paseo already removed at resolve is said, not passed off as copied home", () => {
+  const f = fixture();
+  paseoArchives(f);
+  const r = f.pp("thread", "resolve", "demo", f.id);
+  assert.ok(r.ok, r.out);
+  assert.match(r.out, /thread folder was already gone/);
+});
+
 test("--dry-run previews with the same checks and deletes nothing", () => {
   const f = fixture();
   const scratch = mkdtempSync(join(TMP, `${f.id}-scratch-`));

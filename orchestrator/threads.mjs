@@ -282,7 +282,7 @@ export function copyHome(project, t, withLibrary = false, exclude = []) {
   if (!t.thread_dir) return { outcome: "complete", notes: [], hash: null };
   let h;
   try { h = host(t.machine); } catch (e) { return { outcome: "failed", error: e.message, notes: [] }; }
-  if (!h.isDir(t.thread_dir)) return { outcome: "complete", notes: [], hash: null };
+  if (!h.isDir(t.thread_dir)) return { outcome: "complete", notes: withLibrary ? ["the thread folder was already gone: its library was not copied home"] : [], hash: null };
   const notes = [];
   const report = h.read(`${t.thread_dir}/report.md`);
   let hash = null;
@@ -609,8 +609,12 @@ export async function clean(project, t, { keepWorktree = false, copyComplete = t
   }
   // A tab thread's workspace goes with it (its folder stays); a worktree's goes with the worktree below.
   if (t.kind === "tab" && t.workspace_id && !dryRun) { try { const c = await client(h.url); await c.workspaces.archive(t.workspace_id); } catch {} }
+  // Paseo's merge auto-archive removes a workspace's worktree whatever pp keeps, so a kept one says so.
+  // shortcut: an unreadable daemon config counts as off, the note is a warning; read it as unknown if that matters.
+  const paseoArchivesMerged = t.kind === "worktree" && Boolean(t.workspace_id)
+    && await client(h.url).then((c) => c.config.get()).then((r) => r.config?.autoArchiveAfterMerge === true, () => false);
   let done;
-  try { done = await cleanup.run(project, t, h, { keepWorktree, copyComplete, dryRun }); }
+  try { done = await cleanup.run(project, t, h, { keepWorktree, copyComplete, dryRun, paseoArchivesMerged }); }
   catch (e) { return [...notes, `cleanup failed: ${e.message}; \`thread cleanup ${project.slug} ${t.id}\` retries`]; }
   notes.push(...done.notes);
   if (dryRun || t.kind !== "worktree" || !done.worktreeGone) return notes;

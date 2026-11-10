@@ -54,7 +54,7 @@ worktree 删除前要满足这些条件，任何一条不满足就保留并写�
 
 ## 保留的（写明原因）
 
-- `--keep-worktree`，或 `cleanup.json` 里有 `keep`：worktree 保留。sweep 和重试也不会删它。
+- `--keep-worktree`，或 `cleanup.json` 里有 `keep`：worktree 保留。sweep 和重试也不会删它（Paseo 的合并自动归档会绕过保留，见下文）。
 - 最终拷贝不完整：worktree 保留。`thread resolve --force` 可以删。
 - `cleanup.json` 解析不了：不知道哪些要保留，所以全部保留。
 - worktree 里有原因的内容：untracked、未提交改动、不认识的 ignored 内容（trace、log、报告、out/ 等）、其他线程的目录。
@@ -98,6 +98,16 @@ worktree 删除前要满足这些条件，任何一条不满足就保留并写�
 - 再次 `thread resolve` 会报错，并提示改用 `thread cleanup`。
 - `--dry-run` 走同样的检查，会列出 would-remove，不删东西，也不写记录。它不会重新拷贝，所以 library 里的成品可能还没归档。
 - `pp sweep` 会对 resolved 线程残留的 worktree 再跑一次 `thread cleanup`，跳过保留的。不属于任何线程的 `pp-<slug>-t-NNNN` worktree 也走同样的 worktree 检查。
+
+## 和 Paseo 的合并自动归档冲突
+
+Paseo daemon 的 `daemon.autoArchiveAfterMerge`（默认关闭）打开时，会在 PR 合并后自动归档 workspace。触发条件只有这几条：PR 合并、git 不脏、没有领先 origin、worktree 归 Paseo 所有。满足后它用 `git worktree remove --force`、`rm -rf` 和 `git worktree prune` 删掉 worktree。它不看 pp 的保留决定，不看 ignored 内容（`.paseo-project/` 也在其中），也不看占用的进程。pp 的线程 worktree 都是 Paseo 创建的，所以这个设置打开时，删 worktree 的就不止 pp 一家：
+
+- pp 先 resolve、决定保留时：保留守不住。记录里 worktree 的 kept 原因会写明这一点，`pp doctor` 也会提示。
+- Paseo 先删时（合并后 pp 要等报告完成或 10 分钟宽限，所以这是常见顺序）：最终拷贝拿不到 library，resolve 的说明里会写「the thread folder was already gone」。
+- 之后的 `pp thread cleanup` 重试按磁盘实际状态记录：保留过的 worktree 不在了，就记 gone，不再记 kept。
+
+要让 pp 成为唯一的删除方，就关掉这个设置：`paseo daemon config set daemon.autoArchiveAfterMerge false`，然后 `paseo daemon reload`。这个设置对整台主机生效，pp 管不到的 workspace 也会一起停止合并后自动归档。Paseo 没有给单个 workspace 豁免的接口。
 
 ## 限制
 

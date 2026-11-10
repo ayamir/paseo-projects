@@ -109,10 +109,12 @@ export async function doctor(root, fix) {
   const out = [];
   const config = loadConfig();
   for (const [name, p] of Object.entries(config.profiles)) if (!p.provider) out.push(`config.json: profile \`${name}\` has no provider`);
-  try { await client(); } catch (e) { out.push(`the local Paseo daemon does not answer (${e.message}); \`paseo start\` starts it`); }
+  // A second remover of thread worktrees, one that skips pp's checks and keeps; the setting is host-wide.
+  const autoArchives = (c, where) => c.config.get().then((r) => { if (r.config?.autoArchiveAfterMerge === true) out.push(`${where}: Paseo's daemon.autoArchiveAfterMerge is on; it removes a merged thread's worktree with --force whatever pp keeps, often before pp copies its library home. \`paseo daemon config set daemon.autoArchiveAfterMerge false\`, then \`paseo daemon reload\`, leaves the removal to pp (it also stops it for workspaces pp does not manage)`); }, () => {});
+  try { await autoArchives(await client(), "the local Paseo daemon"); } catch (e) { out.push(`the local Paseo daemon does not answer (${e.message}); \`paseo start\` starts it`); }
   for (const [name, m] of Object.entries(config.machines)) {
     if (!m.url) out.push(`config.json: machine \`${name}\` has no url`);
-    else { try { await client(m.url); } catch (e) { out.push(`machine \`${name}\` (${m.url}) does not answer: ${e.message}`); } }
+    else { try { await autoArchives(await client(m.url), `machine \`${name}\``); } catch (e) { out.push(`machine \`${name}\` (${m.url}) does not answer: ${e.message}`); } }
   }
   if (!ticker.runningPid(root)) {
     out.push("the ticker is not running");
