@@ -342,6 +342,37 @@ test("an index rooted at a link into the main checkout is not the thread's, even
   assert.deepEqual(f.indexes(), ["main-via-link", "via-dangling"]);
 });
 
+test("a failed index retry deletes it while its root still resolves as before, not once the path points into the main checkout", () => {
+  const firstRunFails = () => {
+    const f = fixture();
+    const scratch = mkdtempSync(join(TMP, `${f.id}-scratch-`));
+    write(join(f.td, "cleanup.json"), JSON.stringify({ discard: [{ path: scratch }] }));
+    f.indexes({ projects: [{ name: "idx", root_path: join(scratch, "index") }], failDelete: true });
+    assert.ok(f.pp("thread", "resolve", "demo", f.id).ok);
+    assert.ok(!existsSync(scratch));
+    assert.equal(f.item("index", "idx").status, "failed");
+    f.indexes({ failDelete: false });
+    return { ...f, scratch, deletes: () => readFileSync(join(f.root, "cbm.json.log"), "utf8").split("\n").filter((l) => l.startsWith("delete_project")).length };
+  };
+
+  const f = firstRunFails();
+  f.pp("thread", "cleanup", "demo", f.id);
+  assert.equal(f.item("index", "idx").status, "removed");
+  assert.equal(f.cleanup().state, "complete");
+  assert.deepEqual(f.indexes(), []);
+
+  const g = firstRunFails();
+  mkdirSync(join(g.repo, "index"));
+  symlinkSync(g.repo, g.scratch); // the same root string now resolves into the main checkout
+  const tried = g.deletes();
+  const r = g.pp("thread", "cleanup", "demo", g.id);
+  assert.equal(g.deletes(), tried, r.out);
+  assert.deepEqual(g.indexes(), ["idx"]);
+  assert.equal(g.item("index", "idx").status, "kept", r.out);
+  assert.ok(existsSync(join(g.repo, "package.json")));
+  rmSync(g.scratch);
+});
+
 test("--dry-run previews with the same checks and deletes nothing", () => {
   const f = fixture();
   const scratch = mkdtempSync(join(TMP, `${f.id}-scratch-`));

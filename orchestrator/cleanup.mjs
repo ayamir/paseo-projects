@@ -6,8 +6,9 @@
 // The one ownership rule: something is the thread's to delete only as a real path, resolved before anything
 // is deleted, inside its own folder or a <tmp>/<id>-… folder, clear of every thread folder but the inside of
 // its own and of everything it declared kept. An index is the thread's only when its root resolved, before
-// the deletion, inside what this run removed, or when an earlier run of the thread recorded it. A path that is
-// not there proves nothing.
+// the deletion, inside what this run removed, or when an earlier run recorded it failed with the real root and the
+// removed folder that proved it, the root still resolving there and the folder still gone. A path that is not
+// there proves nothing.
 import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve as resolvePath } from "node:path";
@@ -228,23 +229,36 @@ function snapshot() {
 
 /**
  * Deletes the indexes this run proved the thread's: rooted (as resolved before the deletion) inside a folder
- * it removed, or recorded by an earlier run (`retry`) with the same root. Then lists again to check.
+ * it removed, or recorded failed by an earlier run (`retry`) with the same root, still resolving to the real
+ * root recorded then, under a removed folder still not there. Then lists again to check.
  */
 function cleanIndexes(snap, roots, retry, dryRun) {
   if (!snap || (!roots.length && !retry.length)) return [];
   if (snap.skip) return [{ kind: "index", target: "(codebase-memory-mcp)", status: "skipped", reason: snap.skip }];
   if (snap.error) return [{ kind: "index", target: "(list)", status: "failed", reason: `${snap.error}; listed before the removal or not at all, the indexes in what went are not known: delete them by hand` }];
-  const recorded = (x) => retry.some((i) => i.target === x.name && i.root === x.root);
-  const owned = snap.rows.filter((x) => (x.real && roots.some((r) => inside(x.real, r))) || recorded(x));
+  const owned = [], held = [];
+  for (const x of snap.rows) {
+    const under = x.real && roots.find((r) => inside(x.real, r));
+    if (under) { owned.push({ ...x, under }); continue; }
+    const i = retry.find((i) => i.target === x.name && i.root === x.root);
+    if (!i) continue;
+    const back = (() => { try { lstatSync(i.under); return true; } catch { return false; } })();
+    const why = !i.real || !i.under ? "no real root on record from the run that removed its folder"
+      : x.real !== i.real ? `its root now resolves to ${x.real || "(unknown)"}, not ${i.real} as when its folder was removed`
+      : back ? `${i.under}, removed for it, is there again` : "";
+    if (why) held.push({ kind: "index", target: x.name, root: x.root, status: i.real && i.under ? "kept" : "skipped", reason: why });
+    else owned.push({ ...x, under: i.under });
+  }
   const vanished = retry.filter((i) => !snap.rows.some((x) => x.name === i.target)).map((i) => ({ ...i, status: "gone", reason: undefined }));
-  if (dryRun) return [...owned.map((x) => ({ kind: "index", target: x.name, root: x.root, status: "would-remove" })), ...vanished];
+  const item = (x, status, reason) => ({ kind: "index", target: x.name, root: x.root, real: x.real, under: x.under, status, reason });
+  if (dryRun) return [...owned.map((x) => item(x, "would-remove")), ...held, ...vanished];
   const errors = new Map();
   for (const x of owned) { try { cbm("delete_project", { project: x.name }); } catch (e) { errors.set(x.name, e.message); } }
   let left;
-  try { left = new Set(listIndexes().map((x) => x.name)); } catch (e) { return [...owned.map((x) => ({ kind: "index", target: x.name, root: x.root, status: "failed", reason: `not checked: ${e.message}` })), ...vanished]; }
+  try { left = new Set(listIndexes().map((x) => x.name)); } catch (e) { return [...owned.map((x) => item(x, "failed", `not checked: ${e.message}`)), ...held, ...vanished]; }
   return [...owned.map((x) => left.has(x.name)
-    ? { kind: "index", target: x.name, root: x.root, status: "failed", reason: errors.get(x.name) ?? "still listed after delete_project" }
-    : { kind: "index", target: x.name, root: x.root, status: "removed" }), ...vanished];
+    ? item(x, "failed", errors.get(x.name) ?? "still listed after delete_project")
+    : item(x, "removed")), ...held, ...vanished];
 }
 
 // ------------------------------------------------------------ one run
