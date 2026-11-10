@@ -1,10 +1,11 @@
 // Project lifecycle: pause, archive, delete, rename; sweep and doctor.
-import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { client, sh, readText, readJson, writeJson, isFile, isDir, secondsSince } from "./lib.mjs";
 import { CONFIG_PATH, canonical, loadConfig, moveApprovals } from "./config.mjs";
 import { Project, SUBDIRS, TASKS_TEMPLATE, writeAgentsMd, writeSettings, listSlugs } from "./project.mjs";
 import * as threads from "./threads.mjs";
+import * as cleanup from "./cleanup.mjs";
 import * as inbox from "./inbox.mjs";
 import * as ticker from "./ticker.mjs";
 
@@ -66,20 +67,29 @@ export async function rename(project, newSlug, { name, dryRun = false } = {}) {
 
 // ------------------------------------------------------------ sweep
 
-/** What is left behind: orphan `pp-<slug>-t-NNNN` worktrees, merged branches of resolved threads, old done items. */
+/**
+ * What is left behind: `pp-<slug>-t-NNNN` worktrees of resolved threads (cleaned up again, the same way
+ * resolve does; a kept one stays) and of no thread at all, merged branches of resolved threads, old done items.
+ */
 export function sweepPlan(project) {
   const plan = [];
   const all = threads.list(project);
-  const openCwds = new Set(all.filter(threads.isOpen).map((t) => t.cwd));
+  const real = (p) => { try { return realpathSync(p); } catch { return p; } };
+  const byCwd = new Map(all.filter((t) => t.cwd).flatMap((t) => [[t.cwd, t], [real(t.cwd), t]]));
   for (const repo of project.settings().repos.filter((r) => !r.machine)) {
     const r = sh(["git", "-C", repo.path, "worktree", "list", "--porcelain"]);
     if (!r.ok) continue;
     for (const block of r.stdout.split("\n\n")) {
       const path = /^worktree (.+)$/m.exec(block)?.[1];
       const branch = /^branch refs\/heads\/(.+)$/m.exec(block)?.[1];
-      if (path && threads.isOwnBranch(project.slug, branch) && !openCwds.has(path)) {
-        plan.push({ what: `remove worktree ${path} (${branch})`, run: () => sh(["git", "-C", repo.path, "worktree", "remove", "--", path]) });
-      }
+      if (!path || !threads.isOwnBranch(project.slug, branch)) continue;
+      const t = byCwd.get(path);
+      if (t && (threads.isOpen(t) || t.kept_worktree)) continue;
+      if (t) plan.push({ what: `clean up ${t.id} again (worktree ${path})`, run: async () => ({ ok: true, out: (await threads.cleanupAgain(project, t.id)).join("; ") }) });
+      else plan.push({ what: `remove worktree ${path} (${branch}), of no thread`, run: async () => {
+        const i = await cleanup.removeWorktree(threads.host(null), { cwd: path, repo: repo.path });
+        return { ok: i.status === "removed", out: i.reason ?? i.status };
+      } });
     }
   }
   for (const t of all.filter((t) => t.status === "resolved" && t.branch && t.repo && !t.machine && t.pr_state === "MERGED")) {
