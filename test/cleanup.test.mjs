@@ -12,7 +12,7 @@ import { createRequire } from "node:module";
 const TMP = realpathSync(tmpdir());
 const BASE = mkdtempSync(join(TMP, "pp-cleanup-"));
 process.env.PP_CONFIG = join(BASE, "config.json");
-const { create } = await import("../orchestrator/project.mjs");
+const { create, writeSettings } = await import("../orchestrator/project.mjs");
 const PP = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "pp.mjs");
 
 const FAKE_CBM = join(BASE, "fake-cbm.mjs");
@@ -486,6 +486,89 @@ test("a retry after pp archived and removed the worktree does not call the archi
   assert.ok(r.ok, r.out);
   assert.doesNotMatch(r.out, /not copied home/);
   assert.equal(f.cleanup().archive, "complete");
+});
+
+test("a library copy that failed part way, then the folder gone: the archive is unknown, never complete", () => {
+  const f = fixture();
+  write(join(f.td, "library", "a.txt"), "a\n");
+  write(join(f.td, "library", "b.txt"), "b\n");
+  chmodSync(join(f.td, "library", "b.txt"), 0); // rsync copies a.txt, fails on b.txt
+  const first = f.pp("thread", "resolve", "demo", f.id);
+  assert.ok(!first.ok, first.out);
+  assert.match(first.out, /final copy failed/);
+  assert.ok(existsSync(f.p.path("library", f.id, "a.txt")) && !existsSync(f.p.path("library", f.id, "b.txt")));
+  paseoArchives(f);
+  for (const args of [["resolve", "demo", f.id], ["cleanup", "demo", f.id]]) {
+    const r = f.pp("thread", ...args);
+    assert.ok(r.ok, r.out);
+    assert.match(r.out, /thread folder was already gone: whether the library home is complete is unknown/);
+    assert.equal(f.cleanup().archive, "unknown", args[0]);
+    assert.deepEqual(f.cleanup().archive_unknown, ["library"]);
+  }
+});
+
+test("an old cleanup record without an archive field does not prove the library came home complete", () => {
+  const f = fixture();
+  write(join(f.td, "library", "a.txt"), "a\n");
+  assert.ok(f.pp("thread", "resolve", "demo", f.id).ok);
+  assert.equal(f.item("worktree").status, "removed");
+  // As pp wrote it before it recorded the archive: `resolve --force` also removed worktrees whose library was not copied.
+  const { archive, ...old } = f.cleanup();
+  writeFileSync(f.p.path("threads", `${f.id}.cleanup.json`), JSON.stringify(old));
+  const r = f.pp("thread", "cleanup", "demo", f.id);
+  assert.ok(r.ok, r.out);
+  assert.match(r.out, /whether the library home is complete is unknown/);
+  assert.equal(f.cleanup().archive, "unknown");
+});
+
+test("pp archive leaves the project active when the daemon does not answer, not archived with live agents", () => {
+  const f = fixture();
+  const r = f.pp("archive", "demo");
+  assert.ok(!r.ok, r.out);
+  assert.match(r.out, /no Paseo daemon answered/);
+  assert.equal(f.p.status, "active");
+});
+
+// One ticker pass in its own process, `gh` faked: the pull request is merged.
+const FAKE_GH_DIR = join(BASE, "fake-gh");
+write(join(FAKE_GH_DIR, "gh"), `#!/usr/bin/env node
+const a = process.argv.slice(2);
+console.log(a[0] === "pr" && a[1] === "view" ? process.env.FAKE_GH_VIEW : a[0] === "api" ? "me" : "[]");
+`);
+chmodSync(join(FAKE_GH_DIR, "gh"), 0o755);
+const ORCH = join(dirname(fileURLToPath(import.meta.url)), "..", "orchestrator");
+const TICK = join(BASE, "tick.mjs");
+writeFileSync(TICK, `const { tick } = await import(${JSON.stringify(pathToFileURL(join(ORCH, "ticker.mjs")).href)});
+const { Project } = await import(${JSON.stringify(pathToFileURL(join(ORCH, "project.mjs")).href)});
+await tick(new Project(process.argv[2], "demo"), process.argv[3]);
+process.exit(0);
+`);
+const tickOnce = (f, started, view) => new Promise((ok) => {
+  const env = { ...process.env, PATH: `${FAKE_GH_DIR}:${process.env.PATH}`, PASEO_URL: NO_DAEMON, PP_CODEBASE_MEMORY_BIN: FAKE_CBM, FAKE_GH_VIEW: JSON.stringify(view) };
+  const c = spawn(process.execPath, [TICK, f.root, started], { env, stdio: ["ignore", "pipe", "pipe"] });
+  let out = "";
+  c.stdout.on("data", (d) => (out += d)); c.stderr.on("data", (d) => (out += d));
+  const timer = setTimeout(() => c.kill(), 120_000);
+  c.on("exit", (code) => { clearTimeout(timer); ok({ code, out }); });
+});
+
+test("the ticker resolves no merged or idle thread while the daemon that says whether its agent works does not answer", async () => {
+  const old = new Date(Date.now() - 30 * 86400_000).toISOString();
+  const merged = fixture(), idle = fixture();
+  const url = "https://github.com/o/r/pull/7";
+  for (const [f, extra] of [[merged, { origin: "https://github.com/o/r", last_state_change: new Date().toISOString() }], [idle, { last_state_change: old, last_report_change: old }]]) {
+    const path = f.p.path("threads", `${f.id}.json`);
+    writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, "utf8")), agent_id: "agent-maybe-working", report_hash: "h", acked_report_hash: "h", ...extra }));
+    write(f.p.path("threads", `${f.id}.progress.json`), JSON.stringify({ percent: 100, activity: "done", reported_at: Math.floor(Date.now() / 1000) }));
+    write(f.p.path("threads", `${f.id}.md`), `${f === merged ? `PR: ${url}\n\n` : ""}## Report\ndone\n`);
+    writeSettings(f.p, { ...f.p.settings(), mute: true, nudge: false });
+  }
+  const view = { state: "MERGED", reviewDecision: "", statusCheckRollup: [], comments: [], reviews: [], headRefName: merged.branch, headRefOid: "abc", headRepository: { name: "r" }, headRepositoryOwner: { login: "o" } };
+  const runs = await Promise.all([tickOnce(merged, old, view), tickOnce(idle, old, view)]);
+  for (const r of runs) assert.equal(r.code, 0, r.out);
+  const now = (f) => ({ status: JSON.parse(readFileSync(f.p.path("threads", `${f.id}.json`), "utf8")).status, worktree: existsSync(f.wt) });
+  assert.deepEqual({ merged: now(merged), idle: now(idle) }, { merged: { status: "open", worktree: true }, idle: { status: "open", worktree: true } }, runs.map((r) => r.out).join("\n"));
+  assert.equal(JSON.parse(readFileSync(merged.p.path("threads", `${merged.id}.json`), "utf8")).pr_state, "MERGED");
 });
 
 test("--dry-run previews with the same checks and deletes nothing", () => {

@@ -16,19 +16,24 @@ async function liveAgents(project) {
   return r.entries.map((e) => e.agent).filter((a) => !a.archivedAt && a.status !== "closed" && ["thread", "coordinator"].includes(a.labels?.role));
 }
 
+/** Throws unless every one was archived, so a caller changes nothing on disk while agents still run. */
 async function archiveAgents(project) {
   const c = await client();
   const agents = await liveAgents(project);
-  for (const a of agents) await c.agents.ref(a.id).archive().catch(() => {});
+  const failed = [];
+  for (const a of agents) await c.agents.ref(a.id).archive().catch((e) => failed.push(`${a.id}: ${e.message}`));
+  if (failed.length) throw new Error(`${failed.length} of ${agents.length} agent(s) were not archived (${failed.join("; ")})`);
   return agents.length;
 }
 
 export function pause(project) { project.setState({ status: "paused" }); }
 export function resume(project) { project.setState({ status: "active" }); }
 
+/** Archived only once its agents are: a daemon that does not answer leaves the project as it was. */
 export async function archive(project) {
+  const n = await archiveAgents(project);
   project.setState({ status: "archived" });
-  return archiveAgents(project);
+  return n;
 }
 export function unarchive(project) { project.setState({ status: "active" }); }
 

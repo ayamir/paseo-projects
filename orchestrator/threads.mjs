@@ -283,15 +283,15 @@ export function copyHome(project, t, withLibrary = false, exclude = []) {
   let h;
   try { h = host(t.machine); } catch (e) { return { outcome: "failed", error: e.message, notes: [] }; }
   if (!h.isDir(t.thread_dir)) {
-    // Gone before a final copy. A retry after a complete one (whose run then removed the worktree) misses nothing.
-    const prev = readJson(project.path("threads", `${t.id}.cleanup.json`));
-    const archivedBefore = prev?.archive ? prev.archive === "complete" : Boolean(prev?.items?.some((i) => i.kind === "worktree" && i.status === "removed"));
-    if (!withLibrary || archivedBefore) return { outcome: "complete", notes: [], hash: null };
+    // Gone before a final copy. Only a recorded complete one proves the library home whole: a library folder home
+    // may be a copy that failed part way, and a record without `archive` (older pp) a `--force` that skipped it.
+    if (!withLibrary || readJson(project.path("threads", `${t.id}.cleanup.json`))?.archive === "complete") return { outcome: "complete", notes: [], hash: null };
     // The report comes home as it changes, the library only with a final copy: what is not home now is lost.
     const reportHome = existsSync(homeReportPath(project, t.id));
-    const missing = [...(reportHome ? [] : ["report"]), ...(isDir(project.path("library", t.id)) ? [] : ["library"])];
-    if (!missing.length) return { outcome: "complete", notes: [], hash: null };
-    return { outcome: "missing", missing, hash: null, notes: [`the thread folder was already gone: ${missing.join(" and ")} not copied home${reportHome ? "; the report home is pp's last copy" : ""}`] };
+    const libraryHome = isDir(project.path("library", t.id));
+    const missing = [...(reportHome ? [] : ["report"]), ...(libraryHome ? [] : ["library"])];
+    const said = [...(missing.length ? [`${missing.join(" and ")} not copied home`] : []), ...(libraryHome ? ["whether the library home is complete is unknown"] : [])];
+    return { outcome: missing.length ? "missing" : "unknown", missing, unknown: libraryHome ? ["library"] : [], hash: null, notes: [`the thread folder was already gone: ${said.join("; ")}${reportHome ? "; the report home is pp's last copy" : ""}`] };
   }
   const notes = [];
   const report = h.read(`${t.thread_dir}/report.md`);

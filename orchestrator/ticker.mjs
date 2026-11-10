@@ -233,8 +233,12 @@ async function prRoutines(project, t, url, events, s) {
   }
 }
 
+// Whether its agent works is unknown while its daemon does not answer, and unknown is not idle: it waits.
+const agentUnknown = (agents, t) => (agents.unreachable ?? []).includes(t.machine || "local");
+
 /** A merged thread resolves once it is done with it: idle, and finished or quiet for a while. */
 async function resolveMerged(project, t, url, s, agents, at) {
+  if (agentUnknown(agents, t)) return;
   const live = threads.liveOf(t, agents.get(t.agent_id), threads.progressOf(project, t.id), at);
   const g = threads.group(t, live, at).group;
   if (g === "working" || g === "waiting-on-you") return;
@@ -254,7 +258,7 @@ async function autoResolve(project, settings, state, agents, at) {
   const days = settings.auto_resolve_days;
   if (!days) return;
   for (const t of threads.list(project).filter(threads.isOpen)) {
-    if (t.status !== "open") continue;
+    if (t.status !== "open" || agentUnknown(agents, t)) continue;
     const live = threads.liveOf(t, agents.get(t.agent_id), threads.progressOf(project, t.id), at);
     if (threads.group(t, live, at).group !== "idle") continue;
     const since = [t.last_state_change, t.last_report_change, state.started_at].filter(Boolean).sort().pop();

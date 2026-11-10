@@ -346,12 +346,12 @@ function record(project, t, items, decl, archive) {
   const failed = merged.filter((i) => i.status === "failed").length;
   const rec = {
     thread: t.id, project: project.slug, run: (prev?.run ?? 0) + 1, at, state: failed ? "partial" : "complete",
-    archive: archive.outcome, ...(archive.missing?.length ? { archive_missing: archive.missing } : {}),
+    archive: archive.outcome, ...(archive.missing?.length ? { archive_missing: archive.missing } : {}), ...(archive.unknown?.length ? { archive_unknown: archive.unknown } : {}),
     removed_kib: merged.filter((i) => i.status === "removed").reduce((s, i) => s + (i.kib ?? 0), 0),
     measure: "du -sk before removal; shared or cloned blocks mean it is not a promise of freed disk",
     items: merged, declaration: decl,
   };
   writeJson(recordPath(project, t.id), rec);
   const rows = merged.map((i) => `| ${i.kind} | \`${i.target}\` | ${i.status} | ${i.kib ?? ""} | ${(i.reason ?? i.why ?? "").replace(/\|/g, "\\|")} |`);
-  writeAtomic(project.path("threads", `${t.id}.cleanup.md`), `# ${t.id} cleanup\n\nRun ${rec.run} at ${at}: **${rec.state}**${failed ? ` (${failed} failed; \`pp thread cleanup ${project.slug} ${t.id}\` retries)` : ""}; archive **${rec.archive}**${rec.archive_missing ? ` (not copied home: ${rec.archive_missing.join(", ")})` : ""}. Removed ${rec.removed_kib} KiB (${rec.measure}).\n\n| Kind | Target | Result | KiB | Reason |\n|---|---|---|---|---|\n${rows.join("\n")}\n`);
+  writeAtomic(project.path("threads", `${t.id}.cleanup.md`), `# ${t.id} cleanup\n\nRun ${rec.run} at ${at}: **${rec.state}**${failed ? ` (${failed} failed; \`pp thread cleanup ${project.slug} ${t.id}\` retries)` : ""}; archive **${rec.archive}**${rec.archive_missing ? ` (not copied home: ${rec.archive_missing.join(", ")})` : ""}${rec.archive_unknown ? ` (completeness unknown: ${rec.archive_unknown.join(", ")})` : ""}. Removed ${rec.removed_kib} KiB (${rec.measure}).\n\n| Kind | Target | Result | KiB | Reason |\n|---|---|---|---|---|\n${rows.join("\n")}\n`);
 }
