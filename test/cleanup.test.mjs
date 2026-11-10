@@ -265,6 +265,83 @@ test("a retry keeps the earlier removal on record when the worktree path goes th
   assert.equal(f.item("worktree").status, "removed");
 });
 
+// Review of PR #1: the four reachable gaps.
+
+test("a declaration cannot reach another thread's folder, its ancestors, or a folder holding one", () => {
+  const f = fixture();
+  const other = join(f.wt, ".paseo-project", "demo-t-0002");
+  write(join(other, "report.md"), "another thread's report\n");
+  const holder = mkdtempSync(join(TMP, `${f.id}-holder-`));
+  write(join(holder, "wt", ".paseo-project", "x-t-0003", "report.md"), "another\n");
+  write(join(f.td, "cleanup.json"), JSON.stringify({ discard: [{ path: "../demo-t-0002" }, { path: ".." }, { path: holder }] }));
+  const r = f.pp("thread", "resolve", "demo", f.id);
+  assert.ok(r.ok, r.out);
+  const ds = f.cleanup().items.filter((i) => i.kind === "discard");
+  assert.deepEqual(ds.map((i) => i.status), ["kept", "kept", "kept"], r.out);
+  assert.ok(ds.every((i) => /thread folder/.test(i.reason)), ds.map((i) => i.reason).join("\n"));
+  assert.ok(existsSync(join(other, "report.md")) && existsSync(join(holder, "wt", ".paseo-project", "x-t-0003", "report.md")));
+  rmSync(holder, { recursive: true, force: true });
+});
+
+test("a missing path never makes an index this thread's; a failed registration removal is failed", () => {
+  const f = fixture();
+  const foreign = join(BASE, `foreign-${f.id}`); // not there, and never the thread's
+  write(join(f.td, "cleanup.json"), JSON.stringify({ discard: [{ path: foreign }] }));
+  f.indexes({ projects: [{ name: "foreign-index", root_path: join(foreign, "x") }] });
+  assert.ok(f.pp("thread", "resolve", "demo", f.id).ok);
+  assert.equal(f.item("discard").status, "skipped");
+  assert.deepEqual(f.indexes(), ["foreign-index"]);
+
+  const g = fixture();
+  git(g.repo, "worktree", "lock", g.wt); // `git worktree remove` without --force refuses a locked one
+  rmSync(g.wt, { recursive: true, force: true });
+  g.indexes({ projects: [{ name: "wt-index", root_path: g.wt }] });
+  const r = g.pp("thread", "resolve", "demo", g.id);
+  assert.match(r.out, /worktree failed/, r.out);
+  assert.equal(g.cleanup().state, "partial");
+  assert.deepEqual(g.indexes(), ["wt-index"]);
+});
+
+test("a declared keep protects every overlapping discard, in temp folders and tab threads too", () => {
+  const f = fixture();
+  const scratch = mkdtempSync(join(TMP, `${f.id}-scratch-`));
+  write(join(scratch, "qa", "result.json"), "{}\n");
+  write(join(f.td, "cleanup.json"), JSON.stringify({ discard: [{ path: scratch }], keep: [{ path: join(scratch, "qa"), why: "QA result" }] }));
+  f.pp("thread", "resolve", "demo", f.id);
+  assert.equal(f.item("discard").status, "kept");
+  assert.ok(existsSync(join(scratch, "qa", "result.json")));
+  rmSync(scratch, { recursive: true, force: true });
+
+  const g = fixture();
+  const tab = mkdtempSync(join(BASE, "tab-"));
+  const td = join(tab, ".paseo-project", `demo-${g.id}`);
+  write(join(td, "report.md"), "## Report\nfinal\n");
+  write(join(tab, "out", "keep", "a.txt"), "keep\n");
+  write(join(td, "cleanup.json"), JSON.stringify({ discard: [{ path: "../../out" }], keep: [{ path: "../../out/keep" }] }));
+  const rec = JSON.parse(readFileSync(g.p.path("threads", `${g.id}.json`), "utf8"));
+  writeFileSync(g.p.path("threads", `${g.id}.json`), JSON.stringify({ ...rec, kind: "tab", repo: "", branch: "", cwd: tab, thread_dir: td }));
+  assert.ok(g.pp("thread", "resolve", "demo", g.id).ok);
+  assert.equal(g.item("discard").status, "kept");
+  assert.ok(existsSync(join(tab, "out", "keep", "a.txt")));
+});
+
+test("an index rooted at a link into the main checkout is not the thread's, even once the link is gone", () => {
+  const f = fixture();
+  const scratch = mkdtempSync(join(TMP, `${f.id}-scratch-`));
+  symlinkSync(f.repo, join(scratch, "main-link"));
+  symlinkSync(join(BASE, `moved-away-${f.id}`), join(scratch, "dangling")); // where it pointed is not known
+  write(join(f.td, "cleanup.json"), JSON.stringify({ discard: [{ path: scratch }] }));
+  f.indexes({ projects: [
+    { name: "main-via-link", root_path: join(scratch, "main-link") }, { name: "via-dangling", root_path: join(scratch, "dangling", "x") },
+    { name: "scratch-index", root_path: scratch }, { name: "scratch-sub", root_path: join(scratch, "not-made-yet") },
+  ] });
+  assert.ok(f.pp("thread", "resolve", "demo", f.id).ok);
+  assert.ok(!existsSync(scratch) && existsSync(join(f.repo, "package.json")));
+  assert.deepEqual(f.indexes(), ["main-via-link", "via-dangling"]);
+  f.pp("thread", "cleanup", "demo", f.id);
+  assert.deepEqual(f.indexes(), ["main-via-link", "via-dangling"]);
+});
+
 test("--dry-run previews with the same checks and deletes nothing", () => {
   const f = fixture();
   const scratch = mkdtempSync(join(TMP, `${f.id}-scratch-`));

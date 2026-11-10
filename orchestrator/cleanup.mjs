@@ -2,6 +2,12 @@
 // disposable: the paths it declared in <thread_dir>/cleanup.json, its worktree, and the Codebase Memory
 // indexes rooted in what was removed. One implementation for resolve, `thread cleanup` (retry; with
 // --dry-run a preview) and sweep. Every run rewrites threads/<id>.cleanup.json and .cleanup.md.
+//
+// The one ownership rule: something is the thread's to delete only as a real path, resolved before anything
+// is deleted, inside its own folder or a <tmp>/<id>-… folder, clear of every thread folder but the inside of
+// its own and of everything it declared kept. An index is the thread's only when its root resolved, before
+// the deletion, inside what this run removed, or when an earlier run of the thread recorded it. A path that is
+// not there proves nothing.
 import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve as resolvePath } from "node:path";
@@ -31,13 +37,20 @@ export function declaration(project, t, h) {
   return { discard: list(d.discard), keep: list(d.keep) };
 }
 
-/** Where a declared path may be: in the thread's own folder (worktree or tab folder), or a <tmp>/<id>-… folder. */
-function checkDiscard(t, e) {
+const keepsOf = (t, decl) => decl.keep.map((k) => canon(isAbsolute(k.path) ? k.path : resolvePath(t.thread_dir, k.path)));
+
+/**
+ * Whether a declared path is the thread's to delete (see the rule at the top). `keeps`: the real paths it
+ * declared kept; `removedBefore`: the targets an earlier run removed, the only proof a missing path was its.
+ */
+function checkDiscard(t, e, { keeps = [], removedBefore = new Set() } = {}) {
   const abs = isAbsolute(e.path) ? e.path : resolvePath(t.thread_dir, e.path);
   const item = { kind: "discard", target: canon(abs), why: e.why };
   if (t.machine) return { ...item, status: "kept", reason: "declared paths on another machine are not cleaned from here" };
   let st;
-  try { st = lstatSync(abs); } catch { return { ...item, status: "gone" }; }
+  try { st = lstatSync(abs); } catch {
+    return removedBefore.has(item.target) ? { ...item, status: "gone" } : { ...item, status: "skipped", reason: "not there, and no earlier run of this thread removed it" };
+  }
   if (st.isSymbolicLink()) return { ...item, status: "kept", reason: "is a symbolic link; its target is not the thread's to delete" };
   const real = realpathSync(abs);
   const own = t.kind !== "checkout" && t.cwd ? canon(t.cwd) : null;
@@ -46,7 +59,12 @@ function checkDiscard(t, e) {
   const inTmp = tmps.some((r) => real !== r && inside(real, r) && relative(r, real).split("/")[0].startsWith(`${t.id}-`));
   if (!inOwn && !inTmp) return { ...item, target: real, status: "kept", reason: `not inside the thread's folder or a ${t.id}-… temp folder` };
   const td = canon(t.thread_dir);
-  if (inside(td, real)) return { ...item, target: real, status: "kept", reason: "contains the thread's folder" };
+  if (inside(td, real)) return { ...item, target: real, status: "kept", reason: "contains this thread folder" };
+  if (real.split("/").includes(".paseo-project") && !inside(real, td)) return { ...item, target: real, status: "kept", reason: "is or is in another thread folder" };
+  const holds = sh(["find", real, "-name", ".paseo-project", "-print", "-quit"]);
+  if (!holds.ok || holds.stdout.trim()) return { ...item, target: real, status: "kept", reason: holds.ok ? `holds a thread folder: ${holds.stdout.trim()}` : `could not be searched for thread folders: ${holds.out}` };
+  const k = keeps.find((x) => inside(x, real) || inside(real, x));
+  if (k) return { ...item, target: real, status: "kept", reason: `overlaps the declared keep ${k}` };
   if (inOwn && t.kind === "worktree" && sh(["git", "-C", own, "ls-files", "--", real]).stdout.trim()) return { ...item, target: real, status: "kept", reason: "has tracked files" };
   const lib = join(td, "library");
   if (inside(real, lib) && !e.product) return { ...item, target: real, status: "kept", reason: "is in the library: name the finished product it was made into" };
@@ -62,7 +80,8 @@ function checkDiscard(t, e) {
 /** Library paths the final copy leaves out: declared discards with a product, checked as far as they can be before the copy. */
 export function libraryExcludes(project, t, h) {
   const lib = t.thread_dir ? join(canon(t.thread_dir), "library") : "";
-  return declaration(project, t, h).discard.map((e) => checkDiscard(t, e)).filter((d) => !d.status && d.product && inside(d.target, lib) && d.target !== lib).map((d) => relative(lib, d.target));
+  const decl = declaration(project, t, h);
+  return decl.discard.map((e) => checkDiscard(t, e, { keeps: keepsOf(t, decl) })).filter((d) => !d.status && d.product && inside(d.target, lib) && d.target !== lib).map((d) => relative(lib, d.target));
 }
 
 // ------------------------------------------------------------ the worktree
@@ -128,10 +147,14 @@ function threadDirReasons(sh_, threadDir, discards, top) {
 export async function removeWorktree(h, t, { threadDir = "", discards = [], dryRun = false } = {}) {
   const item = { kind: "worktree", target: t.cwd };
   if (!h.isDir(t.cwd)) {
-    if (dryRun) return { ...item, status: "gone" };
+    const wl = h.shell("git worktree list --porcelain", t.repo);
+    if (!wl.ok) return { ...item, status: "failed", reason: `its folder is gone and the worktrees of ${t.repo} cannot be read: ${wl.out}` };
+    const paths = wl.stdout.split("\n").filter((l) => l.startsWith("worktree ")).map((l) => l.slice(9));
+    if (!paths.includes(t.cwd) && !paths.includes(canon(t.cwd))) return { ...item, status: "gone" };
+    if (dryRun) return { ...item, status: "gone", note: "its registration would be removed" };
     // Only this worktree's registration: never `git worktree prune`, which is repository-wide.
     const r = h.shell(`git worktree remove -- ${q(t.cwd)}`, t.repo);
-    return { ...item, status: "gone", ...(r.ok ? { note: "its registration removed" } : {}) };
+    return r.ok ? { ...item, status: "gone", note: "its registration removed" } : { ...item, status: "failed", reason: `its folder is gone but git worktree remove failed: ${r.out}` };
   }
   const top = h.shell("pwd -P", t.cwd).stdout.trim();
   item.real = top;
@@ -187,32 +210,54 @@ export function listIndexes() {
 
 const cbmInstalled = () => Boolean(process.env.PP_CODEBASE_MEMORY_BIN) || sh(["sh", "-c", "command -v codebase-memory-mcp"]).ok;
 
-/** Deletes the indexes whose root is inside a removed folder, then lists again to check. */
-function cleanIndexes(roots, dryRun) {
-  if (!roots.length) return [];
-  if (!cbmInstalled()) return [{ kind: "index", target: "(codebase-memory-mcp)", status: "skipped", reason: "codebase-memory-mcp is not installed" }];
-  let all;
-  try { all = listIndexes(); } catch (e) { return [{ kind: "index", target: "(list)", status: "failed", reason: e.message }]; }
-  const owned = all.filter((x) => x.root && roots.some((r) => inside(canon(x.root), r) || inside(x.root, r)));
-  if (dryRun) return owned.map((x) => ({ kind: "index", target: x.name, root: x.root, status: "would-remove" }));
+/** Like canon, but "" when a link on the way leads nowhere: where it pointed is not known. */
+const settled = (p) => {
+  try { return realpathSync(p); } catch {}
+  try { lstatSync(p); return ""; } catch {}
+  const up = dirname(p);
+  const r = up === p ? "" : settled(up);
+  return r && join(r, basename(p));
+};
+
+/** Every index with its root resolved now, before anything is deleted: links still say where they point. */
+function snapshot() {
+  if (!cbmInstalled()) return { skip: "codebase-memory-mcp is not installed" };
+  try { return { rows: listIndexes().map((x) => ({ ...x, real: x.root ? settled(x.root) : "" })) }; }
+  catch (e) { return { error: e.message }; }
+}
+
+/**
+ * Deletes the indexes this run proved the thread's: rooted (as resolved before the deletion) inside a folder
+ * it removed, or recorded by an earlier run (`retry`) with the same root. Then lists again to check.
+ */
+function cleanIndexes(snap, roots, retry, dryRun) {
+  if (!snap || (!roots.length && !retry.length)) return [];
+  if (snap.skip) return [{ kind: "index", target: "(codebase-memory-mcp)", status: "skipped", reason: snap.skip }];
+  if (snap.error) return [{ kind: "index", target: "(list)", status: "failed", reason: `${snap.error}; listed before the removal or not at all, the indexes in what went are not known: delete them by hand` }];
+  const recorded = (x) => retry.some((i) => i.target === x.name && i.root === x.root);
+  const owned = snap.rows.filter((x) => (x.real && roots.some((r) => inside(x.real, r))) || recorded(x));
+  const vanished = retry.filter((i) => !snap.rows.some((x) => x.name === i.target)).map((i) => ({ ...i, status: "gone", reason: undefined }));
+  if (dryRun) return [...owned.map((x) => ({ kind: "index", target: x.name, root: x.root, status: "would-remove" })), ...vanished];
   const errors = new Map();
   for (const x of owned) { try { cbm("delete_project", { project: x.name }); } catch (e) { errors.set(x.name, e.message); } }
   let left;
-  try { left = new Set(listIndexes().map((x) => x.name)); } catch (e) { return owned.map((x) => ({ kind: "index", target: x.name, root: x.root, status: "failed", reason: `not checked: ${e.message}` })); }
-  return owned.map((x) => left.has(x.name)
+  try { left = new Set(listIndexes().map((x) => x.name)); } catch (e) { return [...owned.map((x) => ({ kind: "index", target: x.name, root: x.root, status: "failed", reason: `not checked: ${e.message}` })), ...vanished]; }
+  return [...owned.map((x) => left.has(x.name)
     ? { kind: "index", target: x.name, root: x.root, status: "failed", reason: errors.get(x.name) ?? "still listed after delete_project" }
-    : { kind: "index", target: x.name, root: x.root, status: "removed" });
+    : { kind: "index", target: x.name, root: x.root, status: "removed" }), ...vanished];
 }
 
 // ------------------------------------------------------------ one run
 
 /**
- * Declared discards, then the worktree, then the indexes rooted in what is gone. Kept items are decisions,
- * failed ones are errors; neither stops the rest. Returns notes and whether the worktree is gone.
+ * Checks everything first, lists the indexes, then deletes: declared discards, the worktree, the indexes
+ * rooted in what went. Kept and skipped items are decisions, failed ones are errors; none stops the rest.
  */
 export async function run(project, t, h, { keepWorktree = false, copyComplete = true, dryRun = false } = {}) {
   const decl = declaration(project, t, h);
-  const items = [];
+  const before = readJson(recordPath(project, t.id))?.items ?? [];
+  const removedBefore = new Set(before.filter((i) => i.kind === "discard" && i.status === "removed").map((i) => i.target));
+  const retry = before.filter((i) => i.kind === "index" && i.status === "failed" && i.root);
   const own = t.kind !== "checkout" && t.cwd ? canon(t.cwd) : null;
   const keepReason = keepWorktree ? "kept as asked (--keep-worktree)"
     : decl.error ? `${decl.error}; its keep list is unknown`
@@ -220,8 +265,8 @@ export async function run(project, t, h, { keepWorktree = false, copyComplete = 
     : !copyComplete ? "the final copy was partial (`thread resolve --force` removes it)" : "";
   const worktreeKept = t.kind === "worktree" && Boolean(keepReason);
   const lib = t.thread_dir ? join(canon(t.thread_dir), "library") : "";
-  for (const e of decl.discard) {
-    const d = checkDiscard(t, e);
+  const items = decl.discard.map((e) => {
+    const d = checkDiscard(t, e, { keeps: keepsOf(t, decl), removedBefore });
     if (!d.status && worktreeKept && own && inside(d.target, own)) Object.assign(d, { status: "kept", reason: "its worktree is kept" });
     if (!d.status && d.product) {
       const home = project.path("library", t.id, d.product.rel);
@@ -229,21 +274,22 @@ export async function run(project, t, h, { keepWorktree = false, copyComplete = 
       try { same = sha256(readFileSync(home)) === sha256(readFileSync(d.product.path)); } catch {}
       if (!same && !(dryRun && inside(d.target, lib))) Object.assign(d, { status: "kept", reason: `its product ${d.product.rel} is not archived home unchanged` });
     }
-    if (!d.status) {
-      d.kib = du(h, d.target);
-      if (dryRun) d.status = "would-remove";
-      else {
-        const r = sh(["rm", "-rf", "--", d.target]);
-        d.status = r.ok && !h.shell(`[ -e ${q(d.target)} ]`).ok ? "removed" : "failed";
-        if (d.status === "failed") d.reason = r.out || "still there after rm";
-      }
-    }
     delete d.product;
-    items.push(d);
-  }
-  const discards = items.filter((d) => ["removed", "gone", "would-remove"].includes(d.status)).map((d) => d.target);
+    return d;
+  });
   // Library discards left behind were not copied home, so the worktree holding them must stay.
   const strandedInLibrary = items.filter((d) => d.status === "kept" && lib && inside(d.target, lib) && h.shell(`[ -e ${q(d.target)} ]`).ok);
+  const pending = items.filter((d) => !d.status);
+  const tryWorktree = t.kind === "worktree" && t.cwd && !worktreeKept && !strandedInLibrary.length;
+  const snap = t.machine || !(pending.length || (tryWorktree && h.isDir(t.cwd)) || retry.length) ? null : snapshot();
+  for (const d of pending) {
+    d.kib = du(h, d.target);
+    if (dryRun) { d.status = "would-remove"; continue; }
+    const r = sh(["rm", "-rf", "--", d.target]);
+    d.status = r.ok && !h.shell(`[ -e ${q(d.target)} ]`).ok ? "removed" : "failed";
+    if (d.status === "failed") d.reason = r.out || "still there after rm";
+  }
+  const discards = items.filter((d) => ["removed", "gone", "would-remove"].includes(d.status)).map((d) => d.target);
   if (t.kind === "worktree" && t.cwd) {
     if (worktreeKept) items.push({ kind: "worktree", target: t.cwd, status: "kept", reason: keepReason });
     else if (strandedInLibrary.length) items.push({ kind: "worktree", target: t.cwd, status: "kept", reason: `not copied home: ${strandedInLibrary.map((d) => d.target).join(", ")}` });
@@ -253,9 +299,9 @@ export async function run(project, t, h, { keepWorktree = false, copyComplete = 
     }
   }
   const wt = items.find((i) => i.kind === "worktree");
-  const gone = (i) => ["removed", "gone", "would-remove"].includes(i.status);
-  const roots = t.machine ? [] : items.filter((i) => gone(i)).flatMap((i) => [...new Set([i.target, i.real ?? canon(i.target)])]);
-  items.push(...cleanIndexes(roots, dryRun));
+  // Only what this run removed: a path that was already gone proves nothing about what an index pointed at.
+  const roots = items.filter((i) => ["removed", "would-remove"].includes(i.status)).map((i) => i.real ?? i.target);
+  items.push(...cleanIndexes(snap, roots, retry, dryRun));
   const result = { notes: items.map(note), worktreeGone: Boolean(wt && ["removed", "gone"].includes(wt.status)), items };
   if (!dryRun) record(project, t, items, decl);
   return result;
