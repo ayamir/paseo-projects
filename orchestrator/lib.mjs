@@ -23,14 +23,31 @@ export function makeClient(url) {
 }
 
 // One connected client per daemon URL for the life of the process.
+// The SDK retries a daemon that is down forever and never rejects, so pp closes it after CONNECT_SECS.
+const CONNECT_SECS = 15;
 const clients = new Map();
 export async function client(url) {
   const key = url || process.env.PASEO_URL || LOCAL_URL;
   if (!clients.has(key)) {
     const c = makeClient(key);
-    clients.set(key, c.connect().then(() => c, (e) => { clients.delete(key); throw e; }));
+    const timer = setTimeout(() => c.close().catch(() => {}), CONNECT_SECS * 1000);
+    clients.set(key, c.connect().finally(() => clearTimeout(timer)).then(() => c, (e) => {
+      clients.delete(key);
+      throw e.message === "Daemon client closed" ? new Error(`no Paseo daemon answered at ${key} within ${CONNECT_SECS}s`) : e;
+    }));
   }
   return clients.get(key);
+}
+
+/**
+ * Paseo's daemon.autoArchiveAfterMerge: `{ on: true | false }`, or `{ on: null, why }` when the daemon does not say
+ * (none answers, it refuses the read, its answer fails the SDK's check). Unknown is never taken as off.
+ */
+export async function autoArchiveAfterMerge(url) {
+  try {
+    const on = (await (await client(url)).config.get())?.config?.autoArchiveAfterMerge;
+    return typeof on === "boolean" ? { on } : { on: null, why: "the daemon's answer has no autoArchiveAfterMerge" };
+  } catch (e) { return { on: null, why: e.message }; }
 }
 export async function closeClients() {
   for (const p of clients.values()) await p.then((c) => c.close()).catch(() => {});

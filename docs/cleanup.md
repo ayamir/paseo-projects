@@ -87,7 +87,7 @@ worktree 删除前要满足这些条件，任何一条不满足就保留并写�
 
 每次运行都会重写这两个文件：
 
-- `threads/<id>.cleanup.json`：`run`、`state`（`complete`，或有 failed 时为 `partial`）、`removed_kib`，以及每一项的 kind、target、status（removed、gone、kept、failed、skipped）、reason、kib，还有这次用的声明。
+- `threads/<id>.cleanup.json`：`run`、`state`（`complete`，或有 failed 时为 `partial`）、`archive`（这次最终拷贝的结果：`complete`、`partial`、`missing`（附 `archive_missing`）、重试时可能是 `failed`，用 `--skip-copy` 时为 `skipped`）、`removed_kib`，以及每一项的 kind、target、status（removed、gone、kept、failed、skipped）、reason、kib，还有这次用的声明。
 - `threads/<id>.cleanup.md`：同样内容的表格。
 
 几个规则：
@@ -104,8 +104,9 @@ worktree 删除前要满足这些条件，任何一条不满足就保留并写�
 Paseo daemon 的 `daemon.autoArchiveAfterMerge`（默认关闭）打开时，会在 PR 合并后自动归档 workspace。触发条件只有这几条：PR 合并、git 不脏、没有领先 origin、worktree 归 Paseo 所有。满足后它用 `git worktree remove --force`、`rm -rf` 和 `git worktree prune` 删掉 worktree。它不看 pp 的保留决定，不看 ignored 内容（`.paseo-project/` 也在其中），也不看占用的进程。pp 的线程 worktree 都是 Paseo 创建的，所以这个设置打开时，删 worktree 的就不止 pp 一家：
 
 - pp 先 resolve、决定保留时：保留守不住。记录里 worktree 的 kept 原因会写明这一点，`pp doctor` 也会提示。
-- Paseo 先删时（合并后 pp 要等报告完成或 10 分钟宽限，所以这是常见顺序）：最终拷贝拿不到 library，resolve 的说明里会写「the thread folder was already gone」。
-- 之后的 `pp thread cleanup` 重试按磁盘实际状态记录：保留过的 worktree 不在了，就记 gone，不再记 kept。
+- 读不到这个设置时（daemon 连不上、拒绝读取，或者回了 SDK 不认的格式），按「未知」处理，不当作关闭：kept 原因写「is unknown (原因)」，`pp doctor` 写「could not be read (原因)」。读设置失败不会挡住清理。daemon 连不上时，SDK 会一直重连、不会报错，所以 pp 等 15 秒后就放弃，所有 daemon 调用都一样。
+- Paseo 先删时（合并后 pp 要等报告完成或 10 分钟宽限，所以这是常见顺序）：最终拷贝什么也拿不到。没拷回家的部分会写进说明，比如「the thread folder was already gone: report and library not copied home」。报告平时会随更新拷回，所以家里如果有报告，那是 pp 最后一次拷的；library 只在最终拷贝时拷。清理记录里，`state` 仍然只表示清理本身是否完成，另外记 `archive: "missing"` 和 `archive_missing`。
+- 之后的 `pp thread cleanup` 重试按磁盘实际状态记录：保留过的 worktree 不在了，就记 gone，不再记 kept。之前已经完整归档的线程，目录被删掉不算缺失。
 
 要让 pp 成为唯一的删除方，就关掉这个设置：`paseo daemon config set daemon.autoArchiveAfterMerge false`，然后 `paseo daemon reload`。这个设置对整台主机生效，pp 管不到的 workspace 也会一起停止合并后自动归档。Paseo 没有给单个 workspace 豁免的接口。
 

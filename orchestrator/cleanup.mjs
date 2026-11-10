@@ -267,7 +267,7 @@ function cleanIndexes(snap, roots, retry, dryRun) {
  * Checks everything first, lists the indexes, then deletes: declared discards, the worktree, the indexes
  * rooted in what went. Kept and skipped items are decisions, failed ones are errors; none stops the rest.
  */
-export async function run(project, t, h, { keepWorktree = false, copyComplete = true, dryRun = false, paseoArchivesMerged = false } = {}) {
+export async function run(project, t, h, { keepWorktree = false, copyComplete = true, archive = { outcome: "complete" }, dryRun = false, paseoAutoArchive = { on: false } } = {}) {
   const decl = declaration(project, t, h);
   const before = readJson(recordPath(project, t.id))?.items ?? [];
   const removedBefore = new Set(before.filter((i) => i.kind === "discard" && i.status === "removed").map((i) => i.target));
@@ -314,12 +314,13 @@ export async function run(project, t, h, { keepWorktree = false, copyComplete = 
     }
   }
   const wt = items.find((i) => i.kind === "worktree");
-  if (wt?.status === "kept" && paseoArchivesMerged) wt.reason += "; but Paseo's daemon.autoArchiveAfterMerge is on: once its pull request merges Paseo removes it with --force, without these checks (turned off, pp alone removes worktrees)";
+  if (wt?.status === "kept" && paseoAutoArchive.on) wt.reason += "; but Paseo's daemon.autoArchiveAfterMerge is on: once its pull request merges Paseo removes it with --force, without these checks (turned off, pp alone removes worktrees)";
+  if (wt?.status === "kept" && paseoAutoArchive.on === null) wt.reason += `; whether Paseo's daemon.autoArchiveAfterMerge removes it once its pull request merges is unknown (${paseoAutoArchive.why})`;
   // Only what this run removed: a path that was already gone proves nothing about what an index pointed at.
   const roots = items.filter((i) => ["removed", "would-remove"].includes(i.status)).map((i) => i.real ?? i.target);
   items.push(...cleanIndexes(snap, roots, retry, dryRun));
   const result = { notes: items.map(note), worktreeGone: Boolean(wt && ["removed", "gone"].includes(wt.status)), items };
-  if (!dryRun) record(project, t, items, decl);
+  if (!dryRun) record(project, t, items, decl, archive);
   return result;
 }
 
@@ -331,8 +332,8 @@ const note = (i) => {
   return `${name} ${i.status}${size}${i.reason ? `: ${i.reason}` : ""}`;
 };
 
-/** threads/<id>.cleanup.json and .md; an item removed by an earlier run keeps that run's entry. */
-function record(project, t, items, decl) {
+/** threads/<id>.cleanup.json and .md; an item removed by an earlier run keeps that run's entry. `state` is the cleanup's, `archive` the final copy's. */
+function record(project, t, items, decl, archive) {
   const prev = readJson(recordPath(project, t.id));
   const before = new Map((prev?.items ?? []).map((i) => [`${i.kind} ${i.target}`, i]));
   const at = now();
@@ -345,11 +346,12 @@ function record(project, t, items, decl) {
   const failed = merged.filter((i) => i.status === "failed").length;
   const rec = {
     thread: t.id, project: project.slug, run: (prev?.run ?? 0) + 1, at, state: failed ? "partial" : "complete",
+    archive: archive.outcome, ...(archive.missing?.length ? { archive_missing: archive.missing } : {}),
     removed_kib: merged.filter((i) => i.status === "removed").reduce((s, i) => s + (i.kib ?? 0), 0),
     measure: "du -sk before removal; shared or cloned blocks mean it is not a promise of freed disk",
     items: merged, declaration: decl,
   };
   writeJson(recordPath(project, t.id), rec);
   const rows = merged.map((i) => `| ${i.kind} | \`${i.target}\` | ${i.status} | ${i.kib ?? ""} | ${(i.reason ?? i.why ?? "").replace(/\|/g, "\\|")} |`);
-  writeAtomic(project.path("threads", `${t.id}.cleanup.md`), `# ${t.id} cleanup\n\nRun ${rec.run} at ${at}: **${rec.state}**${failed ? ` (${failed} failed; \`pp thread cleanup ${project.slug} ${t.id}\` retries)` : ""}. Removed ${rec.removed_kib} KiB (${rec.measure}).\n\n| Kind | Target | Result | KiB | Reason |\n|---|---|---|---|---|\n${rows.join("\n")}\n`);
+  writeAtomic(project.path("threads", `${t.id}.cleanup.md`), `# ${t.id} cleanup\n\nRun ${rec.run} at ${at}: **${rec.state}**${failed ? ` (${failed} failed; \`pp thread cleanup ${project.slug} ${t.id}\` retries)` : ""}; archive **${rec.archive}**${rec.archive_missing ? ` (not copied home: ${rec.archive_missing.join(", ")})` : ""}. Removed ${rec.removed_kib} KiB (${rec.measure}).\n\n| Kind | Target | Result | KiB | Reason |\n|---|---|---|---|---|\n${rows.join("\n")}\n`);
 }

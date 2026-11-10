@@ -1,12 +1,13 @@
 // Resolve-time cleanup, end to end through the CLI: an isolated pp root, a throwaway repo and worktree
-// per case, and a fake codebase-memory-mcp. No Paseo daemon (the records have no agent), no real index.
+// per case, and a fake codebase-memory-mcp. No real Paseo daemon (a fake one for records with a workspace), no real index.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { createRequire } from "node:module";
 
 const TMP = realpathSync(tmpdir());
 const BASE = mkdtempSync(join(TMP, "pp-cleanup-"));
@@ -31,13 +32,39 @@ out("unknown tool", true);
 `);
 chmodSync(FAKE_CBM, 0o755);
 
+// A fake Paseo daemon on the SDK's wire protocol: it reads daemon.autoArchiveAfterMerge as `on`/`off`, refuses the
+// read (`reject`), answers it in a shape the SDK rejects (`malformed`), and archives workspaces. Port 1 is no daemon.
+const NO_DAEMON = "ws://127.0.0.1:1/ws";
+const WS = createRequire(fileURLToPath(import.meta.resolve("@getpaseo/client"))).resolve("ws");
+const FAKE_DAEMON = join(BASE, "fake-daemon.mjs");
+writeFileSync(FAKE_DAEMON, `import ws from ${JSON.stringify(pathToFileURL(WS).href)};
+const mode = process.env.FAKE_DAEMON_MODE, wss = new ws.WebSocketServer({ port: 0, host: "127.0.0.1" });
+wss.on("listening", () => console.log(wss.address().port));
+wss.on("connection", (s) => s.on("message", (raw) => {
+  const m = JSON.parse(String(raw)), send = (message) => s.send(JSON.stringify({ type: "session", message }));
+  if (m.type === "ping") return s.send(JSON.stringify({ type: "pong" }));
+  if (m.type === "hello") return send({ type: "status", payload: { status: "server_info", serverId: "fake" } });
+  const r = m.message ?? {}, requestId = r.requestId;
+  if (r.type === "get_daemon_config_request" && mode === "reject") return send({ type: "rpc_error", payload: { requestId, requestType: r.type, error: "permission denied" } });
+  if (r.type === "get_daemon_config_request") return send({ type: "get_daemon_config_response", payload: { requestId, config: mode === "malformed" ? "nope" : { mcp: { injectIntoAgents: false }, autoArchiveAfterMerge: mode === "on" } } });
+  if (r.type === "archive_workspace_request") return send({ type: "archive_workspace_response", payload: { requestId, workspaceId: r.workspaceId, archivedAt: new Date().toISOString(), error: null } });
+  if (requestId) send({ type: "rpc_error", payload: { requestId, requestType: r.type, error: "not faked" } });
+}));
+`);
+async function fakeDaemon(mode) {
+  if (mode === "down") return { url: NO_DAEMON, stop: () => {} };
+  const child = spawn(process.execPath, [FAKE_DAEMON], { env: { ...process.env, FAKE_DAEMON_MODE: mode }, stdio: ["ignore", "pipe", "inherit"] });
+  const port = await new Promise((ok, no) => { child.stdout.once("data", (d) => ok(String(d).trim())); child.once("exit", () => no(new Error("the fake daemon exited"))); });
+  return { url: `ws://127.0.0.1:${port}/ws`, stop: () => child.kill() };
+}
+
 const G = ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "protocol.file.allow=always"];
 const git = (cwd, ...a) => execFileSync("git", [...G, "-C", cwd, ...a], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 const write = (path, text) => { mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, text); };
 let n = 9100;
 
 /** A project with one open worktree thread on a fresh repo, its brief folder and report in place. */
-function fixture({ inRepo = false } = {}) {
+function fixture({ inRepo = false, daemon = "" } = {}) {
   const id = `t-${++n}`;
   const root = mkdtempSync(join(BASE, "root-"));
   const repo = join(root, "repo");
@@ -56,14 +83,15 @@ function fixture({ inRepo = false } = {}) {
   write(join(td, "report.md"), "## Report\nfinal\n\n## Next\n");
   mkdirSync(join(td, "library"));
   write(join(repo, ".git", "info", "exclude"), ".paseo-project/\n");
-  const record = { id, title: "x", status: "open", error: "", kind: "worktree", repo, origin: "", branch, base: "", machine: "", cwd: wt, thread_dir: td, agent_id: "", workspace_id: "", profile: "", provider: "", created: new Date().toISOString(), updated: "", last_state: "", last_state_change: "", last_group: "", report_hash: "", last_report_change: "", last_review_item_hash: "", acked_report_hash: "", pr: "", pr_state: "", pr_review: "", resolved_reason: "", kept_worktree: false, session: null };
+  const record = { id, title: "x", status: "open", error: "", kind: "worktree", repo, origin: "", branch, base: "", machine: "", cwd: wt, thread_dir: td, agent_id: "", workspace_id: daemon ? `wks_${id}` : "", profile: "", provider: "", created: new Date().toISOString(), updated: "", last_state: "", last_state_change: "", last_group: "", report_hash: "", last_report_change: "", last_review_item_hash: "", acked_report_hash: "", pr: "", pr_state: "", pr_review: "", resolved_reason: "", kept_worktree: false, session: null };
   writeFileSync(p.path("threads", `${id}.json`), JSON.stringify(record));
   const cbm = join(root, "cbm.json");
   writeFileSync(cbm, JSON.stringify({ projects: [] }));
-  const env = { ...process.env, PP_CODEBASE_MEMORY_BIN: FAKE_CBM, FAKE_CBM_STATE: cbm };
+  // A record with a workspace talks to `daemon` (a fake); any other never reaches the real one.
+  const env = { ...process.env, PP_CODEBASE_MEMORY_BIN: FAKE_CBM, FAKE_CBM_STATE: cbm, PASEO_URL: daemon || NO_DAEMON };
   const pp = (...args) => {
-    const r = spawnSync(process.execPath, [PP, "--root", root, ...args], { encoding: "utf8", env });
-    return { ok: r.status === 0, out: `${r.stdout}${r.stderr}` };
+    const r = spawnSync(process.execPath, [PP, "--root", root, ...args], { encoding: "utf8", env, timeout: 45_000 });
+    return { ok: r.status === 0, out: `${r.stdout}${r.stderr}${r.error ? `\n${r.error.message}` : ""}` };
   };
   const cleanup = () => JSON.parse(readFileSync(p.path("threads", `${id}.cleanup.json`), "utf8"));
   const item = (kind, target) => cleanup().items.find((i) => i.kind === kind && (!target || i.target === target));
@@ -391,25 +419,73 @@ test("a kept worktree that Paseo's merge auto-archive removed is recorded gone o
   }
 });
 
-test("a kept worktree's record says Paseo's merge auto-archive will still remove it", async () => {
-  const { run } = await import("../orchestrator/cleanup.mjs");
-  const { host } = await import("../orchestrator/threads.mjs");
-  for (const on of [true, false]) {
-    const f = fixture();
-    const t = JSON.parse(readFileSync(f.p.path("threads", `${f.id}.json`), "utf8"));
-    const done = await run(f.p, t, host(null), { keepWorktree: true, paseoArchivesMerged: on });
-    assert.equal(f.item("worktree").status, "kept");
-    assert.equal(/autoArchiveAfterMerge/.test(f.item("worktree").reason), on, f.item("worktree").reason);
-    assert.equal(/autoArchiveAfterMerge/.test(done.notes.join("; ")), on);
+test("a managed thread's kept worktree says what Paseo's merge auto-archive will do, unknown when the daemon cannot say", async () => {
+  const says = { down: /is unknown \(no Paseo daemon answered/, reject: /is unknown \(permission denied/, malformed: /is unknown \(Response validation failed/, on: /autoArchiveAfterMerge is on/, off: null };
+  for (const [mode, want] of Object.entries(says)) {
+    const d = await fakeDaemon(mode);
+    try {
+      const f = fixture({ daemon: d.url });
+      for (const args of [["resolve", "demo", f.id, "--keep-worktree"], ["cleanup", "demo", f.id]]) {
+        const r = f.pp("thread", ...args);
+        assert.ok(r.ok, `${mode} ${args[0]}: ${r.out}`);
+        assert.equal(JSON.parse(readFileSync(f.p.path("threads", `${f.id}.json`), "utf8")).status, "resolved");
+        const wt = f.item("worktree");
+        assert.equal(wt.status, "kept", `${mode} ${args[0]}`);
+        if (want) { assert.match(wt.reason, want, `${mode} ${args[0]}`); assert.match(r.out, want); }
+        else assert.doesNotMatch(wt.reason, /autoArchiveAfterMerge/, `${mode} ${args[0]}`);
+      }
+      assert.equal(f.cleanup().run, 2);
+    } finally { d.stop(); }
   }
 });
 
-test("a thread folder Paseo already removed at resolve is said, not passed off as copied home", () => {
+test("a managed thread folder Paseo removed before resolve: report and library said missing, the cleanup still complete", async () => {
+  const d = await fakeDaemon("on");
+  try {
+    for (const reportHome of [false, true]) {
+      const f = fixture({ daemon: d.url });
+      if (reportHome) write(f.p.path("threads", `${f.id}.md`), "## Report\nearlier\n");
+      paseoArchives(f);
+      for (const args of [["resolve", "demo", f.id], ["cleanup", "demo", f.id]]) {
+        const r = f.pp("thread", ...args);
+        assert.ok(r.ok, r.out);
+        assert.match(r.out, reportHome ? /thread folder was already gone: library not copied home; the report home is pp's last copy/ : /thread folder was already gone: report and library not copied home/);
+        const c = f.cleanup();
+        assert.equal(c.state, "complete");
+        assert.equal(c.archive, "missing");
+        assert.deepEqual(c.archive_missing, reportHome ? ["library"] : ["report", "library"]);
+        assert.match(readFileSync(f.p.path("threads", `${f.id}.cleanup.md`), "utf8"), /archive \*\*missing\*\*/);
+        assert.equal(f.item("worktree").status, "gone");
+      }
+      assert.equal(existsSync(f.p.path("threads", `${f.id}.md`)), reportHome);
+      assert.ok(!existsSync(f.p.path("library", f.id)));
+    }
+  } finally { d.stop(); }
+});
+
+test("doctor says the daemon's merge auto-archive is on, or that it could not read it, never silent", async () => {
+  const says = { on: /autoArchiveAfterMerge is on/, off: null, reject: /autoArchiveAfterMerge could not be read \(permission denied/, malformed: /autoArchiveAfterMerge could not be read \(Response validation failed/, down: /the local Paseo daemon does not answer/ };
+  for (const [mode, want] of Object.entries(says)) {
+    const d = await fakeDaemon(mode);
+    try {
+      const root = mkdtempSync(join(BASE, "doctor-"));
+      const r = spawnSync(process.execPath, [PP, "--root", root, "doctor"], { encoding: "utf8", env: { ...process.env, PASEO_URL: d.url }, timeout: 45_000 });
+      const out = `${r.stdout}${r.stderr}${r.error ? `\n${r.error.message}` : ""}`;
+      if (want) assert.match(out, want, `${mode}: ${out}`);
+      else assert.doesNotMatch(out, /autoArchiveAfterMerge/, `${mode}: ${out}`);
+    } finally { d.stop(); }
+  }
+});
+
+test("a retry after pp archived and removed the worktree does not call the archive missing", () => {
   const f = fixture();
-  paseoArchives(f);
-  const r = f.pp("thread", "resolve", "demo", f.id);
+  write(join(f.td, "library", "a.txt"), "kept home\n");
+  assert.ok(f.pp("thread", "resolve", "demo", f.id).ok);
+  assert.equal(f.cleanup().archive, "complete");
+  const r = f.pp("thread", "cleanup", "demo", f.id);
   assert.ok(r.ok, r.out);
-  assert.match(r.out, /thread folder was already gone/);
+  assert.doesNotMatch(r.out, /not copied home/);
+  assert.equal(f.cleanup().archive, "complete");
 });
 
 test("--dry-run previews with the same checks and deletes nothing", () => {
