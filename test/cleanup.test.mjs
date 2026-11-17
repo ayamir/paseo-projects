@@ -3,7 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -186,6 +186,25 @@ test("resolve keeps a worktree with unknown ignored or untracked content, and sa
   assert.match(r2.out, /untracked: notes\.txt/);
   assert.match(r2.out, /node_modules\//);
   assert.ok(existsSync(join(g.wt, "notes.txt")));
+});
+
+test("an option a command does not declare stops it before any effect: resolve --dry-run resolves nothing", () => {
+  const f = fixture();
+  write(join(f.wt, "node_modules", ".package-lock.json"), "{}\n");
+  const snap = () => JSON.stringify([readFileSync(f.p.path("threads", `${f.id}.json`), "utf8"), existsSync(f.wt), readdirSync(f.p.path("threads")).sort(), readdirSync(f.p.path("inbox") ?? f.root).sort(), existsSync(f.p.path("library", f.id))]);
+  const before = snap();
+  for (const args of [["thread", "resolve", "demo", f.id, "--dry-run"], ["thread", "resolve", "demo", f.id, "--keep-worktre"], ["thread", "stop", "demo", f.id, "--force"], ["sweep", "demo", "--yes", "--dryrun"]]) {
+    const r = f.pp(...args);
+    assert.ok(!r.ok, args.join(" "));
+    assert.match(r.out, /unknown option/);
+  }
+  assert.equal(snap(), before, "the thread is still open, its worktree and files are as they were");
+  assert.equal(JSON.parse(readFileSync(f.p.path("threads", `${f.id}.json`), "utf8")).status, "open");
+  // The preview that exists is `thread cleanup --dry-run`, and the documented options still resolve.
+  assert.ok(f.pp("thread", "cleanup", "demo", f.id, "--dry-run").ok);
+  assert.ok(existsSync(f.wt));
+  assert.ok(f.pp("thread", "resolve", "demo", f.id, "--keep-worktree", "--skip-copy", "--force").ok);
+  assert.equal(JSON.parse(readFileSync(f.p.path("threads", `${f.id}.json`), "utf8")).status, "resolved");
 });
 
 test("keep-worktree and a declared keep survive sweep and retries", () => {

@@ -6,7 +6,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { closeClients, readText, writeAtomic, splitFront, requirePerson, ask } from "../orchestrator/lib.mjs";
 import { loadConfig, loadSafety, setSafety, parseSafetyValue, SAFETY_KEYS, canonical, listedNames, installedKinds, getProfile, profileSummary, storeApproval, isApproved, yoloKnown, validateProfileName, ROLES, allowed, agentConfig, editConfig, changeProfile, BUILTINS, kindOf } from "../orchestrator/config.mjs";
-import { Project, rootOf, create, listSlugs, parseRepoArg, applySetting, writeSettings, writeAgentsMd, SET_KEYS, prefix } from "../orchestrator/project.mjs";
+import { Project, rootOf, create, listSlugs, parseRepoArg, applySetting, writeSettings, writeAgentsMd, prefix } from "../orchestrator/project.mjs";
 import * as threads from "../orchestrator/threads.mjs";
 import * as coordinator from "../orchestrator/coordinator.mjs";
 import * as inbox from "../orchestrator/inbox.mjs";
@@ -16,80 +16,7 @@ import * as ticker from "../orchestrator/ticker.mjs";
 import * as lifecycle from "../orchestrator/lifecycle.mjs";
 import { migrate } from "../orchestrator/migrate.mjs";
 import { boardData, boardChoices, editArgs } from "../orchestrator/board.mjs";
-
-const HELP = `pp [--root DIR] <command>
-
-Projects
-  new <slug> [--name N] [--goal G] [--repo PATH[@MACHINE]]... [--thread-profile P] [--coordinator-profile P]
-  list [--all] [--json]          overview
-  open <slug> [--profile P] [--fresh]
-                                 find the coordinator, else pick up its last session (--fresh: a new one); starts the ticker
-  context <slug> [--peek]        the coordinator's digest
-  skill                          the coordinator's instructions
-  set <slug> <key> <value>       ${Object.keys(SET_KEYS).join(", ")}
-  assignable <slug> [--check OWNER]
-  inbox list|done <slug> [<item-id>... | --all]
-  coordinator prompt <slug> (--text T | --text-file F|-)
-  pause|resume|archive|unarchive <slug>
-  delete <slug> [--force]
-  rename <slug> <new-slug> [--name N] [--dry-run]
-  sweep <slug> [--dry-run] [--yes]
-  doctor [--fix]
-  migrate-herdr [HERDR_ROOT] [--dry-run]   copy herdr-projects projects here (default ~/.herdr-projects)
-  board tasks|routines|settings|memory     what the board plugin shows, as JSON
-  board edit <json>              a settings edit from the board, as the command it maps to
-
-Threads
-  thread start <slug> --title T (--task T | --task-file F|- | --from-task TITLE) [--repo PATH] [--kind worktree|tab|checkout] [--machine M] [--profile P] [--base REF]
-  thread list <slug> [--all] [--json]
-  thread show <slug> <id> [--json]
-  thread prompt <slug> <id> (--text T | --text-file F|-)
-  thread next <slug> <id> [--line N | --add LINE]
-  thread stop|ack <slug> <id>
-  thread restart <slug> <id> [--profile P] [--fresh | --session ID|latest]
-                                 picks up the old session unless --fresh; latest: the newest Claude session in its folder
-  thread resolve <slug> <id> [--reopen] [--keep-worktree] [--skip-copy] [--force]
-                                 report and library home, then the cleanup (docs/cleanup.md)
-  thread cleanup <slug> <id> [--dry-run]
-                                 the same cleanup again for a resolved thread; --dry-run previews it for any thread
-  thread permissions <slug> <id>
-  thread allow <slug> <id> [--request R] [--action A] [--answers JSON]
-  thread deny <slug> <id> [--request R] [--action A] [--message M]
-  report [--thread SLUG/ID] (--percent N | --unknown) [--activity A]
-
-The user's alone (refused unless run at a terminal)
-  routine list <slug> | routine approve <slug> <name> | routine toggle <slug> <name> [on|off]
-  safety show <slug> | safety set (<slug>|--global) <key> <value...> | safety yolo (<slug>|--global) on|off
-  profile list [--project SLUG]  profiles; with --project, which ones it allows and its defaults
-  profile resolve [NAME] [--project SLUG]
-                                 a profile and the agent config it launches with, as JSON
-  profile add|edit <name> [--provider KIND/MODEL] [--mode M] [--thinking T] [--yolo-mode M] [--description D]
-                                 edit: given fields only; an empty value clears one
-  profile remove <name>          refused while a default, allow-list or project names it
-  profile allow (<slug>|--global) thread|coordinator [NAME...]
-                                 no names: any profile; "default": inherit
-  profile default thread|coordinator <name>
-                                 what new projects start with
-  ticker run|start|stop|status
-`;
-
-const VALUE_FLAGS = new Set(["root", "name", "goal", "repo", "thread-profile", "coordinator-profile", "profile", "check", "text", "text-file", "title", "task", "task-file", "from-task", "kind", "machine", "base", "line", "add", "request", "action", "answers", "message", "thread", "percent", "activity", "session", "project", "provider", "mode", "thinking", "yolo-mode", "description"]);
-
-function parse(argv) {
-  const pos = [], flags = {};
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
-    if (!a.startsWith("--") || a === "-") { pos.push(a); continue; }
-    const [k, inline] = a.slice(2).split(/=(.*)/s);
-    if (VALUE_FLAGS.has(k)) {
-      const v = inline ?? argv[++i];
-      if (v === undefined) throw new Error(`--${k} needs a value`);
-      if (k === "repo" && flags.repos) flags.repos.push(v); else if (k === "repo") flags.repos = [v];
-      flags[k] = v;
-    } else flags[k] = true;
-  }
-  return { pos, flags };
-}
+import { HELP, parse, check } from "../orchestrator/cli.mjs";
 
 const readInput = (path) => (path === "-" ? readFileSync(0, "utf8") : readFileSync(path, "utf8"));
 const textOf = (f, what = "text") => {
@@ -100,7 +27,8 @@ const textOf = (f, what = "text") => {
 const need = (v, usage) => { if (v === undefined || v === "") throw new Error(`usage: pp ${usage}`); return v; };
 
 async function main() {
-  const { pos, flags: f } = parse(process.argv.slice(2));
+  const { pos, flags: f, given, inlined } = parse(process.argv.slice(2));
+  check(pos, given, inlined); // before anything runs: an option the command does not declare is an error, not ignored
   const root = rootOf({ root: f.root });
   const proj = (slug, usage) => Project.open(root, need(slug, usage));
   const [cmd, a1, a2, a3] = pos;
@@ -345,7 +273,7 @@ function routineCommand(sub, slug, name, value, root, proj) {
   throw new Error("usage: pp routine list|approve|toggle <slug> [name]");
 }
 
-async function profileCommand([sub = "list", ...rest], f, root, proj) {
+async function profileCommand([sub, ...rest], f, root, proj) {
   const config = loadConfig();
   const exists = (n) => { validateProfileName(n); if (!getProfile(config, n)) throw new Error(`no profile \`${n}\`; profiles: ${listedNames(config).join(", ")}`); return n; };
   const roleOf = (r) => { if (!ROLES[r]) throw new Error(`\`${r}\` is not a role: thread, coordinator`); return ROLES[r]; };
