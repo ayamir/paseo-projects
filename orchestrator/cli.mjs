@@ -91,9 +91,9 @@ export const HELP = `pp ${HEADER}\n` + SECTIONS.map(([title, rows]) => `\n${titl
   return use.length <= 29 ? `  ${use.padEnd(31)}${note}\n` : `  ${use}\n${" ".repeat(33)}${note}\n`;
 }).join("")).join("");
 
-/** Splits the arguments into positionals and options. `given` lists every option as typed, for `check`. */
+/** Splits the arguments into positionals and options. `given` lists every option as typed and `inlined` every switch typed as `--x=v`, both for `check`. */
 export function parse(argv) {
-  const pos = [], flags = {}, given = [];
+  const pos = [], flags = {}, given = [], inlined = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (!a.startsWith("--") || a === "-") { pos.push(a); continue; }
@@ -104,9 +104,12 @@ export function parse(argv) {
       if (v === undefined) throw new Error(`--${k} needs a value`);
       if (k === "repo" && flags.repos) flags.repos.push(v); else if (k === "repo") flags.repos = [v];
       flags[k] = v;
-    } else flags[k] = inline ?? true;
+    } else {
+      if (inline !== undefined) inlined.push(k); // every occurrence, so `--force=false --force` is still refused
+      flags[k] = inline ?? true;
+    }
   }
-  return { pos, flags, given };
+  return { pos, flags, given, inlined };
 }
 
 const usageOf = (entries) => entries.map((e) => `  pp ${e.use}`).join("\n");
@@ -115,7 +118,7 @@ const usageOf = (entries) => entries.map((e) => `  pp ${e.use}`).join("\n");
  * Throws, before the command does anything, for a command that is not one, for an option the command does not
  * declare, and for a switch given a value (`--force=false` would otherwise read as on).
  */
-export function check(pos, given, flags) {
+export function check(pos, given, inlined) {
   const [cmd] = pos;
   let entry = null;
   if (cmd !== undefined && cmd !== "help" && cmd !== "-h") {
@@ -128,6 +131,5 @@ export function check(pos, given, flags) {
   const takes = { ...GLOBAL, ...entry?.flags };
   const unknown = [...new Set(given.filter((k) => !(k in takes)))];
   if (unknown.length) throw new Error(`unknown option${unknown.length > 1 ? "s" : ""} ${unknown.map((k) => `--${k}`).join(", ")} for \`pp ${entry ? entry.head.map((a, i) => pos[i] ?? a[0]).join(" ") : "help"}\`; usage:\n${entry ? usageOf([entry]) : `  pp ${HEADER}`}`);
-  const valued = given.filter((k) => !takes[k] && flags[k] !== true);
-  if (valued.length) throw new Error(`--${valued[0]} takes no value`);
+  if (inlined.length) throw new Error(`--${inlined[0]} takes no value`);
 }

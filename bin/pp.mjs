@@ -27,8 +27,8 @@ const textOf = (f, what = "text") => {
 const need = (v, usage) => { if (v === undefined || v === "") throw new Error(`usage: pp ${usage}`); return v; };
 
 async function main() {
-  const { pos, flags: f, given } = parse(process.argv.slice(2));
-  check(pos, given, f); // before anything runs: an option the command does not declare is an error, not ignored
+  const { pos, flags: f, given, inlined } = parse(process.argv.slice(2));
+  check(pos, given, inlined); // before anything runs: an option the command does not declare is an error, not ignored
   const root = rootOf({ root: f.root });
   const proj = (slug, usage) => Project.open(root, need(slug, usage));
   const [cmd, a1, a2, a3] = pos;

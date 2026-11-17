@@ -14,7 +14,7 @@ const PP = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "pp.mjs");
 // Every spelling of a command's words: `thread stop|ack` is two commands.
 const spellings = (head) => head.reduce((all, alts) => all.flatMap((w) => alts.map((a) => [...w, a])), [[]]);
 const argvOf = (words, flags) => [...words, "<arg>", ...Object.entries(flags).flatMap(([k, takes]) => takes ? [`--${k}`, "v"] : [`--${k}`])];
-const run = (argv) => { const { pos, flags, given } = parse(argv); check(pos, given, flags); };
+const run = (argv) => { const { pos, given, inlined } = parse(argv); check(pos, given, inlined); };
 
 test("every option of every usage line is accepted for that command", () => {
   assert.ok(ENTRIES.length > 40);
@@ -42,6 +42,9 @@ test("an option of another command is refused too, `--dry-run` on resolve above 
 
 test("a switch given a value is refused, not read as on", () => {
   assert.throws(() => run(["thread", "resolve", "demo", "t-1", "--force=false"]), /--force takes no value/);
+  // Every occurrence counts, not the last one: a later bare `--force` must not hide the first.
+  assert.throws(() => run(["thread", "resolve", "demo", "t-1", "--force=false", "--force"]), /--force takes no value/);
+  assert.throws(() => run(["thread", "resolve", "demo", "t-1", "--force", "--force=false"]), /--force takes no value/);
   assert.doesNotThrow(() => run(["thread", "start", "demo", "--title=T", "--task=x"]));
 });
 
