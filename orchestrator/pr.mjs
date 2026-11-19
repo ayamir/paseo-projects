@@ -11,12 +11,17 @@ export function validPrUrl(url) {
   return Boolean(m && nameOk(m[1]) && nameOk(m[2]));
 }
 
-/** The report's first-line `PR:` URL; `{ note }` when one is present but unusable. */
-export function prLine(report) {
-  const first = report.split("\n")[0] ?? "";
-  if (!first.startsWith("PR:")) return { url: null };
-  const value = first.slice(3).trim();
-  return validPrUrl(value) ? { url: value } : { url: null, note: "the report's `PR:` line is not a https://github.com/<owner>/<repo>/pull/<number> URL and was ignored" };
+function parsePrLine(line, label) {
+  if (!line?.startsWith(label)) return { url: null };
+  const value = line.slice(label.length).trim();
+  return validPrUrl(value) ? { url: value } : { url: null, note: `the report's \`${label}\` line is not a https://github.com/<owner>/<repo>/pull/<number> URL and was ignored` };
+}
+
+/** The author's PR stays on the first line; the reviewed PR can share the first paragraph. */
+export const prLine = (report) => parsePrLine(report.split("\n", 1)[0], "PR:");
+export function reviewedPrLine(report) {
+  const first = report.replace(/^(?:[ \t\r]*\n)+/, "").split(/\n[ \t\r]*\n/, 1)[0];
+  return parsePrLine(first.split("\n").find((line) => line.startsWith("Reviewed-PR:")), "Reviewed-PR:");
 }
 
 /** `{ host, repo }` (lower-cased) of a GitHub remote URL; null off GitHub. */
@@ -77,14 +82,20 @@ export function reduce(json, branch, origin) {
 
 const FIELDS = "state,reviewDecision,statusCheckRollup,comments,reviews,headRefName,headRefOid,headRepository,headRepositoryOwner";
 
-export function view(url, origin) {
+export function view(url, origin, fields = FIELDS) {
   if (!validPrUrl(url)) throw new Error("not a pull request URL");
   const host = hostOf(origin);
   const parts = url.slice("https://github.com/".length).split("/");
-  const args = host === "github.com" ? ["pr", "view", "--json", FIELDS, "--", url] : ["pr", "view", "--json", FIELDS, "--repo", `${parts[0]}/${parts[1]}`, "--", parts[3]];
+  const args = host === "github.com" ? ["pr", "view", "--json", fields, "--", url] : ["pr", "view", "--json", fields, "--repo", `${parts[0]}/${parts[1]}`, "--", parts[3]];
   const r = gh(host, args);
   if (!r.ok) throw new Error(`gh pr view: ${r.out}`);
   return r.stdout;
+}
+
+export function reviewedState(url) {
+  const { state } = JSON.parse(view(url, undefined, "state"));
+  if (!["OPEN", "CLOSED", "MERGED"].includes(state)) throw new Error("gh pr view: unrecognized reviewed PR state");
+  return state;
 }
 
 /** The login `gh` acts as: comments by it are the threads' own replies. */
@@ -151,7 +162,7 @@ export function prRoutinePrompt(name, body, url, events, s) {
 }
 
 /** PRs a report names per `owner/repo`, except the tracked one. */
-export function reportRefs(report, origin, except) {
+export function reportRefs(report, origin, ...except) {
   const refs = new Map();
   const add = (repo, n) => { if (!refs.has(repo)) refs.set(repo, new Set()); refs.get(repo).add(n); };
   const own = normalizeOrigin(origin);
@@ -162,8 +173,8 @@ export function reportRefs(report, origin, except) {
     const p = url.slice(19).split("/");
     add(`${p[0]}/${p[1]}`.toLowerCase(), Number(p[3]));
   }
-  if (validPrUrl(except)) {
-    const p = except.slice(19).split("/");
+  for (const url of except.filter(validPrUrl)) {
+    const p = url.slice(19).split("/");
     refs.get(`${p[0]}/${p[1]}`.toLowerCase())?.delete(Number(p[3]));
   }
   for (const [k, v] of refs) if (!v.size) refs.delete(k);

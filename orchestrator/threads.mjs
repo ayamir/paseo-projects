@@ -9,6 +9,7 @@ import { loadConfig, loadSafety, resolveProfile, agentConfig, kindOf, modelOf, c
 import { prefix } from "./project.mjs";
 import * as inbox from "./inbox.mjs";
 import * as cleanup from "./cleanup.mjs";
+import { validPrUrl } from "./pr.mjs";
 
 
 export const STARTING_TIMEOUT_SECS = 300;
@@ -344,6 +345,7 @@ export async function start(project, a) {
   if (status !== "active") throw new Error(`\`${project.slug}\` is ${status}; \`thread start\` is refused until it is active again`);
   if (!a.title?.trim()) throw new Error("--title may not be empty");
   if (!a.task?.trim()) throw new Error("the task is empty");
+  if (a.reviews !== undefined && !validPrUrl(a.reviews)) throw new Error("--reviews must be a https://github.com/<owner>/<repo>/pull/<number> URL");
   const { settings } = project.read();
   const config = loadConfig();
   const safety = loadSafety(config, project.dir);
@@ -369,7 +371,7 @@ export async function start(project, a) {
     origin = h.shell("git remote get-url origin", repo).stdout.trim();
   }
 
-  const t = allocate(project, (t) => Object.assign(t, { title: a.title.trim(), kind, repo, origin, machine, base: a.base ?? "", profile: profile.name, provider: profile.provider }));
+  const t = allocate(project, (t) => Object.assign(t, { title: a.title.trim(), kind, repo, origin, machine, base: a.base ?? "", profile: profile.name, provider: profile.provider, ...(a.reviews ? { reviews: a.reviews } : {}) }));
   writeAtomic(taskPath(project, t.id), a.task.trimEnd() + "\n");
   if (kind === "worktree") t.branch = branchName(project.slug, t.id, t.title);
 
@@ -388,8 +390,10 @@ export async function start(project, a) {
     });
     await handle.refresh();
     const snap = handle.current();
+    const branchStart = kind === "worktree" ? h.shell(`git rev-parse --verify -q ${q(`refs/heads/${t.branch}`)}`, repo, undefined, 5000) : null;
     const placed = update(project, t.id, (r) => Object.assign(r, {
       agent_id: handle.id, workspace_id: snap?.workspaceId ?? "", cwd: snap?.cwd ?? cwd, branch: t.branch,
+      ...(branchStart?.ok ? { branch_start: { name: t.branch, oid: branchStart.stdout.trim() } } : {}),
     }));
     placed.thread_dir = threadDir(placed.cwd, project.slug, t.id);
     update(project, t.id, (r) => { r.thread_dir = placed.thread_dir; });
@@ -653,8 +657,33 @@ export async function clean(project, t, { keepWorktree = false, copyComplete = t
     if (!tip.ok) notes.push("no local branch left");
     else if (tip.stdout.trim() !== mergedHead) notes.push(`branch ${t.branch} kept: it has commits that are not in the merged pull request`);
     else { const d = h.shell(`git branch -D -- ${q(t.branch)}`, t.repo); notes.push(d.ok ? `branch ${t.branch} deleted` : `branch kept: ${d.out}`); }
+  } else if (t.resolved_reason === "reviewed PR merged" && t.branch) {
+    notes.push(cleanReviewBranch(h, t));
   }
   return notes;
+}
+
+function cleanReviewBranch(h, t) {
+  const ref = `refs/heads/${t.branch}`;
+  const tip = h.shell(`git rev-parse --verify -q ${q(ref)}`, t.repo);
+  if (tip.code === 1) return "no local branch left";
+  if (!tip.ok) return `branch ${t.branch} kept: could not read its tip (${tip.out})`;
+  if (t.branch_start?.name !== t.branch || !t.branch_start.oid) {
+    return `branch ${t.branch} kept: its original branch and starting commit could not be verified`;
+  }
+  if (tip.stdout.trim() !== t.branch_start.oid) {
+    return `branch ${t.branch} kept: it has its own commits or moved since creation`;
+  }
+  const otherRefs = h.shell(`git for-each-ref --contains ${q(t.branch_start.oid)} --format='%(refname)' refs/heads refs/remotes refs/tags`, t.repo);
+  if (!otherRefs.ok || !otherRefs.stdout.trim().split("\n").some((name) => name && name !== ref)) {
+    return `branch ${t.branch} kept: its starting commit is not known to be reachable from another ref`;
+  }
+  const worktrees = h.shell("git worktree list --porcelain", t.repo);
+  if (!worktrees.ok) return `branch ${t.branch} kept: could not list its worktrees (${worktrees.out})`;
+  if (worktrees.stdout.split("\n").includes(`branch ${ref}`)) return `branch ${t.branch} kept: it is checked out`;
+  // An intervening commit must survive, even if the branch was unchanged during the checks above.
+  const deleted = h.shell(`git update-ref --no-deref -d ${q(ref)} ${q(t.branch_start.oid)}`, t.repo);
+  return deleted.ok ? `branch ${t.branch} deleted` : `branch ${t.branch} kept: ${deleted.out}`;
 }
 
 /** Final copy, then resolved, then cleanup, then one inbox item. */

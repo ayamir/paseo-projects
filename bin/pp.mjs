@@ -170,7 +170,7 @@ async function threadCommand([sub, slug, id], f, root, proj) {
         ({ profile, machine } = tasks.launchFor(found, profile, machine));
         task = tasks.delegated(text, f["from-task"], task || found.title);
       }
-      const { thread: t, warnings } = await threads.start(p, { title: f.title, task, repo: f.repo, kind: f.kind, machine: machine ?? undefined, profile: profile ?? undefined, base: f.base });
+      const { thread: t, warnings } = await threads.start(p, { title: f.title, task, repo: f.repo, kind: f.kind, machine: machine ?? undefined, profile: profile ?? undefined, base: f.base, reviews: f.reviews });
       warnings.forEach((w) => console.log(`warning: ${w}`));
       console.log(`started ${t.id} (${t.kind}${t.branch ? `, branch ${t.branch}` : ""}, profile ${t.profile}) agent ${t.agent_id}`);
       return;

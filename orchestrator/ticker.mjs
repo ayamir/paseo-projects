@@ -174,32 +174,19 @@ async function followPrs(project, settings, state, agents, at) {
       inbox.write(project, "pr", t.id, "bad PR line", `${t.id} "${t.title}": ${line.note}`);
       t = threads.update(project, t.id, (r) => { r.pr_note_hash = r.report_hash; });
     }
-    let url = line.url ?? (t.pr || null);
+    const reviewed = pr.reviewedPrLine(report);
+    const reviewedUrl = t.reviews ?? reviewed.url;
     try {
-      if (!url && t.kind === "worktree" && t.branch) url = pr.findByBranch(t.origin, t.branch);
-      if (!url) continue;
-      const reduced = pr.reduce(pr.view(url, t.origin), t.branch, t.origin);
-      if (reduced.ignored) {
-        if (t.pr_ignored_url !== url) {
-          inbox.write(project, "pr", t.id, "PR ignored", `${t.id} "${t.title}": ${url} is not followed: ${reduced.ignored}`);
-          threads.update(project, t.id, (r) => { r.pr_ignored_url = url; });
-        }
-        continue;
-      }
-      const s = pr.withChecks(reduced.summary, settings.pr_checks);
-      const old = t.pr === url ? t.pr_summary ?? null : null;
-      if (JSON.stringify(old) !== JSON.stringify(s)) {
-        const events = pr.prEvents(old, s, ownOf(t.origin));
-        t = threads.update(project, t.id, (r) => {
-          Object.assign(r, { pr: url, pr_state: s.state, pr_review: s.review_decision, pr_summary: s });
-          if (s.state === "MERGED" && !r.merged_seen_at) r.merged_seen_at = now();
-        });
-        const phrase = pr.prEventPhrase(events, s);
-        inbox.write(project, "pr", t.id, phrase, `${t.id} "${t.title}" ${url}: ${pr.describeChange(old, s)}`);
-        if (events.length) notify(project, settings, t.id, `${t.title}: ${phrase}`);
-        await prRoutines(project, t, url, events, s);
-      }
-      if (s.state === "MERGED") await resolveMerged(project, t, url, s, agents, at);
+      await followOwnPr(project, settings, t, line.url, ownOf, agents, at, reviewedUrl);
+    } catch (e) {
+      ghFailed = true;
+      console.error(`${now()} ${project.slug} ${t.id}: ${e.message}`);
+    }
+    if (!reviewedUrl && !reviewed.note) continue;
+    t = threads.load(project, t.id);
+    if (!threads.isOpen(t)) continue;
+    try {
+      await followReviewedPr(project, t, reviewedUrl, reviewed.note, agents, at);
     } catch (e) {
       ghFailed = true;
       console.error(`${now()} ${project.slug} ${t.id}: ${e.message}`);
@@ -216,6 +203,59 @@ async function followPrs(project, settings, state, agents, at) {
     delete state.gh_fail_since;
     delete state.gh_outage_reported;
   }
+}
+
+async function followOwnPr(project, settings, t, declared, ownOf, agents, at, reviewedUrl) {
+  let url = declared ?? (t.pr || null);
+  if (!url && t.kind === "worktree" && t.branch) url = pr.findByBranch(t.origin, t.branch);
+  if (!url) return;
+  const reduced = pr.reduce(pr.view(url, t.origin), t.branch, t.origin);
+  if (reduced.ignored) {
+    if (t.pr_ignored_url !== url) {
+      inbox.write(project, "pr", t.id, "PR ignored", `${t.id} "${t.title}": ${url} is not followed: ${reduced.ignored}`);
+      threads.update(project, t.id, (r) => { r.pr_ignored_url = url; });
+    }
+    return;
+  }
+  const s = pr.withChecks(reduced.summary, settings.pr_checks);
+  const old = t.pr === url ? t.pr_summary ?? null : null;
+  if (JSON.stringify(old) !== JSON.stringify(s)) {
+    const events = pr.prEvents(old, s, ownOf(t.origin));
+    t = threads.update(project, t.id, (r) => {
+      Object.assign(r, { pr: url, pr_state: s.state, pr_review: s.review_decision, pr_summary: s });
+      if (s.state === "MERGED" && !r.merged_seen_at) r.merged_seen_at = now();
+    });
+    const phrase = pr.prEventPhrase(events, s);
+    inbox.write(project, "pr", t.id, phrase, `${t.id} "${t.title}" ${url}: ${pr.describeChange(old, s)}`);
+    if (events.length) notify(project, settings, t.id, `${t.title}: ${phrase}`);
+    await prRoutines(project, t, url, events, s);
+  }
+  if (s.state === "MERGED") await resolveMerged(project, t, url, s, agents, at, reviewedUrl);
+}
+
+const reviewUrlKey = (url) => url.toLowerCase().replace(/\/0+(?=\d+$)/, "/");
+
+async function followReviewedPr(project, t, url, note, agents, at) {
+  if (note && t.reviewed_pr_note_hash !== t.report_hash) {
+    inbox.write(project, "pr", t.id, "bad Reviewed-PR line", `${t.id} "${t.title}": ${note}`);
+    t = threads.update(project, t.id, (r) => { r.reviewed_pr_note_hash = r.report_hash; });
+  }
+  if (!url) return;
+  const state = pr.reviewedState(url);
+  const key = reviewUrlKey(url);
+  const old = t.reviewed_pr && reviewUrlKey(t.reviewed_pr.url) === key ? t.reviewed_pr : null;
+  const mergedSeenAt = state === "MERGED" ? old?.merged_seen_at ?? now() : null;
+  if (old?.state !== state) {
+    t = threads.update(project, t.id, (r) => { r.reviewed_pr = { url, state, merged_seen_at: mergedSeenAt }; });
+  }
+  if (state === "CLOSED" && !t.reviewed_pr_closed_urls?.includes(key)) {
+    inbox.write(project, "pr", t.id, "reviewed PR closed", `${t.id} "${t.title}": ${url} closed without merging`);
+    threads.update(project, t.id, (r) => { (r.reviewed_pr_closed_urls ??= []).push(key); });
+  }
+  const hasUnmergedOwnPr = Boolean(t.pr) && t.pr_state !== "MERGED";
+  if (state !== "MERGED" || hasUnmergedOwnPr) return;
+  if (!readyForMergedResolve(project, t, mergedSeenAt, agents, at) || hasOtherOpenPr(project, t, url)) return;
+  await threads.resolve(project, t.id, { reason: "reviewed PR merged", why: `was resolved: reviewed PR ${url} merged` });
 }
 
 async function prRoutines(project, t, url, events, s) {
@@ -236,21 +276,27 @@ async function prRoutines(project, t, url, events, s) {
 // Whether its agent works is unknown while its daemon does not answer, and unknown is not idle: it waits.
 const agentUnknown = (agents, t) => (agents.unreachable ?? []).includes(t.machine || "local");
 
-/** A merged thread resolves once it is done with it: idle, and finished or quiet for a while. */
-async function resolveMerged(project, t, url, s, agents, at) {
-  if (agentUnknown(agents, t)) return;
+/** A merged thread resolves once it is idle and finished or quiet for a while. */
+function readyForMergedResolve(project, t, mergedSeenAt, agents, at) {
+  if (agentUnknown(agents, t)) return false;
   const live = threads.liveOf(t, agents.get(t.agent_id), threads.progressOf(project, t.id), at);
   const g = threads.group(t, live, at).group;
-  if (g === "working" || g === "waiting-on-you") return;
-  const p = live.progress;
-  const finished = p ? p.percent === 100 : (t.last_report_change && t.last_report_change > t.merged_seen_at) || secondsSince(t.merged_seen_at, at) >= MERGED_GRACE_SECS;
-  if (!finished) return;
-  const refs = pr.reportRefs(readText(threads.homeReportPath(project, t.id)), t.origin, url);
+  if (g === "working" || g === "waiting-on-you") return false;
+  return live.progress ? live.progress.percent === 100
+    : (t.last_report_change && t.last_report_change > mergedSeenAt) || secondsSince(mergedSeenAt, at) >= MERGED_GRACE_SECS;
+}
+
+function hasOtherOpenPr(project, t, ...excludedUrls) {
+  const refs = pr.reportRefs(readText(threads.homeReportPath(project, t.id)), t.origin, ...excludedUrls);
   for (const [repo, numbers] of refs) {
     const openOwn = pr.openOwnNumbers(repo, pr.hostOf(t.origin));
-    const still = [...numbers].filter((n) => openOwn.has(n));
-    if (still.length) return; // another of its pull requests is still open
+    if ([...numbers].some((n) => openOwn.has(n))) return true;
   }
+  return false;
+}
+
+async function resolveMerged(project, t, url, s, agents, at, reviewedUrl) {
+  if (!readyForMergedResolve(project, t, t.merged_seen_at, agents, at) || hasOtherOpenPr(project, t, url, reviewedUrl)) return;
   await threads.resolve(project, t.id, { reason: "merged", mergedHead: s.head_oid, why: `was resolved: ${url} merged` });
 }
 
