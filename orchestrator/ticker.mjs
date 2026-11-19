@@ -176,7 +176,7 @@ async function followPrs(project, settings, state, agents, at) {
     }
     let url = line.url ?? (t.pr || null);
     try {
-      if (!url && t.kind === "worktree" && t.branch) url = pr.findByBranch(t.origin, t.branch);
+      if (!url && threads.hasBranchCheckout(t) && t.branch) url = pr.findByBranch(t.origin, t.branch);
       if (!url) continue;
       const reduced = pr.reduce(pr.view(url, t.origin), t.branch, t.origin);
       if (reduced.ignored) {
