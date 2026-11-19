@@ -252,7 +252,8 @@ async function followReviewedPr(project, t, url, note, agents, at) {
     inbox.write(project, "pr", t.id, "reviewed PR closed", `${t.id} "${t.title}": ${url} closed without merging`);
     threads.update(project, t.id, (r) => { (r.reviewed_pr_closed_urls ??= []).push(key); });
   }
-  if (state !== "MERGED" || t.pr_state === "OPEN") return;
+  const hasUnmergedOwnPr = Boolean(t.pr) && t.pr_state !== "MERGED";
+  if (state !== "MERGED" || hasUnmergedOwnPr) return;
   if (!readyForMergedResolve(project, t, mergedSeenAt, agents, at) || hasOtherOpenPr(project, t, url)) return;
   await threads.resolve(project, t.id, { reason: "reviewed PR merged", why: `was resolved: reviewed PR ${url} merged` });
 }

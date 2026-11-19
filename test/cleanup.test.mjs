@@ -722,13 +722,13 @@ test("CLI and ticker: follow reviewed PRs and resolve only the merged, finished 
     return { kind, url, row };
   });
   const both = cases.find(({ kind }) => kind === "both");
-  async function poll(final = false, ownMerged = false) {
+  async function poll(final = false, ownState = "OPEN") {
     write(statePath, JSON.stringify({ ...JSON.parse(existsSync(statePath) ? readFileSync(statePath, "utf8") : "{}"), last_pr_poll: null }));
     const views = Object.fromEntries(cases.map(({ kind, url }) => [url, { state: final ? (kind === "closed" ? "CLOSED" : "MERGED") : "OPEN", headRefName: "author-branch", headRepository: { name: "fork" }, headRepositoryOwner: { login: "other" } }]));
     // At the last poll the reviewer points to a different, open PR filed by the same gh login.
-    if (ownMerged) views["https://github.com/o/r/pull/21"] = { state: "OPEN" };
-    views[ownUrl] = { state: ownMerged ? "MERGED" : "OPEN", headRefName: both.row.branch, headRefOid: git(both.row.cwd, "rev-parse", "HEAD"), headRepository: { name: "r" }, headRepositoryOwner: { login: "o" } };
-    const gitHub = { FAKE_GH_VIEW: JSON.stringify(views), FAKE_GH_FAIL_HEAD: final ? cases[0].row.branch : "", FAKE_GH_OPEN_OWN: ownMerged ? '[{"number":21}]' : "[]" };
+    if (ownState === "MERGED") views["https://github.com/o/r/pull/21"] = { state: "OPEN" };
+    views[ownUrl] = { state: ownState, headRefName: both.row.branch, headRefOid: git(both.row.cwd, "rev-parse", "HEAD"), headRepository: { name: "r" }, headRepositoryOwner: { login: "o" } };
+    const gitHub = { FAKE_GH_VIEW: JSON.stringify(views), FAKE_GH_FAIL_HEAD: final ? cases[0].row.branch : "", FAKE_GH_OPEN_OWN: ownState === "MERGED" ? '[{"number":21}]' : "[]" };
     const child = spawn(process.execPath, [...args, "ticker", "run"], { env: { ...env, ...gitHub }, stdio: ["ignore", "ignore", "pipe"] });
     let stderr = "";
     child.stderr.on("data", (data) => { stderr += data; });
@@ -760,8 +760,16 @@ test("CLI and ticker: follow reviewed PRs and resolve only the merged, finished 
   assert.equal(stillOpen.pr_state, "OPEN");
   assert.equal(stillOpen.reviewed_pr?.state, "MERGED");
   assert.ok(existsSync(both.row.cwd));
+  await poll(true, "CLOSED");
+  const ownClosed = show(both.row.id);
+  assert.equal(ownClosed.pr, ownUrl);
+  assert.equal(ownClosed.pr_state, "CLOSED");
+  assert.equal(ownClosed.reviewed_pr?.state, "MERGED");
+  assert.equal(ownClosed.status, "open", "a closed, unmerged own PR blocks reviewed PR auto-resolve");
+  assert.ok(existsSync(both.row.cwd));
+  assert.notEqual(git(repo, "branch", "--list", both.row.branch), "");
   write(join(both.row.thread_dir, "report.md"), `PR: ${ownUrl}\nReviewed-PR: https://github.com/o/r/pull/21\n\n## Report\nDone\n`);
-  await poll(true, true);
+  await poll(true, "MERGED");
   const ownResolved = show(both.row.id);
   assert.equal(ownResolved.status, "resolved");
   assert.equal(ownResolved.pr, ownUrl);
