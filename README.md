@@ -71,7 +71,7 @@ node bin/pp.mjs open billing                  # coordinator + ticker
 ```sh
 pp list                                       # every project and what needs you
 pp context <slug>                             # the coordinator's digest
-pp thread start <slug> --title T --task-file brief.md [--repo PATH] [--kind worktree|tab|checkout] [--profile P]
+pp thread start <slug> --title T --task-file brief.md [--repo PATH] [--kind worktree|ovnfs|tab|checkout] [--profile P]
 pp thread list <slug>                         # grouped by what needs you
 pp thread prompt <slug> <id> --text "…"       # steer a thread
 pp thread permissions|allow|deny <slug> <id>  # answer its permission requests
@@ -85,8 +85,11 @@ pp doctor [--fix]
 Thread kinds:
 
 - `worktree` (the default with `--repo`): its own worktree and branch.
+- `ovnfs` (opt-in, local): its own branch in an [OVNFS](https://github.com/stencil-hq/ovnfs) checkout. Requires `ovnfs` v0.8.0 on `PATH`, `--repo`, and a local Paseo daemon. `--base` selects a Git revision and defaults to `HEAD`.
 - `checkout`: the repository's main checkout, shared with you.
 - `tab` (the default without `--repo`): its own folder, `threads/<id>/`. With `--repo` it still shows under that repository's project in the Paseo sidebar. Good for research that reads the code and writes nothing.
+
+For example, `pp thread start demo --title "Fix tests" --task-file brief.md --repo /path/to/repo --kind ovnfs` opens an OVNFS checkout and attaches a directory workspace to the source repo's Paseo project when it is registered. Restart reuses the checkout. The OVNFS mount must stay available to the local Paseo daemon and ticker. See the [OVNFS cleanup rules](docs/cleanup.md#ovnfs-checkout).
 
 ## Get your questions answered
 

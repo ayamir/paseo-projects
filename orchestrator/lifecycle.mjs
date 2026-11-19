@@ -97,7 +97,7 @@ export function sweepPlan(project) {
       } });
     }
   }
-  for (const t of all.filter((t) => t.status === "resolved" && t.branch && t.repo && !t.machine && t.pr_state === "MERGED")) {
+  for (const t of all.filter((t) => t.kind === "worktree" && t.status === "resolved" && t.branch && t.repo && !t.machine && t.pr_state === "MERGED")) {
     const tip = sh(["git", "-C", t.repo, "rev-parse", "--verify", "-q", `refs/heads/${t.branch}`]);
     if (!tip.ok || tip.stdout.trim() !== t.pr_summary?.head_oid) continue;
     if (isDir(t.cwd)) continue; // its worktree is still there; the worktree step goes first

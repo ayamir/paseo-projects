@@ -101,6 +101,14 @@ worktree 删除前要满足这些条件，任何一条不满足就保留并写�
 - `--dry-run` 会预览 worktree、声明路径和索引，列出 would-remove，不删东西，也不写记录。它不会重新拷贝，所以 library 里的成品可能还没归档。只有 worktree 已经移除时才检查本地分支并归档 workspace。这两项的结果写在命令输出或 resolve 的 inbox 里。
 - `pp sweep` 会对 resolved 线程残留的 worktree 再跑一次 `thread cleanup`，跳过保留的。不属于任何线程的 `pp-<slug>-t-NNNN` worktree 也走同样的 worktree 检查。
 
+## OVNFS checkout
+
+`--kind ovnfs` 使用本机 OVNFS v0.8.0 管理 checkout。Paseo 将其作为普通目录 workspace 打开，`pp thread restart` 复用原挂载。OVNFS 进程和挂载需要在启动、重启与清理期间可用。PP 启动 OVNFS daemon 时设置 `OVNFS_GIT_REMOTES=0`，已有 daemon 使用自己的配置。
+
+`resolve` 或 `thread cleanup` 会确认 OVNFS registry 中的 checkout 身份、Paseo agent 归档结果、成品拷贝和 Git 状态。checkout 空闲后会再次拷贝报告和 library。只有 checkout 仍未被占用，且 Git 提交（包括 reflog 中可恢复的提交）可从源仓库的引用或已核实的合并 PR 找到时，才调用 `ovnfs rm --sticky-snapshots`。源仓库的克隆中尚未抓取的远端提交可能需要先 fetch，清理过程本身不会 fetch。`--keep-worktree` 也适用于 OVNFS，`--dry-run` 可预览保留原因。
+
+OVNFS 线程支持 `--reviews` 和报告中的 `Reviewed-PR:`。因被审 PR 合并而 resolve 时，只有私有分支仍指向启动时记录的提交，且提交可从源仓库引用访问，才移除 checkout。线程有尚未合并的自有 PR 时，被审 PR 合并不会触发 resolve。
+
 ## 和 Paseo 的合并自动归档冲突
 
 Paseo daemon 的 `daemon.autoArchiveAfterMerge`（默认关闭）打开时，会在 PR 合并后自动归档 workspace。触发条件只有这几条：PR 合并、git 不脏、没有领先 origin、worktree 归 Paseo 所有。满足后它用 `git worktree remove --force`、`rm -rf` 和 `git worktree prune` 删掉 worktree。它不看 pp 的保留决定，不看 ignored 内容（`.paseo-project/` 也在其中），也不看占用的进程。pp 的线程 worktree 都是 Paseo 创建的，所以这个设置打开时，删 worktree 的就不止 pp 一家：

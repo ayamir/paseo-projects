@@ -34,6 +34,39 @@ out("unknown tool", true);
 `);
 chmodSync(FAKE_CBM, 0o755);
 
+// A real private Git checkout behind OVNFS's CLI contract, so guards run without a filesystem mount in CI.
+const FAKE_OVNFS = join(BASE, "ovnfs");
+writeFileSync(FAKE_OVNFS, `#!/usr/bin/env node
+import { execFileSync, spawn } from "node:child_process";
+import { existsSync, realpathSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+const args = process.argv.slice(2);
+const state = process.env.FAKE_OVNFS_STATE;
+const saved = existsSync(state) ? JSON.parse(readFileSync(state, "utf8")) : null;
+const git = (...a) => execFileSync("git", a, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+if (args[0] === "--json" && args[1] === "ls") {
+  console.log(JSON.stringify({ checkouts: saved?.source === args[2] ? [saved] : [] }));
+} else if (args[0] === "--json" && args[1] === "new" && !saved && args[3] === "--name" && args[5]?.startsWith("--rev=")) {
+  const source = args[2], name = args[4], path = join(dirname(state), name);
+  const rev = git("-C", source, "rev-parse", "--verify", args[5].slice(6));
+  git("clone", "--no-checkout", "--", source, path);
+  git("-C", path, "checkout", "--detach", rev);
+  git("-C", path, "config", "ovnfs.checkout", name);
+  const c = { name, path: realpathSync(path), source, created: new Date().toISOString(), git: true };
+  writeFileSync(state, JSON.stringify(c));
+  console.log(JSON.stringify({ checkout: c }));
+} else if (args.length === 3 && args[0] === "rm" && args[1] === saved?.name && args[2] === "--sticky-snapshots") {
+  if (process.env.FAKE_OVNFS_DELAY_UNMOUNT) {
+    spawn(process.execPath, ["--input-type=module", "-e", 'import { rmSync } from "node:fs"; setTimeout(() => rmSync(process.argv[1], { recursive: true }), 800)', saved.path], { stdio: "ignore" }).unref();
+  } else rmSync(saved.path, { recursive: true });
+  rmSync(state);
+} else {
+  console.error("unexpected ovnfs invocation", args);
+  process.exit(1);
+}
+`);
+chmodSync(FAKE_OVNFS, 0o755);
+
 // A fake Paseo daemon on the SDK's wire protocol: it reads daemon.autoArchiveAfterMerge as `on`/`off`, refuses the
 // read (`reject`), answers it in a shape the SDK rejects (`malformed`), and archives workspaces. It also gives a
 // `thread restart` its agent: none listed, a create that checks the branch out again (where the fixture's worktree
@@ -43,14 +76,18 @@ const WS = createRequire(fileURLToPath(import.meta.resolve("@getpaseo/client")))
 const FAKE_DAEMON = join(BASE, "fake-daemon.mjs");
 writeFileSync(FAKE_DAEMON, `import ws from ${JSON.stringify(pathToFileURL(WS).href)};
 import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 const agents = new Map(), archiveAttempts = new Set(), at = new Date().toISOString();
+const workspaces = [], pageInfo = { nextCursor: null, prevCursor: null, hasMore: false };
+const projectFile = process.env.FAKE_PASEO_PROJECT;
+const project = () => ({ projectId: "prj_repo", projectRootPath: readFileSync(projectFile, "utf8"), projectDisplayName: "Repo", projectKind: "git" });
 const mode = process.env.FAKE_DAEMON_MODE, wss = new ws.WebSocketServer({ port: 0, host: "127.0.0.1" });
 wss.on("listening", () => console.log(wss.address().port));
 wss.on("connection", (s) => s.on("message", (raw) => {
   const m = JSON.parse(String(raw)), send = (message) => s.send(JSON.stringify({ type: "session", message }));
   if (m.type === "ping") return s.send(JSON.stringify({ type: "pong" }));
-  if (m.type === "hello") return send({ type: "status", payload: { status: "server_info", serverId: "fake" } });
+  if (m.type === "hello") return send({ type: "status", payload: { status: "server_info", serverId: "fake", features: { workspaceMultiplicity: true } } });
   const r = m.message ?? {}, requestId = r.requestId;
   if (r.type === "get_daemon_config_request" && mode === "reject") return send({ type: "rpc_error", payload: { requestId, requestType: r.type, error: "permission denied" } });
   if (r.type === "get_daemon_config_request") return send({ type: "get_daemon_config_response", payload: { requestId, config: mode === "malformed" ? "nope" : { mcp: { injectIntoAgents: false }, autoArchiveAfterMerge: mode === "on" } } });
@@ -59,12 +96,22 @@ wss.on("connection", (s) => s.on("message", (raw) => {
     archiveAttempts.add(r.workspaceId);
     return send({ type: "archive_workspace_response", payload: { requestId, workspaceId: r.workspaceId, archivedAt: first ? null : new Date().toISOString(), error: first ? "workspace archive refused" : null } });
   }
-  if (r.type === "fetch_agents_request") return send({ type: "fetch_agents_response", payload: { requestId, entries: [], pageInfo: { nextCursor: null, prevCursor: null, hasMore: false } } });
+  if (r.type === "project.list.request") return send({ type: "project.list.response", payload: { requestId, projects: projectFile ? [project()] : [] } });
+  if (r.type === "fetch_workspaces_request") return send({ type: "fetch_workspaces_response", payload: { requestId, entries: workspaces, pageInfo } });
+  if (r.type === "workspace.create.request") {
+    if (r.source.kind !== "directory" || r.source.projectId !== project().projectId) throw new Error("expected a directory workspace under the source repo");
+    const workspace = { ...project(), id: "wks_ovnfs_" + workspaces.length, workspaceDirectory: r.source.path,
+      workspaceKind: "checkout", name: r.title, status: "done", activityAt: null, gitRuntime: null, githubRuntime: null };
+    workspaces.push(workspace);
+    return send({ type: "workspace.create.response", payload: { requestId, workspace, setupTerminalId: null, error: null } });
+  }
+  if (r.type === "fetch_agents_request") return send({ type: "fetch_agents_response", payload: { requestId, entries: [], pageInfo } });
   if (r.type === "create_agent_request") {
-    const id = "agent-" + (agents.size + 1), { branch, newBranch, base } = r.worktree;
-    const cwd = join(dirname(r.config.cwd), newBranch || "wt");
-    execFileSync("git", ["-C", r.config.cwd, "worktree", "add", "-q", ...(newBranch ? ["-b", newBranch, cwd, base || "HEAD"] : [cwd, branch])], { stdio: "ignore" });
-    const agent = { id, provider: "claude", cwd, workspaceId: "wks_restarted", model: null, createdAt: at, updatedAt: at, lastUserMessageAt: null, status: "idle",
+    const id = "agent-" + (agents.size + 1), { branch, newBranch, base } = r.worktree ?? {};
+    const cwd = r.worktree ? join(dirname(r.config.cwd), newBranch || "wt") : r.config.cwd;
+    if (r.worktree) execFileSync("git", ["-C", r.config.cwd, "worktree", "add", "-q", ...(newBranch ? ["-b", newBranch, cwd, base || "HEAD"] : [cwd, branch])], { stdio: "ignore" });
+    else if (!workspaces.some((w) => w.id === r.workspaceId && w.workspaceDirectory === cwd)) throw new Error("agent placed outside the directory workspace");
+    const agent = { id, provider: "claude", cwd, workspaceId: r.workspaceId ?? "wks_restarted", model: null, createdAt: at, updatedAt: at, lastUserMessageAt: null, status: "idle",
       capabilities: { supportsStreaming: false, supportsSessionPersistence: false, supportsDynamicModes: false, supportsMcpServers: false, supportsReasoningStream: false, supportsToolInvocations: false },
       currentModeId: null, availableModes: [], pendingPermissions: [], persistence: null, title: null, labels: r.labels ?? {} };
     agents.set(id, agent);
@@ -81,9 +128,9 @@ wss.on("connection", (s) => s.on("message", (raw) => {
   if (requestId) send({ type: "rpc_error", payload: { requestId, requestType: r.type, error: "not faked" } });
 }));
 `);
-async function fakeDaemon(mode) {
+async function fakeDaemon(mode, projectFile = "") {
   if (mode === "down") return { url: NO_DAEMON, stop: () => {} };
-  const child = spawn(process.execPath, [FAKE_DAEMON], { env: { ...process.env, FAKE_DAEMON_MODE: mode }, stdio: ["ignore", "pipe", "inherit"] });
+  const child = spawn(process.execPath, [FAKE_DAEMON], { env: { ...process.env, FAKE_DAEMON_MODE: mode, FAKE_PASEO_PROJECT: projectFile }, stdio: ["ignore", "pipe", "inherit"] });
   const port = await new Promise((ok, no) => { child.stdout.once("data", (d) => ok(String(d).trim())); child.once("exit", () => no(new Error("the fake daemon exited"))); });
   return { url: `ws://127.0.0.1:${port}/ws`, stop: () => child.kill() };
 }
@@ -126,8 +173,114 @@ function fixture({ inRepo = false, daemon = "" } = {}) {
   const cleanup = () => JSON.parse(readFileSync(p.path("threads", `${id}.cleanup.json`), "utf8"));
   const item = (kind, target) => cleanup().items.find((i) => i.kind === kind && (!target || i.target === target));
   const indexes = (v) => { const s = JSON.parse(readFileSync(cbm, "utf8")); if (v) writeFileSync(cbm, JSON.stringify({ ...s, ...v })); return s.projects.map((x) => x.name).sort(); };
-  return { id, root, p, repo, wt, td, branch, pp, cleanup, item, indexes };
+  return { id, root, p, repo, wt, td, branch, env, pp, cleanup, item, indexes };
 }
+
+async function ovnfsFixture(mode, fn, startFlags = []) {
+  const projectFile = join(BASE, `ovnfs-project-${n}`);
+  const d = await fakeDaemon(mode, projectFile);
+  try {
+    const f = fixture({ daemon: d.url });
+    write(projectFile, f.repo);
+    const config = join(f.root, "config.json");
+    write(config, JSON.stringify({ profiles: { fake: { provider: "claude/fake-model" } } }));
+    const registry = join(f.root, "ovnfs.json");
+    Object.assign(f.env, { PP_CONFIG: config, FAKE_OVNFS_STATE: registry, PATH: `${BASE}:${f.env.PATH}` });
+    const base = git(f.repo, "rev-parse", "HEAD");
+    git(f.repo, "commit", "--allow-empty", "-qm", "next");
+    git(f.repo, "remote", "add", "origin", "https://github.com/o/r");
+    const r = f.pp("thread", "start", "demo", "--title", "OVNFS test", "--task", "test", "--kind", "ovnfs", "--repo", f.repo, "--base", base, "--profile", "fake", ...startFlags);
+    assert.ok(r.ok, r.out);
+    const id = `t-${Number(f.id.slice(2)) + 1}`;
+    const thread = () => JSON.parse(readFileSync(f.p.path("threads", `${id}.json`), "utf8"));
+    const t = thread();
+    assert.equal(git(t.cwd, "rev-parse", "HEAD"), base);
+    assert.equal(git(t.cwd, "branch", "--show-current"), t.branch);
+    assert.equal(t.workspace_id, "wks_ovnfs_0");
+    assert.equal(git(f.repo, "branch", "--list", t.branch), "");
+    await fn({ ...f, id, t, thread, registry });
+  } finally { d.stop(); }
+}
+
+test("OVNFS starts and restarts in the source project's directory workspace, then retries cleanup after agent archive fails", async () => {
+  await ovnfsFixture("archive-retry", ({ p, pp, id, t, thread }) => {
+    const restarted = pp("thread", "restart", "demo", id, "--fresh");
+    assert.ok(restarted.ok, restarted.out);
+    assert.equal(thread().cwd, t.cwd);
+    assert.equal(thread().workspace_id, t.workspace_id);
+    assert.notEqual(thread().agent_id, t.agent_id);
+    write(join(t.thread_dir, "library", "result.txt"), "archived output\n");
+    const preview = pp("thread", "cleanup", "demo", id, "--dry-run");
+    assert.ok(preview.ok, preview.out);
+    assert.match(preview.out, /OVNFS checkout would be removed/);
+    assert.ok(existsSync(t.cwd));
+    const first = pp("thread", "resolve", "demo", id);
+    assert.ok(first.ok, first.out);
+    assert.match(first.out, /agent archive refused/);
+    assert.match(first.out, /OVNFS checkout kept/);
+    assert.ok(existsSync(t.cwd));
+    assert.equal(readFileSync(p.path("library", id, "result.txt"), "utf8"), "archived output\n");
+    const retry = pp("thread", "cleanup", "demo", id);
+    assert.ok(retry.ok, retry.out);
+    assert.match(retry.out, /agent archived/);
+    assert.match(retry.out, /OVNFS checkout removed/);
+    assert.ok(!existsSync(t.cwd));
+  });
+});
+
+test("OVNFS archives library changes made before the checkout becomes idle", async () => {
+  await ovnfsFixture("off", ({ env, p, pp, id, t, root }) => {
+    const bin = join(root, "bin");
+    const result = join(t.thread_dir, "library", "result.txt");
+    const checked = join(root, "checked-occupants");
+    write(result, "before\n");
+    mkdirSync(bin);
+    writeFileSync(join(bin, "lsof"), `#!/usr/bin/env node
+const fs = require('node:fs');
+if (!fs.existsSync(${JSON.stringify(checked)})) {
+  const times = fs.statSync(${JSON.stringify(result)});
+  fs.writeFileSync(${JSON.stringify(result)}, 'latest\\n');
+  fs.utimesSync(${JSON.stringify(result)}, times.atime, times.mtime);
+  fs.writeFileSync(${JSON.stringify(checked)}, '1');
+  console.log(${JSON.stringify(`p12345\nn${t.cwd}`)});
+}
+`, { mode: 0o755 });
+    env.PATH = `${bin}:${env.PATH}`;
+    const resolved = pp("thread", "resolve", "demo", id);
+    assert.ok(resolved.ok, resolved.out);
+    assert.match(resolved.out, /OVNFS checkout removed/);
+    assert.ok(!existsSync(t.cwd));
+    assert.equal(readFileSync(p.path("library", id, "result.txt"), "utf8"), "latest\n");
+  });
+});
+
+test("OVNFS cleanup keeps changed identities, dirty files and commits absent from the source repo", async () => {
+  await ovnfsFixture("off", ({ pp, id, t, registry }) => {
+    const record = readFileSync(registry, "utf8");
+    write(registry, JSON.stringify({ ...JSON.parse(record), created: "replaced" }));
+    const mismatch = pp("thread", "resolve", "demo", id);
+    assert.equal(mismatch.ok, false, mismatch.out);
+    assert.match(mismatch.out, /OVNFS checkout identity changed/);
+    write(registry, record);
+    write(join(t.cwd, "package.json"), '{"dirty":true}\n');
+    const dirty = pp("thread", "resolve", "demo", id);
+    assert.ok(dirty.ok, dirty.out);
+    assert.match(dirty.out, /uncommitted change: package.json/);
+    assert.ok(existsSync(t.cwd));
+    git(t.cwd, "stash", "push");
+    const stashed = pp("thread", "cleanup", "demo", id);
+    assert.ok(stashed.ok, stashed.out);
+    assert.match(stashed.out, /it has Git stashes/);
+    assert.ok(existsSync(t.cwd));
+    git(t.cwd, "stash", "pop");
+    git(t.cwd, "add", "package.json");
+    git(t.cwd, "commit", "-qm", "private commit");
+    const unique = pp("thread", "cleanup", "demo", id);
+    assert.ok(unique.ok, unique.out);
+    assert.match(unique.out, /not confirmed outside the OVNFS checkout/);
+    assert.ok(existsSync(t.cwd));
+  });
+});
 
 test("resolve: report and library home first, then the declared, dependency and index resources go", () => {
   const f = fixture();
@@ -648,7 +801,8 @@ const view = process.env.FAKE_GH_VIEW;
 const matched = JSON.parse(view || "{}")[a.at(-1).toLowerCase()];
 if (process.env.FAKE_GH_FAIL_HEAD && a.includes("--head=" + process.env.FAKE_GH_FAIL_HEAD)) process.exit(1);
 console.log(a[0] === "pr" && a[1] === "view" ? (matched ? JSON.stringify(matched) : view)
-  : a[0] === "api" ? "me" : a.includes("--author") ? process.env.FAKE_GH_OPEN_OWN || "[]" : "[]");
+  : a[0] === "api" ? "me" : a.includes("--author") ? process.env.FAKE_GH_OPEN_OWN || "[]"
+  : a.includes("--head=" + process.env.FAKE_GH_HEAD) ? process.env.FAKE_GH_HEAD_PRS : "[]");
 `);
 chmodSync(join(FAKE_GH_DIR, "gh"), 0o755);
 const ORCH = join(dirname(fileURLToPath(import.meta.url)), "..", "orchestrator");
@@ -659,7 +813,7 @@ await tick(new Project(process.argv[2], "demo"), process.argv[3]);
 process.exit(0);
 `);
 const tickOnce = (f, started, view) => new Promise((ok) => {
-  const env = { ...process.env, PATH: `${FAKE_GH_DIR}:${process.env.PATH}`, PASEO_URL: NO_DAEMON, PP_CODEBASE_MEMORY_BIN: FAKE_CBM, FAKE_GH_VIEW: JSON.stringify(view) };
+  const env = { ...f.env, PATH: `${FAKE_GH_DIR}:${f.env.PATH}`, FAKE_GH_VIEW: JSON.stringify(view) };
   const c = spawn(process.execPath, [TICK, f.root, started], { env, stdio: ["ignore", "pipe", "pipe"] });
   let out = "";
   c.stdout.on("data", (d) => (out += d)); c.stderr.on("data", (d) => (out += d));
@@ -685,6 +839,41 @@ test("the ticker resolves no merged or idle thread while the daemon that says wh
   assert.deepEqual({ merged: now(merged), idle: now(idle) }, { merged: { status: "open", worktree: true }, idle: { status: "open", worktree: true } }, runs.map((r) => r.out).join("\n"));
   assert.equal(JSON.parse(readFileSync(merged.p.path("threads", `${merged.id}.json`), "utf8")).pr_state, "MERGED");
 });
+
+const REVIEW_URL = "https://github.com/o/r/pull/10";
+for (const kind of ["clean", "dirty", "private commit", "published commit", "reflog commit", "own PR"]) {
+  test(`OVNFS review: ${kind} after the reviewed PR merges`, async () => {
+    const byFlag = kind === "clean";
+    await ovnfsFixture("off", async ({ t, p, pp, id, thread, registry, ...f }) => {
+      writeSettings(p, { ...p.settings(), mute: true, nudge: false });
+      write(join(t.thread_dir, "report.md"), `${byFlag ? "" : `Reviewed-PR: ${REVIEW_URL}\n\n`}## Report\nDone\n`);
+      const progress = pp("report", "--thread", `demo/${id}`, "--percent", "100");
+      assert.ok(progress.ok, progress.out);
+      if (byFlag) f.env.FAKE_OVNFS_DELAY_UNMOUNT = "1";
+      if (kind === "dirty") write(join(t.cwd, "package.json"), '{"dirty":true}\n');
+      if (kind.endsWith("commit")) git(t.cwd, "commit", "--allow-empty", "-qm", "reviewer change");
+      const privateTip = kind === "reflog commit" ? git(t.cwd, "rev-parse", "HEAD") : "";
+      if (privateTip) git(t.cwd, "reset", "--hard", "HEAD^");
+      if (kind === "published commit") git(f.repo, "fetch", t.cwd, `${t.branch}:refs/heads/published-review`);
+      const views = { [REVIEW_URL]: { state: "MERGED" } };
+      if (kind === "own PR") {
+        const url = "https://github.com/o/r/pull/20";
+        Object.assign(f.env, { FAKE_GH_HEAD: t.branch, FAKE_GH_HEAD_PRS: JSON.stringify([{ url, state: "OPEN" }]) });
+        views[url] = { state: "OPEN", headRefName: t.branch, headRepository: { name: "r" }, headRepositoryOwner: { login: "o" } };
+      }
+      const r = await tickOnce(f, new Date().toISOString(), views);
+      assert.equal(r.code, 0, r.out);
+      assert.equal(thread().reviewed_pr?.state, "MERGED", r.out);
+      assert.equal(thread().status, kind === "own PR" ? "open" : "resolved", r.out);
+      assert.equal(thread().resolved_reason, kind === "own PR" ? "" : "reviewed PR merged");
+      assert.equal(existsSync(t.cwd), !byFlag, kind);
+      assert.equal(existsSync(registry), !byFlag, kind);
+      if (kind === "dirty") assert.equal(readFileSync(join(t.cwd, "package.json"), "utf8"), '{"dirty":true}\n');
+      if (privateTip) assert.ok(git(t.cwd, "reflog", "--format=%H").includes(privateTip));
+      else if (kind.endsWith("commit")) assert.equal(git(t.cwd, "log", "-1", "--format=%s"), "reviewer change");
+    }, byFlag ? ["--reviews", REVIEW_URL] : []);
+  });
+}
 
 test("CLI and ticker: follow reviewed PRs and resolve only the merged, finished reviews", { timeout: 45_000 }, async (t) => {
   const root = mkdtempSync(join(BASE, "reviews-"));

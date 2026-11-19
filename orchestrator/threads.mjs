@@ -9,6 +9,7 @@ import { loadConfig, loadSafety, resolveProfile, agentConfig, kindOf, modelOf, c
 import { prefix } from "./project.mjs";
 import * as inbox from "./inbox.mjs";
 import * as cleanup from "./cleanup.mjs";
+import * as ovnfs from "./ovnfs.mjs";
 import { validPrUrl } from "./pr.mjs";
 
 
@@ -301,7 +302,9 @@ export function copyHome(project, t, withLibrary = false, exclude = []) {
   let hash = null;
   if (report !== null) {
     hash = sha256(report);
-    if (hash !== t.report_hash || !existsSync(homeReportPath(project, t.id))) project.lock(() => writeAtomic(homeReportPath(project, t.id), report));
+    if ((withLibrary && t.kind === "ovnfs") || hash !== t.report_hash || !existsSync(homeReportPath(project, t.id))) {
+      project.lock(() => writeAtomic(homeReportPath(project, t.id), report));
+    }
   }
   if (withLibrary && h.isDir(`${t.thread_dir}/library`)) {
     const lib = `${t.thread_dir}/library`;
@@ -316,7 +319,7 @@ export function copyHome(project, t, withLibrary = false, exclude = []) {
       mkdirSync(target, { recursive: true });
       // `-rt` without `-l`: symbolic links are skipped, never followed.
       const src = h.remote ? `${h.ssh}:${lib}/` : `${lib}/`;
-      const r = sh(["rsync", "-rt", ...exclude.map((x) => `--exclude=/${x.replace(/[*?[\\]/g, "\\$&")}`), ...(h.remote ? ["-e", "ssh -o BatchMode=yes"] : []), src, `${target}/`], undefined, undefined, { timeout: 120_000 });
+      const r = sh(["rsync", t.kind === "ovnfs" ? "-rtc" : "-rt", ...exclude.map((x) => `--exclude=/${x.replace(/[*?[\\]/g, "\\$&")}`), ...(h.remote ? ["-e", "ssh -o BatchMode=yes"] : []), src, `${target}/`], undefined, undefined, { timeout: 120_000 });
       if (!r.ok) return { outcome: "failed", error: `rsync failed: ${r.out}`, notes, hash };
       if (/skipping non-regular/.test(r.out)) notes.push("symbolic links in the library were not copied");
     }
@@ -325,6 +328,30 @@ export function copyHome(project, t, withLibrary = false, exclude = []) {
 }
 
 // ------------------------------------------------------------ start
+
+export const hasBranchCheckout = (t) => t.kind === "worktree" || t.kind === "ovnfs";
+
+function requireLocalPaseo() {
+  const { hostname } = new URL(process.env.PASEO_URL || "ws://127.0.0.1:6767/ws");
+  if (!["127.0.0.1", "localhost", "[::1]"].includes(hostname)) throw new Error("an OVNFS thread needs a local Paseo daemon");
+}
+
+function ovnfsCwd(project, t) {
+  if (!t.cwd) {
+    const placement = ovnfs.prepare(t);
+    t = update(project, t.id, (r) => Object.assign(r, placement));
+  } else if (!ovnfs.mounted(t)) {
+    throw new Error(`${t.id}'s OVNFS checkout is gone; start a new thread`);
+  }
+  if (!t.ovnfs_ready) {
+    const oid = ovnfs.createBranch(t.cwd, t.branch);
+    update(project, t.id, (r) => {
+      r.ovnfs_ready = true;
+      r.branch_start = { name: t.branch, oid };
+    });
+  }
+  return t.cwd;
+}
 
 /**
  * A tab thread with a repo runs in a workspace of that repo's Paseo project, so the sidebar shows it
@@ -352,9 +379,10 @@ export async function start(project, a) {
   const machine = a.machine ?? "";
   if (machine && !a.repo) throw new Error("a remote thread needs --repo: a task with no repository runs as a folder thread in the project, which is local");
   const kind = a.kind ?? (a.repo ? "worktree" : "tab");
-  if (!["worktree", "tab", "checkout"].includes(kind)) throw new Error(`\`${kind}\` is not a thread kind (worktree, tab or checkout)`);
-  if ((kind === "worktree" || kind === "checkout") && !a.repo) throw new Error("a worktree or checkout thread needs --repo");
-  if (kind !== "worktree" && machine) throw new Error("a tab or checkout thread runs locally; a remote repo needs a worktree thread");
+  if (!["worktree", "ovnfs", "tab", "checkout"].includes(kind)) throw new Error(`\`${kind}\` is not a thread kind (worktree, ovnfs, tab or checkout)`);
+  if (kind !== "tab" && !a.repo) throw new Error(`a ${kind} thread needs --repo`);
+  if (kind !== "worktree" && machine) throw new Error(`a ${kind} thread runs locally; a remote repo needs a worktree thread`);
+  if (kind === "ovnfs") requireLocalPaseo();
   const profile = resolveProfile(config, safety, settings, "thread", a.profile, project.slug);
   const h = host(machine, config);
   const warnings = [];
@@ -371,15 +399,18 @@ export async function start(project, a) {
     origin = h.shell("git remote get-url origin", repo).stdout.trim();
   }
 
-  const t = allocate(project, (t) => Object.assign(t, { title: a.title.trim(), kind, repo, origin, machine, base: a.base ?? "", profile: profile.name, provider: profile.provider, ...(a.reviews ? { reviews: a.reviews } : {}) }));
+  const t = allocate(project, (t) => {
+    Object.assign(t, { title: a.title.trim(), kind, repo, origin, machine, base: a.base ?? "", profile: profile.name, provider: profile.provider, ...(a.reviews ? { reviews: a.reviews } : {}) });
+    if (hasBranchCheckout(t)) t.branch = branchName(project.slug, t.id, t.title);
+    if (kind === "ovnfs") t.ovnfs_name = ovnfs.checkoutName();
+  });
   writeAtomic(taskPath(project, t.id), a.task.trimEnd() + "\n");
-  if (kind === "worktree") t.branch = branchName(project.slug, t.id, t.title);
 
   try {
     const c = await client(h.url);
-    const cwd = kind === "tab" ? project.path("threads", t.id) : repo;
+    const cwd = kind === "tab" ? project.path("threads", t.id) : kind === "ovnfs" ? ovnfsCwd(project, t) : repo;
     if (kind === "tab") mkdirSync(cwd, { recursive: true });
-    const ws = kind === "tab" ? await tabWorkspace(c, cwd, repo, t.title) : null;
+    const ws = kind === "tab" || kind === "ovnfs" ? await tabWorkspace(c, cwd, repo, t.title) : null;
     const handle = await (ws ? ws.agents : c.agents).create({
       config: agentConfig(profile, safety),
       cwd,
@@ -392,7 +423,7 @@ export async function start(project, a) {
     const snap = handle.current();
     const branchStart = kind === "worktree" ? h.shell(`git rev-parse --verify -q ${q(`refs/heads/${t.branch}`)}`, repo, undefined, 5000) : null;
     const placed = update(project, t.id, (r) => Object.assign(r, {
-      agent_id: handle.id, workspace_id: snap?.workspaceId ?? "", cwd: snap?.cwd ?? cwd, branch: t.branch,
+      agent_id: handle.id, workspace_id: snap?.workspaceId ?? ws?.id ?? "", cwd: kind === "ovnfs" ? cwd : snap?.cwd ?? cwd, branch: t.branch,
       ...(branchStart?.ok ? { branch_start: { name: t.branch, oid: branchStart.stdout.trim() } } : {}),
     }));
     placed.thread_dir = threadDir(placed.cwd, project.slug, t.id);
@@ -462,9 +493,13 @@ export async function restart(project, id, requested, opts = {}) {
   const profile = resolveProfile(config, safety, settings, "thread", requested || t.profile, project.slug);
   const h = host(t.machine, config);
   const c = await client(h.url);
+  let cwd = t.cwd, worktree;
+  if (t.kind === "ovnfs") {
+    requireLocalPaseo();
+    cwd = ovnfsCwd(project, t);
+  }
   if (t.agent_id && agents.has(t.agent_id)) await c.agents.ref(t.agent_id).archive().catch(() => {});
 
-  let cwd = t.cwd, worktree;
   if (t.kind === "tab") { cwd = project.path("threads", id); mkdirSync(cwd, { recursive: true }); }
   else if (!cwd || !h.isDir(cwd)) {
     if (t.kind !== "worktree") throw new Error(`${t.repo} is gone`);
@@ -478,7 +513,7 @@ export async function restart(project, id, requested, opts = {}) {
   const cfg = agentConfig(profile, safety);
   const title = `${project.displayName(settings)} · ${id} ${t.title}`.slice(0, 120);
   const labels = { project: project.slug, role: "thread", thread: id };
-  const ws = t.kind === "tab" ? await tabWorkspace(c, cwd, t.repo, t.title) : null;
+  const ws = t.kind === "tab" || t.kind === "ovnfs" ? await tabWorkspace(c, cwd, t.repo, t.title) : null;
   let handle;
   if (session) {
     // shortcut: an imported agent has no PP_THREAD; the brief's `report` command names the thread anyway.
@@ -496,7 +531,7 @@ export async function restart(project, id, requested, opts = {}) {
   await handle.refresh();
   const snap = handle.current();
   const placed = update(project, id, (r) => Object.assign(r, {
-    agent_id: handle.id, workspace_id: snap?.workspaceId ?? r.workspace_id, cwd: snap?.cwd ?? cwd,
+    agent_id: handle.id, workspace_id: snap?.workspaceId ?? ws?.id ?? r.workspace_id, cwd: t.kind === "ovnfs" ? cwd : snap?.cwd ?? cwd,
     profile: profile.name, provider: profile.provider, status: "open", error: "", session,
   }));
   placed.thread_dir = threadDir(placed.cwd, project.slug, id);
@@ -601,7 +636,7 @@ export function reportProgress(project, id, percent, activity) {
 
 /** The worktree's current branch, read again: Paseo or the agent may rename it. */
 export function refreshBranch(project, t) {
-  if (t.kind !== "worktree" || !t.cwd) return t;
+  if (!hasBranchCheckout(t) || !t.cwd) return t;
   try {
     const r = host(t.machine).shell("git branch --show-current", t.cwd, undefined, 5000);
     const b = r.ok ? r.stdout.trim() : "";
@@ -629,21 +664,26 @@ export async function clean(project, t, { keepWorktree = false, copyComplete = t
   const notes = [];
   let h;
   try { h = host(t.machine); } catch (e) { return [e.message]; }
+  let agentArchived = !t.agent_id || dryRun;
   if (t.agent_id && !dryRun) {
     try {
+      if (t.kind === "ovnfs") requireLocalPaseo();
       const c = await client(h.url);
-      await c.agents.ref(t.agent_id).archive();
+      const { archivedAt } = await c.agents.ref(t.agent_id).archive();
+      if (!archivedAt) throw new Error("Paseo did not confirm the archive");
+      agentArchived = true;
       notes.push("agent archived");
     } catch (e) {
       notes.push(`agent not archived: ${e.message}`);
     }
   }
   // A tab thread's workspace goes with it (its folder stays); a worktree's goes with the worktree below.
-  if (t.kind === "tab" && t.workspace_id && !dryRun) notes.push(await archiveWorkspace(h.url, t.workspace_id));
+  if ((t.kind === "tab" || (t.kind === "ovnfs" && agentArchived)) && t.workspace_id && !dryRun) notes.push(await archiveWorkspace(h.url, t.workspace_id));
   // Paseo's merge auto-archive removes a workspace's worktree whatever pp keeps, so a kept one says so (or that it is unknown).
   const paseoAutoArchive = t.kind === "worktree" && t.workspace_id ? await autoArchiveAfterMerge(h.url) : { on: false };
+  const refreshArchive = t.kind === "ovnfs" ? () => finalCopy(project, t) : undefined;
   let done;
-  try { done = await cleanup.run(project, t, h, { keepWorktree, copyComplete, archive, dryRun, paseoAutoArchive }); }
+  try { done = await cleanup.run(project, t, h, { keepWorktree, copyComplete, archive, refreshArchive, agentArchived, mergedHead, dryRun, paseoAutoArchive }); }
   catch (e) { return [...notes, `cleanup failed: ${e.message}; \`thread cleanup ${project.slug} ${t.id}\` retries`]; }
   notes.push(...done.notes);
   if (dryRun || t.kind !== "worktree") return notes;
@@ -706,6 +746,10 @@ export async function resolve(project, id, { keepWorktree = false, force = false
 
 /** Report and library home, less the library paths the thread declared disposable. */
 function finalCopy(project, t) {
+  if (t.kind === "ovnfs" && t.cwd) {
+    try { ovnfs.mounted(t); }
+    catch (e) { return { outcome: "failed", notes: [], error: e.message }; }
+  }
   let excludes = [];
   try { excludes = t.machine ? [] : cleanup.libraryExcludes(project, t, host(t.machine)); } catch {}
   return copyHome(project, t, true, excludes);
@@ -721,7 +765,8 @@ export async function cleanupAgain(project, id, { dryRun = false } = {}) {
     copied = finalCopy(project, t);
     notes.push(...copied.notes, ...(copied.error ? [`the copy home failed: ${copied.error}`] : []));
   } else notes.push("preview: assumes the final copy completes");
-  return [...notes, ...(await clean(project, t, { keepWorktree: t.status === "resolved" && t.kept_worktree, copyComplete: !copied || copied.outcome === "complete", archive: copied, dryRun }))];
+  const mergedHead = t.kind === "ovnfs" && t.resolved_reason === "merged" && t.pr_summary?.state === "MERGED" ? t.pr_summary.head_oid : "";
+  return [...notes, ...(await clean(project, t, { keepWorktree: t.status === "resolved" && t.kept_worktree, copyComplete: !copied || copied.outcome === "complete", archive: copied, mergedHead, dryRun }))];
 }
 
 export function reopen(project, id) {
