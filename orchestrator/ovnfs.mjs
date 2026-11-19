@@ -1,12 +1,20 @@
 // OVNFS owns the mount and checkout registry. PP only removes a checkout whose saved identity still matches.
 import { randomUUID } from "node:crypto";
 import { lstatSync, realpathSync } from "node:fs";
+import { constants } from "node:os";
 import { isAbsolute } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { sh } from "./lib.mjs";
 
-function pathGone(cwd) {
-  try { lstatSync(cwd); } catch (e) { if (e.code === "ENOENT") return true; throw e; }
+function pathGone(cwd, duringUnmount = false) {
+  try {
+    lstatSync(cwd);
+  } catch (e) {
+    if (e.code === "ENOENT") return true;
+    // Node may report Darwin's ESTALE only as a numeric errno.
+    if (duringUnmount && (e.code === "ESTALE" || e.errno === -constants.errno.ESTALE)) return false;
+    throw e;
+  }
   return false;
 }
 
@@ -117,7 +125,7 @@ export async function remove(t) {
   // macOS NFS can cache the mount path after OVNFS drops the registration.
   if (!lookup(t)) {
     const deadline = Date.now() + 10_000;
-    while (Date.now() < deadline && !pathGone(t.cwd)) await delay(250);
+    while (Date.now() < deadline && !pathGone(t.cwd, true)) await delay(250);
   }
   if (mounted(t)) throw new Error("checkout still registered after ovnfs rm");
 }
