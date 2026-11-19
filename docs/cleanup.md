@@ -95,6 +95,7 @@ worktree 删除前要满足这些条件，任何一条不满足就保留并写�
 - 字节数来自删除前的 `du -sk`。共享或克隆的块不算在内，所以它不保证真的释放了这么多空间。
 - 之前删掉的项，在之后的运行里显示为 gone 时，保留原来那次删除的记录。
 - 失败不会被吞掉，也不会被当成成功：thread 照样 resolve，记录标为 `partial`，inbox 里写明失败的项。`pp thread cleanup <slug> <id>` 重试，重试是幂等的。
+- `resolve` 会归档 Paseo agent。工作树已经移除时，也会归档侧边栏里的 workspace。工作树需要保留时，workspace 也保留，因为 Paseo 的 workspace 归档可能删除工作树。`resolve` 和 `thread cleanup` 的输出都会说明 Paseo 归档结果，失败后可以用 `thread cleanup` 重试。
 - 再次 `thread resolve` 会报错，并提示改用 `thread cleanup`。
 - `--dry-run` 走同样的检查，会列出 would-remove，不删东西，也不写记录。它不会重新拷贝，所以 library 里的成品可能还没归档。
 - `pp sweep` 会对 resolved 线程残留的 worktree 再跑一次 `thread cleanup`，跳过保留的。不属于任何线程的 `pp-<slug>-t-NNNN` worktree 也走同样的 worktree 检查。

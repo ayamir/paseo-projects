@@ -42,7 +42,7 @@ const FAKE_DAEMON = join(BASE, "fake-daemon.mjs");
 writeFileSync(FAKE_DAEMON, `import ws from ${JSON.stringify(pathToFileURL(WS).href)};
 import { execFileSync } from "node:child_process";
 import { dirname, join } from "node:path";
-const agents = new Map(), at = new Date().toISOString();
+const agents = new Map(), archiveAttempts = new Set(), at = new Date().toISOString();
 const mode = process.env.FAKE_DAEMON_MODE, wss = new ws.WebSocketServer({ port: 0, host: "127.0.0.1" });
 wss.on("listening", () => console.log(wss.address().port));
 wss.on("connection", (s) => s.on("message", (raw) => {
@@ -52,7 +52,11 @@ wss.on("connection", (s) => s.on("message", (raw) => {
   const r = m.message ?? {}, requestId = r.requestId;
   if (r.type === "get_daemon_config_request" && mode === "reject") return send({ type: "rpc_error", payload: { requestId, requestType: r.type, error: "permission denied" } });
   if (r.type === "get_daemon_config_request") return send({ type: "get_daemon_config_response", payload: { requestId, config: mode === "malformed" ? "nope" : { mcp: { injectIntoAgents: false }, autoArchiveAfterMerge: mode === "on" } } });
-  if (r.type === "archive_workspace_request") return send({ type: "archive_workspace_response", payload: { requestId, workspaceId: r.workspaceId, archivedAt: new Date().toISOString(), error: null } });
+  if (r.type === "archive_workspace_request") {
+    const first = mode === "archive-retry" && !archiveAttempts.has(r.workspaceId);
+    archiveAttempts.add(r.workspaceId);
+    return send({ type: "archive_workspace_response", payload: { requestId, workspaceId: r.workspaceId, archivedAt: first ? null : new Date().toISOString(), error: first ? "workspace archive refused" : null } });
+  }
   if (r.type === "fetch_agents_request") return send({ type: "fetch_agents_response", payload: { requestId, entries: [], pageInfo: { nextCursor: null, prevCursor: null, hasMore: false } } });
   if (r.type === "create_agent_request") {
     const cwd = join(dirname(r.config.cwd), "wt"), id = "agent-" + (agents.size + 1);
@@ -64,7 +68,12 @@ wss.on("connection", (s) => s.on("message", (raw) => {
     return send({ type: "status", payload: { status: "agent_created", requestId, agentId: id, agent } });
   }
   if (r.type === "fetch_agent_request") return send({ type: "fetch_agent_response", payload: { requestId, agent: agents.get(r.agentId) ?? null, error: null } });
-  if (r.type === "archive_agent_request" && agents.has(r.agentId)) return send({ type: "agent_archived", payload: { requestId, agentId: r.agentId, archivedAt: new Date().toISOString() } });
+  if (r.type === "archive_agent_request" && (agents.has(r.agentId) || r.agentId === "agent-for-resolve")) {
+    const first = mode === "archive-retry" && !archiveAttempts.has(r.agentId);
+    archiveAttempts.add(r.agentId);
+    if (first) return send({ type: "rpc_error", payload: { requestId, requestType: r.type, error: "agent archive refused" } });
+    return send({ type: "agent_archived", payload: { requestId, agentId: r.agentId, archivedAt: new Date().toISOString() } });
+  }
   if (r.type === "send_agent_message_request") return send({ type: "send_agent_message_response", payload: { requestId, agentId: r.agentId, accepted: true, error: null } });
   if (requestId) send({ type: "rpc_error", payload: { requestId, requestType: r.type, error: "not faked" } });
 }));
@@ -512,6 +521,43 @@ test("doctor says the daemon's merge auto-archive is on, or that it could not re
       else assert.doesNotMatch(out, /autoArchiveAfterMerge/, `${mode}: ${out}`);
     } finally { d.stop(); }
   }
+});
+
+test("resolve reports Paseo archive failures and cleanup retries both archives", async () => {
+  const d = await fakeDaemon("archive-retry");
+  try {
+    const f = fixture({ daemon: d.url });
+    const path = f.p.path("threads", `${f.id}.json`);
+    writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, "utf8")), agent_id: "agent-for-resolve" }));
+    assert.ok(f.pp("thread", "cleanup", "demo", f.id, "--dry-run").ok);
+
+    const first = f.pp("thread", "resolve", "demo", f.id);
+    assert.ok(first.ok, first.out);
+    assert.match(first.out, /agent not archived: .*agent archive refused/);
+    assert.match(first.out, /Paseo workspace not archived: workspace archive refused/);
+    assert.equal(existsSync(f.wt), false);
+
+    const second = f.pp("thread", "cleanup", "demo", f.id);
+    assert.ok(second.ok, second.out);
+    assert.match(second.out, /agent archived/);
+    assert.match(second.out, /Paseo workspace archived/);
+  } finally { d.stop(); }
+});
+
+test("resolve archives the agent and leaves a workspace backed by a kept worktree active", async () => {
+  const d = await fakeDaemon("off");
+  try {
+    const f = fixture({ daemon: d.url });
+    const path = f.p.path("threads", `${f.id}.json`);
+    writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, "utf8")), agent_id: "agent-for-resolve" }));
+    write(join(f.td, "cleanup.json"), JSON.stringify({ keep: [{ path: ".", why: "audit evidence" }] }));
+    const r = f.pp("thread", "resolve", "demo", f.id);
+    assert.ok(r.ok, r.out);
+    assert.match(r.out, /agent archived/);
+    assert.match(r.out, /Paseo workspace kept: archiving it could delete the worktree/);
+    assert.doesNotMatch(r.out, /Paseo workspace archived/);
+    assert.ok(existsSync(f.wt));
+  } finally { d.stop(); }
 });
 
 test("a retry after pp archived and removed the worktree does not call the archive missing", () => {

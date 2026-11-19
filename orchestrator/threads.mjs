@@ -606,29 +606,48 @@ export function refreshBranch(project, t) {
   return t;
 }
 
+async function archiveWorkspace(url, id) {
+  try {
+    const c = await client(url);
+    const { archivedAt, error } = await c.workspaces.archive(id);
+    if (error || !archivedAt) throw new Error(error ?? "Paseo did not confirm the archive");
+    return "Paseo workspace archived";
+  } catch (e) {
+    return `Paseo workspace not archived: ${e.message}`;
+  }
+}
+
 /**
- * Archives the agent, then cleanup.run: declared discards, the worktree (never forced, only once nothing
- * in it would be lost), the indexes rooted in what went; then deletes a merged branch. `retry`: the agent
- * is already archived. `dryRun`: a preview through the same checks.
+ * Archives the agent, then runs cleanup: declared discards, the worktree (never forced), and its indexes.
+ * A worktree workspace is archived only once the worktree is gone: Paseo's archive can delete it.
  */
-export async function clean(project, t, { keepWorktree = false, copyComplete = true, archive, mergedHead = "", retry = false, dryRun = false } = {}) {
+export async function clean(project, t, { keepWorktree = false, copyComplete = true, archive, mergedHead = "", dryRun = false } = {}) {
   const notes = [];
   let h;
   try { h = host(t.machine); } catch (e) { return [e.message]; }
-  if (t.agent_id && !retry && !dryRun) {
-    try { const c = await client(h.url); await c.agents.ref(t.agent_id).archive(); notes.push("agent archived"); }
-    catch (e) { notes.push(`agent not archived: ${e.message}`); }
+  if (t.agent_id && !dryRun) {
+    try {
+      const c = await client(h.url);
+      await c.agents.ref(t.agent_id).archive();
+      notes.push("agent archived");
+    } catch (e) {
+      notes.push(`agent not archived: ${e.message}`);
+    }
   }
   // A tab thread's workspace goes with it (its folder stays); a worktree's goes with the worktree below.
-  if (t.kind === "tab" && t.workspace_id && !dryRun) { try { const c = await client(h.url); await c.workspaces.archive(t.workspace_id); } catch {} }
+  if (t.kind === "tab" && t.workspace_id && !dryRun) notes.push(await archiveWorkspace(h.url, t.workspace_id));
   // Paseo's merge auto-archive removes a workspace's worktree whatever pp keeps, so a kept one says so (or that it is unknown).
   const paseoAutoArchive = t.kind === "worktree" && t.workspace_id ? await autoArchiveAfterMerge(h.url) : { on: false };
   let done;
   try { done = await cleanup.run(project, t, h, { keepWorktree, copyComplete, archive, dryRun, paseoAutoArchive }); }
   catch (e) { return [...notes, `cleanup failed: ${e.message}; \`thread cleanup ${project.slug} ${t.id}\` retries`]; }
   notes.push(...done.notes);
-  if (dryRun || t.kind !== "worktree" || !done.worktreeGone) return notes;
-  if (t.workspace_id) { try { const c = await client(h.url); await c.workspaces.archive(t.workspace_id); } catch {} }
+  if (dryRun || t.kind !== "worktree") return notes;
+  if (!done.worktreeGone) {
+    if (t.workspace_id) notes.push("Paseo workspace kept: archiving it could delete the worktree");
+    return notes;
+  }
+  if (t.workspace_id) notes.push(await archiveWorkspace(h.url, t.workspace_id));
   if (mergedHead && t.branch) {
     const tip = h.shell(`git rev-parse --verify -q ${q(`refs/heads/${t.branch}`)}`, t.repo);
     if (!tip.ok) notes.push("no local branch left");
@@ -673,7 +692,7 @@ export async function cleanupAgain(project, id, { dryRun = false } = {}) {
     copied = finalCopy(project, t);
     notes.push(...copied.notes, ...(copied.error ? [`the copy home failed: ${copied.error}`] : []));
   } else notes.push("preview: assumes the final copy completes");
-  return [...notes, ...(await clean(project, t, { keepWorktree: t.status === "resolved" && t.kept_worktree, copyComplete: !copied || copied.outcome === "complete", archive: copied, retry: true, dryRun }))];
+  return [...notes, ...(await clean(project, t, { keepWorktree: t.status === "resolved" && t.kept_worktree, copyComplete: !copied || copied.outcome === "complete", archive: copied, dryRun }))];
 }
 
 export function reopen(project, id) {
