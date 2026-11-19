@@ -105,7 +105,7 @@ worktree 删除前要满足这些条件，任何一条不满足就保留并写�
 
 `--kind ovnfs` 使用本机 OVNFS v0.8.0 管理 checkout。Paseo 将其作为普通目录 workspace 打开，`pp thread restart` 复用原挂载。OVNFS 进程和挂载需要在启动、重启与清理期间可用。PP 启动 OVNFS daemon 时设置 `OVNFS_GIT_REMOTES=0`，已有 daemon 使用自己的配置。
 
-`resolve` 或 `thread cleanup` 会确认 OVNFS registry 中的 checkout 身份、Paseo agent 归档结果、成品拷贝和 Git 状态。只有 checkout 未被占用，且 Git 提交可从源仓库的引用或已核实的合并 PR 找到时，才调用 `ovnfs rm --sticky-snapshots`。源仓库的克隆中尚未抓取的远端提交可能需要先 fetch，清理过程本身不会 fetch。`--keep-worktree` 也适用于 OVNFS，`--dry-run` 可预览保留原因。
+`resolve` 或 `thread cleanup` 会确认 OVNFS registry 中的 checkout 身份、Paseo agent 归档结果、成品拷贝和 Git 状态。checkout 空闲后会再次拷贝报告和 library。只有 checkout 仍未被占用，且 Git 提交（包括 reflog 中可恢复的提交）可从源仓库的引用或已核实的合并 PR 找到时，才调用 `ovnfs rm --sticky-snapshots`。源仓库的克隆中尚未抓取的远端提交可能需要先 fetch，清理过程本身不会 fetch。`--keep-worktree` 也适用于 OVNFS，`--dry-run` 可预览保留原因。
 
 OVNFS 线程支持 `--reviews` 和报告中的 `Reviewed-PR:`。因被审 PR 合并而 resolve 时，只有私有分支仍指向启动时记录的提交，且提交可从源仓库引用访问，才移除 checkout。线程有尚未合并的自有 PR 时，被审 PR 合并不会触发 resolve。
 

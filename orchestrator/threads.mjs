@@ -302,7 +302,9 @@ export function copyHome(project, t, withLibrary = false, exclude = []) {
   let hash = null;
   if (report !== null) {
     hash = sha256(report);
-    if (hash !== t.report_hash || !existsSync(homeReportPath(project, t.id))) project.lock(() => writeAtomic(homeReportPath(project, t.id), report));
+    if ((withLibrary && t.kind === "ovnfs") || hash !== t.report_hash || !existsSync(homeReportPath(project, t.id))) {
+      project.lock(() => writeAtomic(homeReportPath(project, t.id), report));
+    }
   }
   if (withLibrary && h.isDir(`${t.thread_dir}/library`)) {
     const lib = `${t.thread_dir}/library`;
@@ -317,7 +319,7 @@ export function copyHome(project, t, withLibrary = false, exclude = []) {
       mkdirSync(target, { recursive: true });
       // `-rt` without `-l`: symbolic links are skipped, never followed.
       const src = h.remote ? `${h.ssh}:${lib}/` : `${lib}/`;
-      const r = sh(["rsync", "-rt", ...exclude.map((x) => `--exclude=/${x.replace(/[*?[\\]/g, "\\$&")}`), ...(h.remote ? ["-e", "ssh -o BatchMode=yes"] : []), src, `${target}/`], undefined, undefined, { timeout: 120_000 });
+      const r = sh(["rsync", t.kind === "ovnfs" ? "-rtc" : "-rt", ...exclude.map((x) => `--exclude=/${x.replace(/[*?[\\]/g, "\\$&")}`), ...(h.remote ? ["-e", "ssh -o BatchMode=yes"] : []), src, `${target}/`], undefined, undefined, { timeout: 120_000 });
       if (!r.ok) return { outcome: "failed", error: `rsync failed: ${r.out}`, notes, hash };
       if (/skipping non-regular/.test(r.out)) notes.push("symbolic links in the library were not copied");
     }
@@ -679,13 +681,9 @@ export async function clean(project, t, { keepWorktree = false, copyComplete = t
   if ((t.kind === "tab" || (t.kind === "ovnfs" && agentArchived)) && t.workspace_id && !dryRun) notes.push(await archiveWorkspace(h.url, t.workspace_id));
   // Paseo's merge auto-archive removes a workspace's worktree whatever pp keeps, so a kept one says so (or that it is unknown).
   const paseoAutoArchive = t.kind === "worktree" && t.workspace_id ? await autoArchiveAfterMerge(h.url) : { on: false };
-  if (t.kind === "ovnfs" && agentArchived && !dryRun && archive?.outcome === "complete") {
-    archive = finalCopy(project, t);
-    copyComplete = archive.outcome === "complete";
-    if (!copyComplete) notes.push(...archive.notes, ...(archive.error ? [archive.error] : []));
-  }
+  const refreshArchive = t.kind === "ovnfs" ? () => finalCopy(project, t) : undefined;
   let done;
-  try { done = await cleanup.run(project, t, h, { keepWorktree, copyComplete, archive, agentArchived, mergedHead, dryRun, paseoAutoArchive }); }
+  try { done = await cleanup.run(project, t, h, { keepWorktree, copyComplete, archive, refreshArchive, agentArchived, mergedHead, dryRun, paseoAutoArchive }); }
   catch (e) { return [...notes, `cleanup failed: ${e.message}; \`thread cleanup ${project.slug} ${t.id}\` retries`]; }
   notes.push(...done.notes);
   if (dryRun || t.kind !== "worktree") return notes;

@@ -228,6 +228,32 @@ test("OVNFS starts and restarts in the source project's directory workspace, the
   });
 });
 
+test("OVNFS archives library changes made before the checkout becomes idle", async () => {
+  await ovnfsFixture("off", ({ env, p, pp, id, t, root }) => {
+    const bin = join(root, "bin");
+    const result = join(t.thread_dir, "library", "result.txt");
+    const checked = join(root, "checked-occupants");
+    write(result, "before\n");
+    mkdirSync(bin);
+    writeFileSync(join(bin, "lsof"), `#!/usr/bin/env node
+const fs = require('node:fs');
+if (!fs.existsSync(${JSON.stringify(checked)})) {
+  const times = fs.statSync(${JSON.stringify(result)});
+  fs.writeFileSync(${JSON.stringify(result)}, 'latest\\n');
+  fs.utimesSync(${JSON.stringify(result)}, times.atime, times.mtime);
+  fs.writeFileSync(${JSON.stringify(checked)}, '1');
+  console.log(${JSON.stringify(`p12345\nn${t.cwd}`)});
+}
+`, { mode: 0o755 });
+    env.PATH = `${bin}:${env.PATH}`;
+    const resolved = pp("thread", "resolve", "demo", id);
+    assert.ok(resolved.ok, resolved.out);
+    assert.match(resolved.out, /OVNFS checkout removed/);
+    assert.ok(!existsSync(t.cwd));
+    assert.equal(readFileSync(p.path("library", id, "result.txt"), "utf8"), "latest\n");
+  });
+});
+
 test("OVNFS cleanup keeps changed identities, dirty files and commits absent from the source repo", async () => {
   await ovnfsFixture("off", ({ pp, id, t, registry }) => {
     const record = readFileSync(registry, "utf8");
@@ -815,7 +841,7 @@ test("the ticker resolves no merged or idle thread while the daemon that says wh
 });
 
 const REVIEW_URL = "https://github.com/o/r/pull/10";
-for (const kind of ["clean", "dirty", "private commit", "published commit", "own PR"]) {
+for (const kind of ["clean", "dirty", "private commit", "published commit", "reflog commit", "own PR"]) {
   test(`OVNFS review: ${kind} after the reviewed PR merges`, async () => {
     const byFlag = kind === "clean";
     await ovnfsFixture("off", async ({ t, p, pp, id, thread, registry, ...f }) => {
@@ -826,6 +852,8 @@ for (const kind of ["clean", "dirty", "private commit", "published commit", "own
       if (byFlag) f.env.FAKE_OVNFS_DELAY_UNMOUNT = "1";
       if (kind === "dirty") write(join(t.cwd, "package.json"), '{"dirty":true}\n');
       if (kind.endsWith("commit")) git(t.cwd, "commit", "--allow-empty", "-qm", "reviewer change");
+      const privateTip = kind === "reflog commit" ? git(t.cwd, "rev-parse", "HEAD") : "";
+      if (privateTip) git(t.cwd, "reset", "--hard", "HEAD^");
       if (kind === "published commit") git(f.repo, "fetch", t.cwd, `${t.branch}:refs/heads/published-review`);
       const views = { [REVIEW_URL]: { state: "MERGED" } };
       if (kind === "own PR") {
@@ -841,7 +869,8 @@ for (const kind of ["clean", "dirty", "private commit", "published commit", "own
       assert.equal(existsSync(t.cwd), !byFlag, kind);
       assert.equal(existsSync(registry), !byFlag, kind);
       if (kind === "dirty") assert.equal(readFileSync(join(t.cwd, "package.json"), "utf8"), '{"dirty":true}\n');
-      if (kind.endsWith("commit")) assert.equal(git(t.cwd, "log", "-1", "--format=%s"), "reviewer change");
+      if (privateTip) assert.ok(git(t.cwd, "reflog", "--format=%H").includes(privateTip));
+      else if (kind.endsWith("commit")) assert.equal(git(t.cwd, "log", "-1", "--format=%s"), "reviewer change");
     }, byFlag ? ["--reviews", REVIEW_URL] : []);
   });
 }

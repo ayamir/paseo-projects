@@ -104,8 +104,10 @@ export function commitReason(t, mergedHead) {
   if (!head.ok || !refs.ok) return "could not check its Git commits";
   const lines = refs.stdout.trim().split("\n").filter(Boolean);
   if (lines.some((line) => line.endsWith(" refs/stash"))) return "it has Git stashes";
+  const reflog = git(t.cwd, ["rev-list", "--reflog", "--no-walk=unsorted"]);
+  if (!reflog.ok) return "could not check its Git reflogs";
   const oid = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
-  const tips = new Set([head.stdout.trim(), ...lines.map((line) => line.split(" ", 1)[0])]);
+  const tips = new Set([head.stdout.trim(), ...lines.map((line) => line.split(" ", 1)[0]), ...reflog.stdout.trim().split("\n").filter(Boolean)]);
   for (const tip of tips) {
     if (!oid.test(tip)) return "could not read its Git refs";
     if (oid.test(mergedHead ?? "") && git(t.cwd, ["merge-base", "--is-ancestor", tip, mergedHead]).ok) continue;
