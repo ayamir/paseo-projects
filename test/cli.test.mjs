@@ -3,7 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readdirSync, realpathSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -58,6 +58,20 @@ test("an unknown or incomplete command is refused with the usage lines of its na
 test("help is the table: each usage line is in it, and an option names one meaning", () => {
   for (const e of ENTRIES) assert.ok(HELP.includes(e.use), e.use);
   assert.ok(VALUE_FLAGS.has("root") && VALUE_FLAGS.has("text-file") && !VALUE_FLAGS.has("dry-run") && !VALUE_FLAGS.has("fresh"));
+});
+
+test("thread start rejects an invalid --reviews URL before allocating a thread", (t) => {
+  const dir = mkdtempSync(join(realpathSync(tmpdir()), "pp-cli-reviews-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const root = join(dir, "root");
+  const pp = (...args) => spawnSync(process.execPath, [PP, "--root", root, ...args], { encoding: "utf8", env: { ...process.env, PP_CONFIG: join(dir, "config.json"), PASEO_URL: "ws://127.0.0.1:1/ws" } });
+  assert.equal(pp("new", "demo").status, 0);
+  for (const url of ["not-a-pr", ""]) {
+    const r = pp("thread", "start", "demo", "--title", "Review", "--task", "Review it", `--reviews=${url}`);
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /--reviews must be a https:\/\/github\.com\//);
+  }
+  assert.deepEqual(readdirSync(join(root, "demo", "threads")), []);
 });
 
 test("through the CLI: a refused option exits non-zero and creates nothing", () => {

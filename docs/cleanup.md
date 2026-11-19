@@ -28,7 +28,7 @@ flowchart TD
   G --> I["Codebase Memory：删删除前已证明属于本线程的索引，再列一次核实"]
   K --> M["写 threads/<id>.cleanup.json 和 .cleanup.md"]
   I --> M
-  M --> B["worktree 没了：归档 workspace；PR 已合并且分支 tip 等于合并 head 时删本地分支"]
+  M --> B["worktree 没了：归档 workspace，按分支清理规则检查本地分支"]
   RT["pp thread cleanup <slug> <id> [--dry-run]<br/>pp sweep"] --> P
 ```
 
@@ -41,7 +41,8 @@ flowchart TD
 | `.paseo-project/<本线程>/` | 跟着 worktree 一起删 | 只有 brief、report、cleanup.json、library（已经拷回家），或者声明丢弃的路径 |
 | 声明丢弃的路径 | 检查通过就 `rm -rf` | 见下面的 `cleanup.json` |
 | Codebase Memory 索引 | 删除前解析的 `root_path` 在本次删掉的目录里，或者之前的记录登记过它 | 用官方 CLI `codebase-memory-mcp cli --json list_projects / delete_project`，删完再列一次核实。经过符号链接的根按链接实际指向判断；断掉的链接不算 |
-| 已合并的本地分支 | worktree 已经没了，分支 tip 等于合并的 head | 和原来一样 |
+| 作者线程的本地分支 | 自有 PR 已合并，worktree 已经没了，分支 tip 等于合并的 head | 和原来一样 |
+| 复审线程的本地分支 | 因被审 PR 合并而 resolve，worktree 已经没了，分支 tip 仍等于创建时记录的提交，且另一个本地或远程跟踪分支或标签包含该提交 | 分支名须与创建记录一致。分支有自己的提交、仍被检出、已变动或缺少创建记录时保留 |
 
 worktree 删除前要满足这些条件，任何一条不满足就保留并写原因：
 
@@ -97,7 +98,7 @@ worktree 删除前要满足这些条件，任何一条不满足就保留并写�
 - 失败不会被吞掉，也不会被当成成功：thread 照样 resolve，记录标为 `partial`，inbox 里写明失败的项。`pp thread cleanup <slug> <id>` 重试，重试是幂等的。
 - `resolve` 会归档 Paseo agent。工作树已经移除时，也会归档侧边栏里的 workspace。工作树需要保留时，workspace 也保留，因为 Paseo 的 workspace 归档可能删除工作树。`resolve` 和 `thread cleanup` 的输出都会说明 Paseo 归档结果，失败后可以用 `thread cleanup` 重试。
 - 再次 `thread resolve` 会报错，并提示改用 `thread cleanup`。
-- `--dry-run` 走同样的检查，会列出 would-remove，不删东西，也不写记录。它不会重新拷贝，所以 library 里的成品可能还没归档。
+- `--dry-run` 会预览 worktree、声明路径和索引，列出 would-remove，不删东西，也不写记录。它不会重新拷贝，所以 library 里的成品可能还没归档。只有 worktree 已经移除时才检查本地分支并归档 workspace。这两项的结果写在命令输出或 resolve 的 inbox 里。
 - `pp sweep` 会对 resolved 线程残留的 worktree 再跑一次 `thread cleanup`，跳过保留的。不属于任何线程的 `pp-<slug>-t-NNNN` worktree 也走同样的 worktree 检查。
 
 ## 和 Paseo 的合并自动归档冲突

@@ -38,6 +38,8 @@ node bin/pp.mjs open myproj       # 启动 coordinator 和常驻 ticker
 - 运行定时 routine。命令型 routine 需要用户在终端执行 `pp routine approve`；
 - coordinator 空闲 60 秒后，用 `[pp inbox] …` nudge 它。
 
+派复审线程时给 `pp thread start` 加 `--reviews <GitHub PR URL>`，也可以在报告首段写 `Reviewed-PR: <URL>`。两处都有时以启动参数为准。ticker 单独读取被审 PR 的状态。合并且复审线程完成后自动 resolve，关闭未合并时只写一次 inbox 提醒。worktree 安全移除后，只有分支仍在创建时的提交才会删除。分支有自己的提交、无法验证起点，或 worktree 声明保留时，清理会写明保留原因。
+
 ## 接续会话
 
 ticker 会把每个 agent 的 provider session id 记进线程记录（`session`）和 `.state/coordinator.json`。agent 被归档或关掉之后：
