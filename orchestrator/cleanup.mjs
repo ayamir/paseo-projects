@@ -221,8 +221,7 @@ async function removeOvnfs(h, t, { threadDir, discards, mergedHead, dryRun }) {
   }
   if (reasons.length) return { ...item, status: "kept", reason: listed(reasons) };
   if (dryRun) return { ...item, status: "would-remove", kib };
-  ovnfs.remove(t);
-  if (ovnfs.mounted(t)) return { ...item, status: "failed", reason: "checkout still registered after ovnfs rm" };
+  await ovnfs.remove(t);
   return { ...item, status: "removed", kib };
 }
 

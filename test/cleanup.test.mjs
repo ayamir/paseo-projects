@@ -1,6 +1,8 @@
 // Resolve-time cleanup, end to end through the CLI: an isolated pp root, a throwaway repo and worktree
 // per case, and a fake codebase-memory-mcp. No real Paseo daemon (a fake one for records with a workspace), no real index.
 import { test } from "node:test";
+import { once } from "node:events";
+import { setTimeout as delay } from "node:timers/promises";
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, readdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
@@ -35,7 +37,7 @@ chmodSync(FAKE_CBM, 0o755);
 // A real private Git checkout behind OVNFS's CLI contract, so guards run without a filesystem mount in CI.
 const FAKE_OVNFS = join(BASE, "ovnfs");
 writeFileSync(FAKE_OVNFS, `#!/usr/bin/env node
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { existsSync, realpathSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 const args = process.argv.slice(2);
@@ -54,7 +56,9 @@ if (args[0] === "--json" && args[1] === "ls") {
   writeFileSync(state, JSON.stringify(c));
   console.log(JSON.stringify({ checkout: c }));
 } else if (args.length === 3 && args[0] === "rm" && args[1] === saved?.name && args[2] === "--sticky-snapshots") {
-  rmSync(saved.path, { recursive: true });
+  if (process.env.FAKE_OVNFS_DELAY_UNMOUNT) {
+    spawn(process.execPath, ["--input-type=module", "-e", 'import { rmSync } from "node:fs"; setTimeout(() => rmSync(process.argv[1], { recursive: true }), 800)', saved.path], { stdio: "ignore" }).unref();
+  } else rmSync(saved.path, { recursive: true });
   rmSync(state);
 } else {
   console.error("unexpected ovnfs invocation", args);
@@ -103,8 +107,9 @@ wss.on("connection", (s) => s.on("message", (raw) => {
   }
   if (r.type === "fetch_agents_request") return send({ type: "fetch_agents_response", payload: { requestId, entries: [], pageInfo } });
   if (r.type === "create_agent_request") {
-    const cwd = r.worktree ? join(dirname(r.config.cwd), "wt") : r.config.cwd, id = "agent-" + (agents.size + 1);
-    if (r.worktree) execFileSync("git", ["-C", r.config.cwd, "worktree", "add", "-q", cwd, r.worktree.branch], { stdio: "ignore" });
+    const id = "agent-" + (agents.size + 1), { branch, newBranch, base } = r.worktree ?? {};
+    const cwd = r.worktree ? join(dirname(r.config.cwd), newBranch || "wt") : r.config.cwd;
+    if (r.worktree) execFileSync("git", ["-C", r.config.cwd, "worktree", "add", "-q", ...(newBranch ? ["-b", newBranch, cwd, base || "HEAD"] : [cwd, branch])], { stdio: "ignore" });
     else if (!workspaces.some((w) => w.id === r.workspaceId && w.workspaceDirectory === cwd)) throw new Error("agent placed outside the directory workspace");
     const agent = { id, provider: "claude", cwd, workspaceId: r.workspaceId ?? "wks_restarted", model: null, createdAt: at, updatedAt: at, lastUserMessageAt: null, status: "idle",
       capabilities: { supportsStreaming: false, supportsSessionPersistence: false, supportsDynamicModes: false, supportsMcpServers: false, supportsReasoningStream: false, supportsToolInvocations: false },
@@ -171,7 +176,7 @@ function fixture({ inRepo = false, daemon = "" } = {}) {
   return { id, root, p, repo, wt, td, branch, env, pp, cleanup, item, indexes };
 }
 
-async function ovnfsFixture(mode, fn) {
+async function ovnfsFixture(mode, fn, startFlags = []) {
   const projectFile = join(BASE, `ovnfs-project-${n}`);
   const d = await fakeDaemon(mode, projectFile);
   try {
@@ -183,7 +188,8 @@ async function ovnfsFixture(mode, fn) {
     Object.assign(f.env, { PP_CONFIG: config, FAKE_OVNFS_STATE: registry, PATH: `${BASE}:${f.env.PATH}` });
     const base = git(f.repo, "rev-parse", "HEAD");
     git(f.repo, "commit", "--allow-empty", "-qm", "next");
-    const r = f.pp("thread", "start", "demo", "--title", "OVNFS test", "--task", "test", "--kind", "ovnfs", "--repo", f.repo, "--base", base, "--profile", "fake");
+    git(f.repo, "remote", "add", "origin", "https://github.com/o/r");
+    const r = f.pp("thread", "start", "demo", "--title", "OVNFS test", "--task", "test", "--kind", "ovnfs", "--repo", f.repo, "--base", base, "--profile", "fake", ...startFlags);
     assert.ok(r.ok, r.out);
     const id = `t-${Number(f.id.slice(2)) + 1}`;
     const thread = () => JSON.parse(readFileSync(f.p.path("threads", `${id}.json`), "utf8"));
@@ -765,7 +771,12 @@ test("pp archive leaves the project active when the daemon does not answer, not 
 const FAKE_GH_DIR = join(BASE, "fake-gh");
 write(join(FAKE_GH_DIR, "gh"), `#!/usr/bin/env node
 const a = process.argv.slice(2);
-console.log(a[0] === "pr" && a[1] === "view" ? process.env.FAKE_GH_VIEW : a[0] === "api" ? "me" : "[]");
+const view = process.env.FAKE_GH_VIEW;
+const matched = JSON.parse(view || "{}")[a.at(-1).toLowerCase()];
+if (process.env.FAKE_GH_FAIL_HEAD && a.includes("--head=" + process.env.FAKE_GH_FAIL_HEAD)) process.exit(1);
+console.log(a[0] === "pr" && a[1] === "view" ? (matched ? JSON.stringify(matched) : view)
+  : a[0] === "api" ? "me" : a.includes("--author") ? process.env.FAKE_GH_OPEN_OWN || "[]"
+  : a.includes("--head=" + process.env.FAKE_GH_HEAD) ? process.env.FAKE_GH_HEAD_PRS : "[]");
 `);
 chmodSync(join(FAKE_GH_DIR, "gh"), 0o755);
 const ORCH = join(dirname(fileURLToPath(import.meta.url)), "..", "orchestrator");
@@ -776,7 +787,7 @@ await tick(new Project(process.argv[2], "demo"), process.argv[3]);
 process.exit(0);
 `);
 const tickOnce = (f, started, view) => new Promise((ok) => {
-  const env = { ...process.env, PATH: `${FAKE_GH_DIR}:${process.env.PATH}`, PASEO_URL: NO_DAEMON, PP_CODEBASE_MEMORY_BIN: FAKE_CBM, FAKE_GH_VIEW: JSON.stringify(view) };
+  const env = { ...f.env, PATH: `${FAKE_GH_DIR}:${f.env.PATH}`, FAKE_GH_VIEW: JSON.stringify(view) };
   const c = spawn(process.execPath, [TICK, f.root, started], { env, stdio: ["ignore", "pipe", "pipe"] });
   let out = "";
   c.stdout.on("data", (d) => (out += d)); c.stderr.on("data", (d) => (out += d));
@@ -801,6 +812,150 @@ test("the ticker resolves no merged or idle thread while the daemon that says wh
   const now = (f) => ({ status: JSON.parse(readFileSync(f.p.path("threads", `${f.id}.json`), "utf8")).status, worktree: existsSync(f.wt) });
   assert.deepEqual({ merged: now(merged), idle: now(idle) }, { merged: { status: "open", worktree: true }, idle: { status: "open", worktree: true } }, runs.map((r) => r.out).join("\n"));
   assert.equal(JSON.parse(readFileSync(merged.p.path("threads", `${merged.id}.json`), "utf8")).pr_state, "MERGED");
+});
+
+const REVIEW_URL = "https://github.com/o/r/pull/10";
+for (const kind of ["clean", "dirty", "private commit", "published commit", "own PR"]) {
+  test(`OVNFS review: ${kind} after the reviewed PR merges`, async () => {
+    const byFlag = kind === "clean";
+    await ovnfsFixture("off", async ({ t, p, pp, id, thread, registry, ...f }) => {
+      writeSettings(p, { ...p.settings(), mute: true, nudge: false });
+      write(join(t.thread_dir, "report.md"), `${byFlag ? "" : `Reviewed-PR: ${REVIEW_URL}\n\n`}## Report\nDone\n`);
+      const progress = pp("report", "--thread", `demo/${id}`, "--percent", "100");
+      assert.ok(progress.ok, progress.out);
+      if (byFlag) f.env.FAKE_OVNFS_DELAY_UNMOUNT = "1";
+      if (kind === "dirty") write(join(t.cwd, "package.json"), '{"dirty":true}\n');
+      if (kind.endsWith("commit")) git(t.cwd, "commit", "--allow-empty", "-qm", "reviewer change");
+      if (kind === "published commit") git(f.repo, "fetch", t.cwd, `${t.branch}:refs/heads/published-review`);
+      const views = { [REVIEW_URL]: { state: "MERGED" } };
+      if (kind === "own PR") {
+        const url = "https://github.com/o/r/pull/20";
+        Object.assign(f.env, { FAKE_GH_HEAD: t.branch, FAKE_GH_HEAD_PRS: JSON.stringify([{ url, state: "OPEN" }]) });
+        views[url] = { state: "OPEN", headRefName: t.branch, headRepository: { name: "r" }, headRepositoryOwner: { login: "o" } };
+      }
+      const r = await tickOnce(f, new Date().toISOString(), views);
+      assert.equal(r.code, 0, r.out);
+      assert.equal(thread().reviewed_pr?.state, "MERGED", r.out);
+      assert.equal(thread().status, kind === "own PR" ? "open" : "resolved", r.out);
+      assert.equal(thread().resolved_reason, kind === "own PR" ? "" : "reviewed PR merged");
+      assert.equal(existsSync(t.cwd), !byFlag, kind);
+      assert.equal(existsSync(registry), !byFlag, kind);
+      if (kind === "dirty") assert.equal(readFileSync(join(t.cwd, "package.json"), "utf8"), '{"dirty":true}\n');
+      if (kind.endsWith("commit")) assert.equal(git(t.cwd, "log", "-1", "--format=%s"), "reviewer change");
+    }, byFlag ? ["--reviews", REVIEW_URL] : []);
+  });
+}
+
+test("CLI and ticker: follow reviewed PRs and resolve only the merged, finished reviews", { timeout: 45_000 }, async (t) => {
+  const root = mkdtempSync(join(BASE, "reviews-"));
+  const daemon = await fakeDaemon("off");
+  t.after(() => { daemon.stop(); rmSync(root, { recursive: true, force: true }); });
+  const repo = join(root, "repo");
+  mkdirSync(repo);
+  git(repo, "init", "-q", "-b", "main");
+  git(repo, "commit", "--allow-empty", "-qm", "base");
+  git(repo, "remote", "add", "origin", "https://github.com/o/r");
+  const config = join(root, "config.json"), cbm = join(root, "cbm.json");
+  write(config, JSON.stringify({ profiles: { fake: { provider: "claude/fake-model" } } }));
+  write(cbm, JSON.stringify({ projects: [] }));
+  const env = { ...process.env, PP_CONFIG: config, PASEO_URL: daemon.url, PP_CODEBASE_MEMORY_BIN: FAKE_CBM, FAKE_CBM_STATE: cbm, PATH: `${FAKE_GH_DIR}:${process.env.PATH}` };
+  const args = [PP, "--root", root];
+  const pp = (...argv) => execFileSync(process.execPath, [...args, ...argv], { env, encoding: "utf8", timeout: 10_000 });
+  pp("new", "demo", "--repo", repo);
+  pp("set", "demo", "mute", "true");
+  pp("set", "demo", "nudge", "false");
+  const statePath = join(root, "demo", ".state", "ticker.json");
+  const context = () => pp("context", "demo", "--peek");
+  const show = (id) => JSON.parse(pp("thread", "show", "demo", id, "--json"));
+  const ownUrl = "https://github.com/o/r/pull/20";
+  const cases = ["report", "flag", "closed", "keep", "commits", "invalid", "both"].map((kind, i) => {
+    const url = `https://github.com/o/r/pull/${10 + i}`;
+    const useFlag = kind === "flag";
+    const started = pp("thread", "start", "demo", "--repo", repo, "--profile", "fake", "--title", kind, "--task", "Review it", ...(useFlag ? ["--reviews", url] : []));
+    const row = show(started.match(/started (t-\d+)/)[1]);
+    if (useFlag) assert.equal(row.reviews, url);
+    const ownLine = kind === "both" ? `PR: ${ownUrl}\n` : "";
+    write(join(row.thread_dir, "report.md"), `${ownLine}${useFlag ? "" : `Reviewed-PR: ${kind === "invalid" ? "bad" : url}\n\n`}## Report\nDone\n\n## Next\n`);
+    if (kind === "keep") write(join(row.thread_dir, "cleanup.json"), JSON.stringify({ keep: [{ path: ".", why: "inspect later" }] }));
+    if (kind === "commits") git(row.cwd, "commit", "--allow-empty", "-qm", "reviewer change");
+    pp("report", "--thread", `demo/${row.id}`, "--percent", kind === "flag" ? "50" : "100", "--activity", kind === "flag" ? "Waiting for you" : "Done");
+    return { kind, url, row };
+  });
+  const both = cases.find(({ kind }) => kind === "both");
+  async function poll(final = false, ownState = "OPEN") {
+    write(statePath, JSON.stringify({ ...JSON.parse(existsSync(statePath) ? readFileSync(statePath, "utf8") : "{}"), last_pr_poll: null }));
+    const views = Object.fromEntries(cases.map(({ kind, url }) => [url, { state: final ? (kind === "closed" ? "CLOSED" : "MERGED") : "OPEN", headRefName: "author-branch", headRepository: { name: "fork" }, headRepositoryOwner: { login: "other" } }]));
+    // At the last poll the reviewer points to a different, open PR filed by the same gh login.
+    if (ownState === "MERGED") views["https://github.com/o/r/pull/21"] = { state: "OPEN" };
+    views[ownUrl] = { state: ownState, headRefName: both.row.branch, headRefOid: git(both.row.cwd, "rev-parse", "HEAD"), headRepository: { name: "r" }, headRepositoryOwner: { login: "o" } };
+    const gitHub = { FAKE_GH_VIEW: JSON.stringify(views), FAKE_GH_FAIL_HEAD: final ? cases[0].row.branch : "", FAKE_GH_OPEN_OWN: ownState === "MERGED" ? '[{"number":21}]' : "[]" };
+    const child = spawn(process.execPath, [...args, "ticker", "run"], { env: { ...env, ...gitHub }, stdio: ["ignore", "ignore", "pipe"] });
+    let stderr = "";
+    child.stderr.on("data", (data) => { stderr += data; });
+    const exited = once(child, "exit");
+    try {
+      for (let i = 0; i < 100 && child.exitCode === null; i++) {
+        if (JSON.parse(readFileSync(statePath, "utf8")).last_pr_poll) return;
+        await delay(50);
+      }
+      assert.fail(`ticker failed to finish a poll: ${stderr}`);
+    } finally { child.kill(); await exited; }
+  }
+  await poll();
+  for (const { kind, row } of cases) {
+    const current = show(row.id);
+    assert.equal(current.status, "open", kind);
+    if (kind !== "invalid") assert.equal(current.reviewed_pr?.state, "OPEN", kind);
+  }
+  await poll(true);
+  assert.equal(show(cases[1].row.id).status, "open", "a waiting reviewer stays open even with a merged PR");
+  assert.equal(show(cases[1].row.id).reviewed_pr?.state, "MERGED");
+  pp("report", "--thread", `demo/${cases[1].row.id}`, "--percent", "100");
+  const closed = cases.find(({ kind }) => kind === "closed");
+  write(join(closed.row.thread_dir, "report.md"), `Reviewed-PR: ${closed.url.replace("/o/r/", "/O/R/")}\n\n## Report\nDone\n`);
+  await poll(true);
+  const stillOpen = show(both.row.id);
+  assert.equal(stillOpen.status, "open");
+  assert.equal(stillOpen.pr, ownUrl);
+  assert.equal(stillOpen.pr_state, "OPEN");
+  assert.equal(stillOpen.reviewed_pr?.state, "MERGED");
+  assert.ok(existsSync(both.row.cwd));
+  await poll(true, "CLOSED");
+  const ownClosed = show(both.row.id);
+  assert.equal(ownClosed.pr, ownUrl);
+  assert.equal(ownClosed.pr_state, "CLOSED");
+  assert.equal(ownClosed.reviewed_pr?.state, "MERGED");
+  assert.equal(ownClosed.status, "open", "a closed, unmerged own PR blocks reviewed PR auto-resolve");
+  assert.ok(existsSync(both.row.cwd));
+  assert.notEqual(git(repo, "branch", "--list", both.row.branch), "");
+  write(join(both.row.thread_dir, "report.md"), `PR: ${ownUrl}\nReviewed-PR: https://github.com/o/r/pull/21\n\n## Report\nDone\n`);
+  await poll(true, "MERGED");
+  const ownResolved = show(both.row.id);
+  assert.equal(ownResolved.status, "resolved");
+  assert.equal(ownResolved.pr, ownUrl);
+  assert.equal(ownResolved.pr_state, "MERGED");
+  assert.equal(ownResolved.resolved_reason, "merged");
+  assert.equal(existsSync(both.row.cwd), false);
+  assert.equal(git(repo, "branch", "--list", both.row.branch), "");
+  const digest = context();
+  assert.ok(digest.includes(`${ownUrl} merged`));
+  for (const { kind, url, row } of cases.filter(({ kind }) => kind !== "both")) {
+    const current = show(row.id);
+    const staysOpen = ["closed", "invalid"].includes(kind), keepsWorktree = staysOpen || kind === "keep";
+    assert.equal(current.status, staysOpen ? "open" : "resolved", kind);
+    assert.equal(current.pr, "", kind);
+    assert.equal(current.pr_state, "", kind);
+    assert.equal(existsSync(row.cwd), keepsWorktree, kind);
+    assert.equal(git(repo, "branch", "--list", row.branch) !== "", keepsWorktree || kind === "commits", kind);
+    if (staysOpen) continue;
+    assert.equal(current.resolved_reason, "reviewed PR merged", kind);
+    assert.ok(digest.includes(`${url} merged`), kind);
+  }
+  assert.equal((digest.match(/closed without merging/g) ?? []).length, 1, digest);
+  assert.equal((digest.match(/`Reviewed-PR:` line is not/g) ?? []).length, 1, digest);
+  assert.match(digest, /branch .* kept: it has its own commits/);
+  assert.doesNotMatch(digest, /PR ignored|routine .* prompted/);
+  t.diagnostic(digest.split("\n").filter((line) => /closed without merging|was resolved|`Reviewed-PR:` line is not/.test(line)).join("\n"));
 });
 
 test("--dry-run previews with the same checks and deletes nothing", () => {

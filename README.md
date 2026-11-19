@@ -39,6 +39,8 @@ Say what you want once. The coordinator proposes threads and waits for your go-a
 
 Agents report their own progress, so a thread that asked you something shows `needs you` even when it looks idle. A background ticker copies reports home, writes inbox items when a thread changes state, follows pull requests (failing checks and review comments go back to the thread; `pr_checks = false` ignores CI results), resolves a thread when its pull request is merged, runs routines, and nudges the coordinator when its inbox has something new.
 
+For a review thread, pass `--reviews <GitHub PR URL>` to `pp thread start` or add `Reviewed-PR: <URL>` in the first paragraph of its report. The flag takes precedence. The ticker reads the reviewed PR's state independently of the thread's own PR. It resolves a finished review after merge and writes one inbox reminder if the PR closes without merging. Cleanup removes an empty review branch once its worktree is safely gone and the branch still points to the commit recorded at creation. Branches with their own commits or an unknown starting point are kept, as are worktrees explicitly marked for retention.
+
 ### 🔁 Pick up where an agent left off
 
 Every agent's provider session is recorded. `pp open` brings back a coordinator on its last session, and `pp thread restart` brings back a thread on its own, so closing the app or the daemon doesn't lose a conversation.
@@ -123,7 +125,7 @@ No. A project is a folder on your machine, `pp` talks to your own Paseo daemons,
 
 ### Will it touch my branches or worktrees on its own?
 
-Only to clean up after a thread is resolved: by you, when its pull request is merged, or after `auto_resolve_days` idle. The report and the thread's files are copied home first. Then it removes the worktree with a plain `git worktree remove`, only when nothing in it would be lost (no uncommitted, untracked or unknown ignored files, no checked-out submodule, nothing using it), the paths the thread declared disposable, the Codebase Memory indexes rooted in what went, and, only if the pull request is merged, the local branch. What it keeps it says why; see [docs/cleanup.md](docs/cleanup.md).
+Cleanup runs after a manual resolve, a resolve triggered by a PR merge, or a resolve after `auto_resolve_days` idle. It copies the report and the thread's files home first. It then removes the worktree with a plain `git worktree remove` once the safety checks pass, along with declared disposable paths and Codebase Memory indexes rooted in removed paths. A merge-triggered resolve can also remove the local branch when its commits are accounted for. Cleanup explains what it keeps. See [docs/cleanup.md](docs/cleanup.md).
 
 ### What is known not to work yet?
 

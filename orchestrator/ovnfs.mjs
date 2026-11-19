@@ -2,7 +2,13 @@
 import { randomUUID } from "node:crypto";
 import { lstatSync, realpathSync } from "node:fs";
 import { isAbsolute } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { sh } from "./lib.mjs";
+
+function pathGone(cwd) {
+  try { lstatSync(cwd); } catch (e) { if (e.code === "ENOENT") return true; throw e; }
+  return false;
+}
 
 export const checkoutName = () => `pp-${randomUUID()}`;
 const git = (cwd, args) => sh(["git", "-C", cwd, ...args], undefined, undefined, {
@@ -62,7 +68,7 @@ function verifyMount(t, path) {
 export function mounted(t) {
   const c = lookup(t);
   if (!c) {
-    try { lstatSync(t.cwd); } catch (e) { if (e.code === "ENOENT") return null; throw e; }
+    if (pathGone(t.cwd)) return null;
     throw new Error("OVNFS checkout is unregistered but its path still exists");
   }
   const { cwd, gitDir } = verifyMount(t, c.path);
@@ -74,9 +80,13 @@ export function mounted(t) {
 
 export function createBranch(cwd, branch) {
   const current = git(cwd, ["branch", "--show-current"]);
-  if (current.ok && current.stdout.trim() === branch) return;
-  const r = git(cwd, ["switch", "-c", branch]);
-  if (!r.ok) throw new Error(`could not create branch ${branch}: ${r.out}`);
+  if (!current.ok || current.stdout.trim() !== branch) {
+    const r = git(cwd, ["switch", "-c", branch]);
+    if (!r.ok) throw new Error(`could not create branch ${branch}: ${r.out}`);
+  }
+  const tip = git(cwd, ["rev-parse", "--verify", `refs/heads/${branch}`]);
+  if (!tip.ok) throw new Error(`could not read branch ${branch}: ${tip.out}`);
+  return tip.stdout.trim();
 }
 
 /** Checkout refs are private. Prove their commits exist on source refs or in the verified merged PR. */
@@ -94,9 +104,20 @@ export function commitReason(t, mergedHead) {
     const found = git(t.repo, ["for-each-ref", "--count=1", `--contains=${tip}`, "--format=%(refname)", "refs/heads", "refs/remotes", "refs/tags"]);
     if (!found.ok || !found.stdout.trim()) return `Git ref ${tip.slice(0, 12)} is not confirmed outside the OVNFS checkout`;
   }
+  if (t.resolved_reason === "reviewed PR merged") {
+    const start = t.branch_start;
+    if (start?.name !== t.branch || !oid.test(start?.oid ?? "")) return "its original branch and starting commit could not be verified";
+    if (!lines.includes(`${start.oid} refs/heads/${start.name}`)) return `branch ${start.name} has its own commits or moved since creation`;
+  }
   return "";
 }
 
-export function remove(t) {
+export async function remove(t) {
   command(["rm", t.ovnfs_name, "--sticky-snapshots"]);
+  // macOS NFS can cache the mount path after OVNFS drops the registration.
+  if (!lookup(t)) {
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline && !pathGone(t.cwd)) await delay(250);
+  }
+  if (mounted(t)) throw new Error("checkout still registered after ovnfs rm");
 }
