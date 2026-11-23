@@ -31,7 +31,7 @@ const SECTIONS = [
     ["board edit <json>", "a settings edit from the board, as the command it maps to"],
   ]],
   ["Threads", [
-    ["thread start <slug> --title T (--task T | --task-file F|- | --from-task TITLE) [--repo PATH] [--kind worktree|ovnfs|tab|checkout] [--machine M] [--profile P] [--base REF | --from-snapshot THREAD/RESOURCE] [--reviews PR_URL]"],
+    ["thread start <slug> --title T (--task T | --task-file F|- | --from-task TITLE) [--repo PATH] [--kind worktree|ovnfs|tab|checkout] [--machine M] [--profile P] [--base REF | --inherit-dirty | --from-snapshot THREAD/RESOURCE] [--reviews PR_URL]", "--inherit-dirty: local tracked files at HEAD (effective edits/deletions, not the index or untracked files), saved as a private seed commit. Optional cache: project working-copy-cache.json, keyed by canonical repo, with baseline OID, ignored root, inputs (tracked paths to SHA-256), and files (paths below root to SHA-256)."],
     ["thread experiment <slug> <id> --name NAME [--base REF]", "create an owned OVNFS experiment distinct from the main checkout"],
     ["thread snapshot <slug> <id> --name NAME [--resource NAME]", "freeze an owned OVNFS checkout (main by default) for derivation, not archival"],
     ["thread list <slug> [--all] [--json]"],

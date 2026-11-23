@@ -27,6 +27,10 @@ const workingCopy = z.object({
   owner: z.string(), backend: z.string(), phase: z.string(), baseline: z.string(), source: z.string(),
   path: z.string(), machine: z.string(), blocker: z.string(), nonce: z.string().optional(),
   blockers: z.array(z.string()).optional(), actions: z.array(z.string()).optional(),
+  selection: z.object({ policy: z.string(), reason: z.string() }).optional(),
+  retained_input: z.object({ path: z.string(), reason: z.string() }).optional(),
+  seed: z.object({ oid: z.string().optional() }).optional(),
+  cache: z.object({ state: z.string(), reason: z.string().optional() }).optional(),
   identity: z.object({ git_dir: z.string(), directory: z.string(), registration: z.string() }).nullable(),
   disposal: z.object({
     phase: z.string(), blocker: z.string(),

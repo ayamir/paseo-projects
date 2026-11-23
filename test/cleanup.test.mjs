@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 const TMP = realpathSync(tmpdir());
 const BASE = mkdtempSync(join(TMP, "pp-cleanup-"));
@@ -286,13 +286,77 @@ async function managedOvnfsFixture(t, mode = "ambiguous-new", daemon = "create-r
     calls: () => readFileSync(join(state, "calls"), "utf8").trim().split("\n").map(JSON.parse) };
 }
 
+test("managed OVNFS submits a committed clean capture without source files or private Git metadata", { skip: process.platform !== "darwin" }, async (t) => {
+  const f = await managedOvnfsFixture(t, "off", "off");
+  const baseline = git(f.repo, "rev-parse", "HEAD");
+  write(join(f.repo, "package.json"), "dirty dummy content\n");
+  write(join(f.repo, "node_modules", ".env"), "dummy credential\n");
+  write(join(f.repo, "out", "local-state"), "dummy local state\n");
+  git(f.repo, "config", "--local", "pp.fixture-secret", "dummy config credential");
+  const started = f.start(); assert.ok(started.ok, started.out);
+  const w = f.show(f.next).working_copy;
+  const rpc = f.calls().find((x) => x.new).new;
+  assert.equal(w.baseline, baseline);
+  assert.equal(w.source, f.repo);
+  assert.notEqual(rpc.dir, f.repo);
+  assert.equal(w.ovnfs.capture.path, rpc.dir);
+  for (const path of [rpc.dir, w.path]) {
+    assert.equal(readFileSync(join(path, "package.json"), "utf8"), "{}\n");
+    assert.equal(existsSync(join(path, "node_modules")), false);
+    assert.equal(existsSync(join(path, "out")), false);
+    assert.throws(() => git(path, "config", "--local", "--get", "pp.fixture-secret"));
+  }
+  assert.ok(existsSync(join(f.repo, "node_modules", ".env")));
+  assert.equal(readFileSync(join(f.repo, "package.json"), "utf8"), "dirty dummy content\n");
+});
+
+test("managed OVNFS refuses a committed source link without submitting any checkout", { skip: process.platform !== "darwin" }, async (t) => {
+  const f = await managedOvnfsFixture(t, "off", "off");
+  const dummy = join(f.repo, "out", "dummy-private");
+  write(dummy, "DUMMY PRIVATE");
+  symlinkSync(dummy, join(f.repo, "tracked-link"));
+  git(f.repo, "add", "tracked-link"); git(f.repo, "commit", "-qm", "unsupported input");
+  assert.ok(f.pp("set", "demo", "working_copy_policy", "ovnfs-preferred").ok);
+  const failed = f.pp("thread", "start", "demo", "--title", "Unverified input", "--task", "test", "--repo", f.repo, "--profile", "fake");
+  assert.equal(failed.ok, false, failed.out);
+  assert.match(failed.out, /does not support tracked links/);
+  assert.doesNotMatch(failed.out, /DUMMY PRIVATE|fell back/);
+  const w = f.show(f.next).working_copy;
+  assert.equal(w.backend, "ovnfs"); assert.equal(w.phase, "planned");
+  assert.equal(f.calls().some((m) => m.new), false);
+  assert.equal(readFileSync(dummy, "utf8"), "DUMMY PRIVATE");
+});
+
+test("managed OVNFS blocks a pre-capture planned record without allocating a checkout", { skip: process.platform !== "darwin" }, async (t) => {
+  const f = await managedOvnfsFixture(t, "off", "off");
+  symlinkSync("package.json", join(f.repo, "tracked-link"));
+  git(f.repo, "add", "tracked-link"); git(f.repo, "commit", "-qm", "unsupported input");
+  assert.match(f.start().out, /does not support tracked links/);
+  const recordPath = f.p.path("threads", `${f.next}.json`);
+  const record = JSON.parse(readFileSync(recordPath, "utf8"));
+  assert.equal(record.working_copy.phase, "planned");
+  delete record.working_copy.ovnfs.capture; // Shape of a planned record written before clean capture was required.
+  write(recordPath, JSON.stringify(record));
+  const failed = f.pp("thread", "restart", "demo", f.next, "--fresh");
+  assert.equal(failed.ok, false, failed.out);
+  assert.match(failed.out, /OVNFS record has no verified capture; start a new checkout explicitly/);
+  const w = f.show(f.next).working_copy;
+  assert.equal(w.phase, "planned"); assert.equal(w.nonce, record.working_copy.nonce);
+  assert.equal(w.ovnfs.capture, undefined); assert.equal(existsSync(w.path), false);
+  assert.match(w.blocker, /no verified capture/);
+  assert.equal(f.calls().some((m) => m.new), false);
+});
+
 test("managed OVNFS reconciles an ambiguous allocation before Agent start and never reallocates", { skip: process.platform !== "darwin" }, async (t) => {
   const f = await managedOvnfsFixture(t);
-  const r = f.start();
+  assert.ok(f.pp("set", "demo", "working_copy_policy", "ovnfs-preferred").ok);
+  const r = f.pp("thread", "start", "demo", "--title", "Policy OVNFS", "--task", "test", "--repo", f.repo, "--profile", "fake");
   assert.equal(r.ok, false, r.out);
   assert.match(r.out, /agent create refused/);
+  assert.doesNotMatch(r.out, /fell back/);
   const failed = f.show(f.next);
   assert.equal(failed.working_copy.backend, "ovnfs");
+  assert.equal(failed.working_copy.selection, undefined);
   assert.equal(failed.working_copy.owner, f.next);
   assert.equal(failed.working_copy.phase, "ready");
   assert.equal(failed.cwd, join(f.mount, f.calls().find((x) => x.new).new.name));
@@ -306,6 +370,32 @@ test("managed OVNFS reconciles an ambiguous allocation before Agent start and ne
   assert.equal(f.show(f.next).cwd, failed.cwd);
   assert.equal(f.calls().filter((entry) => entry.new).length, 1);
   assert.equal(git(f.repo, "branch", "--list", failed.branch), "");
+});
+
+test("managed preflight: resource and space pressure refuse additions without disturbing a held OVNFS checkout", { skip: process.platform !== "darwin" }, async (t) => {
+  const f = await managedOvnfsFixture(t, "off", "off");
+  assert.ok(f.start().ok);
+  const record = f.show(f.next).working_copy;
+  const hold = f.pp("thread", "hold", "demo", f.next, "--reason", "still active", "--until", "2099-01-01T00:00:00Z");
+  assert.ok(hold.ok, hold.out);
+  for (const [key, limit, why] of [["working_copy_max_resources", "2", /resource budget/], ["working_copy_min_free_bytes", "9007199254740991", /space warning/]]) {
+    const setting = f.pp("set", "demo", key, limit); assert.ok(setting.ok, setting.out);
+    const before = readdirSync(f.p.path("threads"));
+    for (const action of [() => f.start(), () => f.pp("thread", "experiment", "demo", f.next, "--name", "extra"), () => f.pp("thread", "snapshot", "demo", f.next, "--name", "save")]) {
+      const rejected = action(); assert.equal(rejected.ok, false, rejected.out); assert.match(rejected.out, why);
+    }
+    assert.deepEqual(readdirSync(f.p.path("threads")), before);
+    const tick = await tickOnce(f, new Date().toISOString(), {});
+    assert.equal(tick.code, 0, tick.out);
+    assert.ok(f.pp("set", "demo", key, "off").ok);
+  }
+  const view = JSON.parse(f.pp("board", "thread", "demo", f.next).out);
+  assert.equal(view.working_copy.nonce, record.nonce);
+  assert.equal(view.working_copy.retained_input.path, record.ovnfs.capture.path);
+  assert.match(view.working_copy.retained_input.reason, /OVNFS Git object dependency/);
+  assert.ok(view.working_copy.blockers.some((s) => /still active/.test(s)));
+  assert.ok(existsSync(record.path));
+  assert.deepEqual(f.calls().filter((m) => m.new || m.snap || m.rm || m.drop).map((m) => Object.keys(m).filter((k) => k !== "id")), [["new"]]);
 });
 
 test("managed OVNFS registers an experiment and snapshots its own checkout before deriving a new owner", { skip: process.platform !== "darwin" }, async (t) => {
@@ -1017,6 +1107,141 @@ async function managedFixture(t, mode = "off", withProject = false) {
   return { ...f, id, start, show: (tid = id) => query("thread", "show", "demo", tid, "--json"),
     board: (tid = id) => query("board", "thread", "demo", tid), legacy: f.id };
 }
+
+test("managed preflight: Git stays default, policy fallback is visible, and actual Git allocations respect the budget", async (t) => {
+  const f = await managedFixture(t);
+  delete f.env.OVNFS_STATE;
+  delete f.env.OVNFS_MOUNT;
+  f.env.PATH = `${BASE}:${f.env.PATH}`;
+  const start = f.start(); assert.ok(start.ok, start.out); assert.doesNotMatch(start.out, /fell back/);
+  assert.equal(f.show().working_copy.backend, "git-worktree");
+  const policy = f.pp("set", "demo", "working_copy_policy", "ovnfs-preferred"); assert.ok(policy.ok, policy.out);
+  const explicit = f.start("--kind", "ovnfs"); assert.equal(explicit.ok, false, explicit.out);
+  assert.doesNotMatch(explicit.out, /fell back/);
+  const preferred = f.start(); assert.ok(preferred.ok, preferred.out); assert.match(preferred.out, /fell back to git-worktree/);
+  const second = `t-${Number(f.id.slice(2)) + 1}`;
+  const w = f.board(second).working_copy;
+  assert.equal(w.backend, "git-worktree");
+  assert.equal(w.selection.policy, "ovnfs-preferred");
+  assert.match(w.selection.reason, /OVNFS/);
+  assert.ok(f.pp("set", "demo", "working_copy_max_resources", "2").ok);
+  const refused = f.start("--kind", "worktree"); assert.equal(refused.ok, false, refused.out); assert.match(refused.out, /resource budget/);
+  assert.equal(f.board().working_copy.phase, "ready");
+  assert.equal(f.board(second).working_copy.nonce, w.nonce);
+  assert.ok(f.pp("set", "demo", "working_copy_max_resources", "off").ok);
+  assert.ok(f.pp("set", "demo", "working_copy_min_free_bytes", "9007199254740991").ok);
+  assert.match(f.start("--kind", "worktree").out, /space warning/);
+});
+
+for (const backend of ["git-worktree", "ovnfs"]) test(`managed cache: ${backend} revalidates exact declared data and never shares writes`, { skip: backend === "ovnfs" && process.platform !== "darwin" }, async (t) => {
+  const f = backend === "ovnfs" ? await managedOvnfsFixture(t, "off", "off") : await managedFixture(t);
+  const start = () => { const r = f.start(); assert.ok(r.ok, r.out); };
+  const i = Number((f.next ?? f.id).slice(2));
+  const view = (offset) => JSON.parse(f.pp("board", "thread", "demo", `t-${i + offset}`).out).working_copy;
+  const hash = (s) => createHash("sha256").update(s).digest("hex");
+  const path = f.p.path("working-copy-cache.json");
+  const declarations = { [f.repo]: { baseline: git(f.repo, "rev-parse", "HEAD"), root: "node_modules",
+    inputs: { "package-lock.json": hash("{}\n") }, files: { "test-cache/value": hash("DUMMY CACHE") } } };
+  const update = () => write(path, JSON.stringify(declarations));
+  update();
+  write(join(f.repo, "node_modules/test-cache/value"), "DUMMY CACHE");
+  write(join(f.repo, "node_modules/test-cache/private"), "DUMMY UNDECLARED");
+  write(join(f.repo, "node_modules/.env"), "DUMMY CREDENTIAL");
+  write(join(f.repo, "out/local"), "DUMMY LOCAL");
+  start(); start();
+  const a = view(0), b = view(1);
+  for (const w of [a, b]) {
+    assert.equal(w.cache.state, "reused");
+    assert.equal(readFileSync(join(w.path, "node_modules/test-cache/value"), "utf8"), "DUMMY CACHE");
+    for (const leaf of ["node_modules/.env", "node_modules/test-cache/private", "out/local"]) assert.equal(existsSync(join(w.path, leaf)), false, leaf);
+  }
+  write(join(a.path, "node_modules/test-cache/value"), "EDIT ONE COPY");
+  assert.equal(readFileSync(join(f.repo, "node_modules/test-cache/value"), "utf8"), "DUMMY CACHE");
+  assert.equal(readFileSync(join(b.path, "node_modules/test-cache/value"), "utf8"), "DUMMY CACHE");
+  write(join(f.repo, "package-lock.json"), "CHANGED INPUT\n");
+  start(); const changed = view(2);
+  assert.equal(changed.cache.state, "cold"); assert.match(changed.cache.reason, /input/);
+  assert.equal(existsSync(join(changed.path, "node_modules")), false);
+  write(join(f.repo, "package-lock.json"), "{}\n");
+  rmSync(join(f.repo, "node_modules/test-cache/value"));
+  symlinkSync(join(f.repo, "node_modules/.env"), join(f.repo, "node_modules/test-cache/value"));
+  start(); const alias = view(3);
+  assert.equal(alias.cache.state, "cold");
+  assert.equal(existsSync(join(alias.path, "node_modules")), false);
+  declarations[f.repo].files = { ".env": hash("DUMMY CREDENTIAL") }; update();
+  start(); assert.equal(view(4).cache.state, "cold");
+  assert.equal(existsSync(join(view(4).path, "node_modules")), false);
+});
+
+for (const backend of ["git-worktree", "ovnfs"]) test(`managed inputs: ${backend} retains an independently restorable explicit dirty seed`, { skip: backend === "ovnfs" && process.platform !== "darwin" }, async (t) => {
+  const f = backend === "ovnfs" ? await managedOvnfsFixture(t, "off", "off") : await managedFixture(t);
+  const base = git(f.repo, "rev-parse", "HEAD");
+  write(join(f.repo, "package.json"), '{"staged": true}\n');
+  git(f.repo, "add", "package.json");
+  write(join(f.repo, "package.json"), '{"effective": true}\n');
+  rmSync(join(f.repo, "package-lock.json"));
+  write(join(f.repo, "local.txt"), "dummy undeclared file");
+  write(join(f.repo, "out", ".env"), "dummy credential");
+  const status = git(f.repo, "status", "--porcelain");
+  const result = f.start("--inherit-dirty"); assert.ok(result.ok, result.out);
+  const id = f.next ?? f.id, w = f.show(id).working_copy;
+  assert.equal(w.baseline, base);
+  assert.notEqual(w.seed.oid, base);
+  assert.equal(git(w.path, "rev-parse", "HEAD"), w.seed.oid);
+  assert.equal(readFileSync(join(w.path, "package.json"), "utf8"), '{"effective": true}\n');
+  assert.equal(existsSync(join(w.path, "package-lock.json")), false);
+  assert.equal(existsSync(join(w.path, "local.txt")), false);
+  assert.equal(existsSync(join(w.path, "out")), false);
+  assert.equal(git(f.repo, "status", "--porcelain"), status);
+  write(join(w.path, "package.json"), '{"later": true}\n');
+  const saved = join(f.root, "source-moved"); renameSync(f.repo, saved);
+  const restored = join(f.root, "restored");
+  git(f.root, "clone", "--no-local", "--", w.seed.path, restored);
+  assert.equal(git(restored, "rev-parse", "HEAD"), w.seed.oid);
+  assert.equal(git(restored, "rev-parse", "HEAD^"), base);
+  assert.equal(readFileSync(join(restored, "package.json"), "utf8"), '{"effective": true}\n');
+  assert.equal(existsSync(join(restored, "package-lock.json")), false);
+});
+
+test("managed inputs: ordinary Git filters still work without a verified cache claim", async (t) => {
+  const f = await managedFixture(t);
+  write(join(f.repo, ".gitattributes"), "package.json filter=fixture\n");
+  git(f.repo, "add", ".gitattributes"); git(f.repo, "commit", "-qm", "normal checkout filter");
+  git(f.repo, "config", "filter.fixture.smudge", "sed 's/^{}/DUMMY &/'");
+  git(f.repo, "config", "filter.fixture.clean", "sed 's/^DUMMY //'");
+  const baseline = git(f.repo, "rev-parse", "HEAD"), hash = (s) => createHash("sha256").update(s).digest("hex");
+  write(join(f.repo, "node_modules/cache.txt"), "DUMMY CACHE");
+  write(f.p.path("working-copy-cache.json"), JSON.stringify({ [f.repo]: { baseline, root: "node_modules",
+    inputs: { "package-lock.json": hash("{}\n") }, files: { "cache.txt": hash("DUMMY CACHE") } } }));
+  const result = f.start(); assert.ok(result.ok, result.out);
+  const w = f.board().working_copy;
+  assert.equal(w.baseline, baseline); assert.equal(git(w.path, "rev-parse", "HEAD"), baseline);
+  assert.equal(readFileSync(join(w.path, "package.json"), "utf8"), "DUMMY {}\n");
+  assert.equal(w.cache.state, "cold"); assert.match(w.cache.reason, /checkout filter/);
+  assert.equal(existsSync(join(w.path, "node_modules")), false);
+  const restarted = f.pp("thread", "restart", "demo", f.id, "--fresh"); assert.ok(restarted.ok, restarted.out);
+  assert.equal(f.board().working_copy.nonce, w.nonce);
+  assert.ok(f.pp("set", "demo", "working_copy_policy", "ovnfs-preferred").ok);
+  const fallback = f.start(); assert.ok(fallback.ok, fallback.out); assert.match(fallback.out, /fell back to git-worktree/);
+  const next = f.board(`t-${Number(f.id.slice(2)) + 1}`).working_copy;
+  assert.equal(next.baseline, baseline); assert.equal(next.cache.state, "cold");
+  assert.equal(readFileSync(join(next.path, "package.json"), "utf8"), "DUMMY {}\n");
+});
+
+test("managed inputs: explicit Git dirty seed refuses a configured checkout filter before allocation", async (t) => {
+  const f = await managedFixture(t);
+  write(join(f.repo, ".gitattributes"), "package.json filter=local-dummy\n");
+  git(f.repo, "add", ".gitattributes"); git(f.repo, "commit", "-qm", "checkout filter attribute");
+  const marker = join(f.repo, "out", "local-filter-ran");
+  write(join(f.repo, "out", "dummy-private"), "DUMMY PRIVATE");
+  git(f.repo, "config", "filter.local-dummy.smudge", `touch '${marker}' && printf 'DUMMY PRIVATE'`);
+  const before = readdirSync(f.p.path("threads"));
+  const result = f.start("--inherit-dirty");
+  assert.equal(result.ok, false, "a filesystem-executing checkout filter is not an authorized seed input");
+  assert.match(result.out, /checkout filter/); assert.doesNotMatch(result.out, /DUMMY PRIVATE/);
+  assert.equal(existsSync(marker), false);
+  assert.deepEqual(readdirSync(f.p.path("threads")), before);
+});
 
 test("managed holds: an agent needs a reason and a valid bound, and cannot release a hold", async (t) => {
   const f = await managedFixture(t);
