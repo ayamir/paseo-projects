@@ -111,7 +111,7 @@ OVNFS 线程支持 `--reviews` 和报告中的 `Reviewed-PR:`。因被审 PR 合
 
 ## 和 Paseo 的合并自动归档冲突
 
-Paseo daemon 的 `daemon.autoArchiveAfterMerge`（默认关闭）打开时，会在 PR 合并后自动归档 workspace。触发条件只有这几条：PR 合并、git 不脏、没有领先 origin、worktree 归 Paseo 所有。满足后它用 `git worktree remove --force`、`rm -rf` 和 `git worktree prune` 删掉 worktree。它不看 pp 的保留决定，不看 ignored 内容（`.paseo-project/` 也在其中），也不看占用的进程。pp 的线程 worktree 都是 Paseo 创建的，所以这个设置打开时，删 worktree 的就不止 pp 一家：
+Paseo daemon 的 `daemon.autoArchiveAfterMerge`（默认关闭）打开时，会在 PR 合并后自动归档 workspace。触发条件只有这几条：PR 合并、git 不脏、没有领先 origin、worktree 归 Paseo 所有。满足后它用 `git worktree remove --force`、`rm -rf` 和 `git worktree prune` 删掉 worktree。它不看 pp 的保留决定，不看 ignored 内容（`.paseo-project/` 也在其中），也不看占用的进程。以下冲突涉及以前由 Paseo 创建、未登记工作副本的线程。新线程的 Git worktree 由 pp 登记和创建；身份缺失或不一致时，pp 不会在该目录执行或清理。
 
 - pp 先 resolve、决定保留时：保留守不住。记录里 worktree 的 kept 原因会写明这一点，`pp doctor` 也会提示。
 - 读不到这个设置时（daemon 连不上、拒绝读取，或者回了 SDK 不认的格式），按「未知」处理，不当作关闭：kept 原因写「is unknown (原因)」，`pp doctor` 写「could not be read (原因)」。读设置失败不会挡住清理。

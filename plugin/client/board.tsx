@@ -57,7 +57,8 @@ export function BoardScreen({ theme, layout }: PluginScreenProps) {
   const threads = q.data?.threads ?? [];
   const key = (t: Thread) => `${t.project}/${t.id}`;
   const selected = threads.find((t) => key(t) === open) ?? null;
-  const detail = useQuery({ queryKey: ["pp-detail", open], queryFn: () => detailRpc({ project: open!.split("/")[0], id: open!.split("/")[1] }), enabled: Boolean(open) });
+  const detail = useQuery({ queryKey: ["pp-detail", open], queryFn: () => detailRpc({ project: open!.split("/")[0], id: open!.split("/")[1] }), enabled: Boolean(open), refetchInterval: 5000 });
+  const worktree = detail.data?.working_copy;
   const needsYou = threads.filter((t) => t.group === "waiting-on-you").length;
 
   const action = useMutation({
@@ -148,6 +149,14 @@ export function BoardScreen({ theme, layout }: PluginScreenProps) {
           </View>
           <Text style={styles.title}>{selected.title}</Text>
           <Text style={styles.meta}>{selected.project} · {selected.id} · {selected.profile}{selected.branch ? ` · ${selected.branch}` : ""}</Text>
+          {worktree && (
+            <View style={{ marginTop: 8 }}>
+              <Text style={styles.meta}>工作副本：{worktree.backend} · {worktree.phase}{worktree.machine ? ` · ${worktree.machine}` : ""}</Text>
+              <Text style={styles.mono}>{worktree.path}{"\n"}基线：{worktree.baseline}</Text>
+              {worktree.blocker ? <Text style={styles.note}>{worktree.blocker}</Text> : null}
+            </View>
+          )}
+          {detail.data?.error ? <Text style={styles.note}>{detail.data.error}</Text> : null}
           <View style={{ flexDirection: "row", flexWrap: "wrap" as const, marginTop: 10 }}>
             <Btn label="Ack 报告" theme={theme} disabled={action.isPending} onPress={() => run("ack", selected)} />
             <Btn label="重启" theme={theme} disabled={action.isPending} onPress={() => run("restart", selected)} />

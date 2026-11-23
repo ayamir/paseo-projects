@@ -27,6 +27,7 @@ const SECTIONS = [
     ["doctor [--fix]"],
     ["migrate-herdr [HERDR_ROOT] [--dry-run]", "copy herdr-projects projects here (default ~/.herdr-projects)"],
     ["board tasks|routines|settings|memory", "what the board plugin shows, as JSON"],
+    ["board thread <slug> <id>", "the board's thread detail, as JSON"],
     ["board edit <json>", "a settings edit from the board, as the command it maps to"],
   ]],
   ["Threads", [

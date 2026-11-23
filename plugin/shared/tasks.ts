@@ -23,11 +23,18 @@ export const tasksRpc = defineRpc({
   }),
 });
 
-// One thread: its report home and the report's `## Next` lines.
+// One thread: report, Next lines, and its registered worktree (null for legacy threads).
 export const threadDetailRpc = defineRpc({
   name: "paseo-projects.thread.detail",
   input: z.object({ project: z.string(), id: z.string() }),
-  output: z.object({ report: z.string(), next: z.array(z.string()), cwd: z.string(), status: z.string() }),
+  output: z.object({
+    report: z.string(), next: z.array(z.string()), cwd: z.string(), status: z.string(), error: z.string(),
+    working_copy: z.object({
+      owner: z.string(), backend: z.string(), phase: z.string(), baseline: z.string(), source: z.string(),
+      path: z.string(), machine: z.string(), blocker: z.string(),
+      identity: z.object({ git_dir: z.string(), directory: z.string(), registration: z.string() }).nullable(),
+    }).nullable(),
+  }),
 });
 
 // What the board's buttons do: each one is a `pp` command, so the board can do nothing the CLI cannot.

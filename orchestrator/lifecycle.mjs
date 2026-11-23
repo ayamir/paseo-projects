@@ -80,7 +80,11 @@ export function sweepPlan(project) {
   const plan = [];
   const all = threads.list(project);
   const real = (p) => { try { return realpathSync(p); } catch { return p; } };
-  const byCwd = new Map(all.filter((t) => t.cwd).flatMap((t) => [[t.cwd, t], [real(t.cwd), t]]));
+  const byCwd = new Map(all.flatMap((t) => {
+    const path = t.working_copy?.path || t.cwd;
+    return path ? [[path, t], [real(path), t]] : [];
+  }));
+  const managedBranches = new Set(all.filter((t) => t.working_copy && !t.machine).flatMap((t) => [t.branch, t.working_copy.branch]));
   for (const repo of project.settings().repos.filter((r) => !r.machine)) {
     const r = sh(["git", "-C", repo.path, "worktree", "list", "--porcelain"]);
     if (!r.ok) continue;
@@ -89,7 +93,8 @@ export function sweepPlan(project) {
       const branch = /^branch refs\/heads\/(.+)$/m.exec(block)?.[1];
       if (!path || !threads.isOwnBranch(project.slug, branch)) continue;
       const t = byCwd.get(path);
-      if (t && (threads.isOpen(t) || t.kept_worktree)) continue;
+      if (t && (threads.isOpen(t) || t.kept_worktree || t.working_copy?.phase === "removed")) continue;
+      if (!t && managedBranches.has(branch)) continue; // A moved or substituted managed copy is not a legacy orphan.
       if (t) plan.push({ what: `clean up ${t.id} again (worktree ${path})`, run: async () => ({ ok: true, out: (await threads.cleanupAgain(project, t.id)).join("; ") }) });
       else plan.push({ what: `remove worktree ${path} (${branch}), of no thread`, run: async () => {
         const i = await cleanup.removeWorktree(threads.host(null), { cwd: path, repo: repo.path });
@@ -97,7 +102,7 @@ export function sweepPlan(project) {
       } });
     }
   }
-  for (const t of all.filter((t) => t.kind === "worktree" && t.status === "resolved" && t.branch && t.repo && !t.machine && t.pr_state === "MERGED")) {
+  for (const t of all.filter((t) => t.kind === "worktree" && (!t.working_copy || t.working_copy.phase === "removed") && t.status === "resolved" && t.branch && t.repo && !t.machine && t.pr_state === "MERGED")) {
     const tip = sh(["git", "-C", t.repo, "rev-parse", "--verify", "-q", `refs/heads/${t.branch}`]);
     if (!tip.ok || tip.stdout.trim() !== t.pr_summary?.head_oid) continue;
     if (isDir(t.cwd)) continue; // its worktree is still there; the worktree step goes first

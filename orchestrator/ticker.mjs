@@ -117,8 +117,9 @@ export async function tick(project, started = now()) {
   }
   const unreachable = new Set((agents.unreachable ?? []).map((m) => (m === "local" ? "" : m)));
   for (let t of open) {
+    if (!t.machine || pollPrs) t = threads.checkWorktree(project, t, at);
     if (unreachable.has(t.machine || "")) continue;
-    if (!t.machine || pollPrs) {
+    if ((!t.machine || pollPrs) && !t.working_copy?.blocker) {
       const c = threads.copyHome(project, t);
       if (c.hash && c.hash !== t.report_hash) t = threads.update(project, t.id, (r) => { r.report_hash = c.hash; r.last_report_change = now(); });
     }
@@ -167,6 +168,7 @@ async function followPrs(project, settings, state, agents, at) {
   const ownOf = (origin) => { const h = pr.hostOf(origin); if (!own.has(h)) own.set(h, pr.ownLogin(origin)); return own.get(h); };
   let ghFailed = false;
   for (let t of threads.list(project).filter(threads.isOpen)) {
+    if (t.working_copy && (t.working_copy.phase !== "ready" || t.working_copy.blocker)) continue;
     t = threads.refreshBranch(project, t);
     const report = readText(threads.homeReportPath(project, t.id));
     const line = pr.prLine(report);

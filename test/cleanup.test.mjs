@@ -79,6 +79,7 @@ import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 const agents = new Map(), archiveAttempts = new Set(), at = new Date().toISOString();
+let creates = 0;
 const workspaces = [], pageInfo = { nextCursor: null, prevCursor: null, hasMore: false };
 const projectFile = process.env.FAKE_PASEO_PROJECT;
 const project = () => ({ projectId: "prj_repo", projectRootPath: readFileSync(projectFile, "utf8"), projectDisplayName: "Repo", projectKind: "git" });
@@ -107,10 +108,11 @@ wss.on("connection", (s) => s.on("message", (raw) => {
   }
   if (r.type === "fetch_agents_request") return send({ type: "fetch_agents_response", payload: { requestId, entries: [], pageInfo } });
   if (r.type === "create_agent_request") {
+    if (++creates === 1 && mode === "create-retry") return send({ type: "rpc_error", payload: { requestId, requestType: r.type, error: "agent create refused" } });
     const id = "agent-" + (agents.size + 1), { branch, newBranch, base } = r.worktree ?? {};
     const cwd = r.worktree ? join(dirname(r.config.cwd), newBranch || "wt") : r.config.cwd;
     if (r.worktree) execFileSync("git", ["-C", r.config.cwd, "worktree", "add", "-q", ...(newBranch ? ["-b", newBranch, cwd, base || "HEAD"] : [cwd, branch])], { stdio: "ignore" });
-    else if (!workspaces.some((w) => w.id === r.workspaceId && w.workspaceDirectory === cwd)) throw new Error("agent placed outside the directory workspace");
+    else if (r.workspaceId && !workspaces.some((w) => w.id === r.workspaceId && w.workspaceDirectory === cwd)) throw new Error("agent placed outside the directory workspace");
     const agent = { id, provider: "claude", cwd, workspaceId: r.workspaceId ?? "wks_restarted", model: null, createdAt: at, updatedAt: at, lastUserMessageAt: null, status: "idle",
       capabilities: { supportsStreaming: false, supportsSessionPersistence: false, supportsDynamicModes: false, supportsMcpServers: false, supportsReasoningStream: false, supportsToolInvocations: false },
       currentModeId: null, availableModes: [], pendingPermissions: [], persistence: null, title: null, labels: r.labels ?? {} };
@@ -793,6 +795,121 @@ test("pp archive leaves the project active when the daemon does not answer, not 
   assert.equal(f.p.status, "active");
 });
 
+async function managedFixture(t, mode = "off", withProject = false) {
+  const projectFile = withProject ? join(BASE, `managed-project-${n}`) : "";
+  const d = await fakeDaemon(mode, projectFile);
+  const f = fixture({ daemon: d.url });
+  if (projectFile) write(projectFile, f.repo);
+  t.after(() => { d.stop(); rmSync(f.root, { recursive: true, force: true }); });
+  const config = join(f.root, "config.json");
+  write(config, JSON.stringify({ profiles: { fake: { provider: "claude/fake-model" } } }));
+  f.env.PP_CONFIG = config;
+  f.pp("set", "demo", "mute", "true");
+  f.pp("set", "demo", "nudge", "false");
+  const id = `t-${Number(f.id.slice(2)) + 1}`;
+  const start = (...args) => f.pp("thread", "start", "demo", "--repo", f.repo, "--title", "Managed copy", "--task", "Work here", "--profile", "fake", ...args);
+  const query = (...args) => {
+    const r = f.pp(...args);
+    assert.ok(r.ok, r.out);
+    return JSON.parse(r.out);
+  };
+  return { ...f, id, start, show: (tid = id) => query("thread", "show", "demo", tid, "--json"),
+    board: (tid = id) => query("board", "thread", "demo", tid), legacy: f.id };
+}
+
+test("managed worktree: explicit committed baseline, dirty source unchanged, same resource in CLI and board", async (t) => {
+  const f = await managedFixture(t);
+  const base = git(f.repo, "rev-parse", "HEAD");
+  write(join(f.repo, "package.json"), '{"newer":true}\n');
+  git(f.repo, "commit", "-qam", "newer source");
+  write(join(f.repo, "package.json"), '{"dirty":true}\n');
+  git(f.repo, "add", "package.json");
+  write(join(f.repo, "untracked"), "source only\n");
+  const before = git(f.repo, "status", "--porcelain");
+  const started = f.start("--base", base);
+  assert.ok(started.ok, started.out);
+  const row = f.show();
+  assert.equal(row.kind, "worktree");
+  assert.equal(row.status, "open");
+  assert.equal(row.working_copy.owner, f.id);
+  assert.equal(row.working_copy.backend, "git-worktree");
+  assert.equal(row.working_copy.baseline, base);
+  assert.equal(row.working_copy.phase, "ready");
+  assert.equal(row.working_copy.path, row.cwd);
+  assert.ok(row.working_copy.identity);
+  assert.deepEqual(f.board().working_copy, row.working_copy);
+  assert.equal(f.board(f.legacy).working_copy, null);
+  assert.equal(f.show(f.legacy).kind, "worktree");
+  assert.equal(git(row.cwd, "rev-parse", "HEAD"), base);
+  assert.equal(readFileSync(join(row.cwd, "package.json"), "utf8"), "{}\n");
+  assert.ok(!existsSync(join(row.cwd, "untracked")));
+  assert.equal(git(f.repo, "status", "--porcelain"), before);
+  assert.equal(readFileSync(join(f.repo, "package.json"), "utf8"), '{"dirty":true}\n');
+});
+
+test("managed worktree: remote retry uses the planned baseline through SSH and Paseo", async (t) => {
+  const f = await managedFixture(t, "off", true);
+  const bin = join(f.root, "bin"), log = join(f.root, "ssh.log");
+  write(join(bin, "ssh"), `#!/bin/sh
+[ "$1" = -o ] && [ "$2" = BatchMode=yes ] && [ "$3" = fake-host ] || exit 1
+printf '%s\\n' "$4" >> ${JSON.stringify(log)}
+exec sh -c "$4"
+`);
+  chmodSync(join(bin, "ssh"), 0o755);
+  f.env.PATH = `${bin}:${f.env.PATH}`;
+  const configure = (url) => write(f.env.PP_CONFIG, JSON.stringify({
+    profiles: { fake: { provider: "claude/fake-model" } }, machines: { remote: { url, ssh: "fake-host" } },
+  }));
+  const base = git(f.repo, "rev-parse", "HEAD");
+  configure(NO_DAEMON);
+  const start = f.start("--machine", "remote");
+  assert.ok(!start.ok, start.out);
+  const planned = f.board().working_copy;
+  assert.equal(planned.phase, "planned");
+  assert.equal(planned.baseline, base);
+  assert.equal(planned.identity, null);
+  assert.ok(!existsSync(planned.path));
+  git(f.repo, "commit", "--allow-empty", "-qm", "source moved since planning");
+  configure(f.env.PASEO_URL);
+  const restart = f.pp("thread", "restart", "demo", f.id, "--fresh");
+  assert.ok(restart.ok, restart.out);
+  const after = f.show();
+  assert.equal(after.kind, "worktree");
+  assert.equal(after.status, "open");
+  assert.equal(after.working_copy.machine, "remote");
+  assert.equal(after.cwd, planned.path);
+  assert.equal(after.working_copy.phase, "ready");
+  assert.equal(git(after.cwd, "rev-parse", "HEAD"), base);
+  assert.match(readFileSync(log, "utf8"), /worktree add/);
+  assert.equal(after.workspace_id, "wks_ovnfs_0");
+  assert.deepEqual(f.board().working_copy, after.working_copy);
+});
+
+test("managed worktree: agent creation failure retains a restartable copy and its changes", async (t) => {
+  const f = await managedFixture(t, "create-retry");
+  const started = f.start();
+  assert.ok(!started.ok, started.out);
+  assert.match(started.out, /agent create refused/);
+  const row = f.show();
+  assert.equal(row.status, "failed");
+  assert.equal(row.working_copy.phase, "ready");
+  assert.equal(f.board().error.includes("agent create refused"), true);
+  const worktrees = git(f.repo, "worktree", "list", "--porcelain");
+  git(row.cwd, "commit", "--allow-empty", "-qm", "saved progress");
+  write(join(row.cwd, "local-progress"), "keep me\n");
+  git(row.cwd, "branch", "-m", "renamed-progress");
+  const restart = f.pp("thread", "restart", "demo", f.id, "--fresh");
+  assert.ok(restart.ok, restart.out);
+  const after = f.show();
+  assert.equal(after.status, "open");
+  assert.equal(after.cwd, row.cwd);
+  assert.equal(after.branch, "renamed-progress");
+  assert.deepEqual(after.working_copy, row.working_copy);
+  assert.equal(git(row.cwd, "log", "-1", "--format=%s"), "saved progress");
+  assert.equal(readFileSync(join(row.cwd, "local-progress"), "utf8"), "keep me\n");
+  assert.deepEqual(git(f.repo, "worktree", "list", "--porcelain").match(/^worktree .+$/gm), worktrees.match(/^worktree .+$/gm));
+});
+
 // One ticker pass in its own process, `gh` faked: the pull request is merged.
 const FAKE_GH_DIR = join(BASE, "fake-gh");
 write(join(FAKE_GH_DIR, "gh"), `#!/usr/bin/env node
@@ -819,6 +936,82 @@ const tickOnce = (f, started, view) => new Promise((ok) => {
   c.stdout.on("data", (d) => (out += d)); c.stderr.on("data", (d) => (out += d));
   const timer = setTimeout(() => c.kill(), 120_000);
   c.on("exit", (code) => { clearTimeout(timer); ok({ code, out }); });
+});
+
+test("managed worktree: ticker reconciles an interrupted Git creation without launching an agent", async (t) => {
+  const f = await managedFixture(t);
+  const bin = join(f.root, "bin"), seen = join(f.root, "creation-intent.json");
+  const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+  const base = git(f.repo, "rev-parse", "HEAD");
+  write(join(bin, "git"), `#!/usr/bin/env node
+const { spawnSync, execFileSync } = require('node:child_process');
+const fs = require('node:fs'), args = process.argv.slice(2);
+if (args.includes('worktree') && args.includes('add')) {
+  const intent = execFileSync(process.execPath, ${JSON.stringify([PP, "--root", f.root, "board", "thread", "demo", f.id])});
+  fs.writeFileSync(${JSON.stringify(seen)}, intent);
+}
+const r = spawnSync(${JSON.stringify(realGit)}, args, { stdio: 'inherit' });
+// Simulate loss of the creation result and inability to query Git in the same attempt.
+process.exit(r.status || (fs.existsSync(${JSON.stringify(seen)}) ? 42 : 0));
+`);
+  chmodSync(join(bin, "git"), 0o755);
+  const path = f.env.PATH;
+  f.env.PATH = `${bin}:${path}`;
+  const started = f.start();
+  f.env.PATH = path;
+  assert.ok(!started.ok, started.out);
+  const intent = JSON.parse(readFileSync(seen, "utf8")).working_copy;
+  assert.equal(intent.owner, f.id);
+  assert.equal(intent.baseline, base);
+  assert.equal(intent.identity, null);
+  assert.equal(intent.phase, "creating");
+  assert.equal(git(intent.path, "rev-parse", "HEAD"), base);
+  assert.equal(f.board().working_copy.phase, "creating");
+  const worktrees = git(f.repo, "worktree", "list", "--porcelain").match(/^worktree .+$/gm);
+  const tick = await tickOnce(f, new Date().toISOString(), {});
+  assert.equal(tick.code, 0, tick.out);
+  const recovered = f.show();
+  assert.equal(recovered.working_copy.phase, "ready");
+  assert.equal(recovered.cwd, intent.path);
+  assert.equal(recovered.agent_id, "");
+  const restart = f.pp("thread", "restart", "demo", f.id, "--fresh");
+  assert.ok(restart.ok, restart.out);
+  assert.deepEqual(f.show().working_copy, recovered.working_copy);
+  assert.deepEqual(git(f.repo, "worktree", "list", "--porcelain").match(/^worktree .+$/gm), worktrees);
+});
+
+test("managed worktree: missing or substituted checkout blocks execution and cleanup", async (t) => {
+  const f = await managedFixture(t);
+  const started = f.start();
+  assert.ok(started.ok, started.out);
+  const row = f.show();
+  const saved = join(f.root, "saved-worktree");
+  git(row.cwd, "checkout", "--detach");
+  git(f.repo, "worktree", "move", row.cwd, saved);
+  const restart = () => f.pp("thread", "restart", "demo", f.id, "--fresh");
+  const missing = restart();
+  assert.ok(!missing.ok, missing.out);
+  assert.match(missing.out, /worktree identity could not be verified/);
+  assert.ok(!existsSync(row.cwd));
+  git(f.repo, "worktree", "add", "-q", row.cwd, row.branch);
+  write(join(row.thread_dir, "report.md"), "replacement report\n");
+  const tick = await tickOnce(f, new Date().toISOString(), {});
+  assert.equal(tick.code, 0, tick.out);
+  const board = f.board();
+  assert.equal(board.report, "(no report yet)");
+  assert.match(board.working_copy.blocker, /identity does not match/);
+  assert.deepEqual(board.working_copy.identity, row.working_copy.identity);
+  const refused = restart();
+  assert.ok(!refused.ok, refused.out);
+  const prompted = f.pp("thread", "prompt", "demo", f.id, "--text", "do not send");
+  assert.ok(!prompted.ok, prompted.out);
+  assert.match(prompted.out, /identity does not match/);
+  const resolved = f.pp("thread", "resolve", "demo", f.id, "--skip-copy", "--force");
+  assert.ok(!resolved.ok, resolved.out);
+  assert.match(resolved.out, /identity does not match/);
+  assert.equal(f.show().agent_id, row.agent_id);
+  assert.ok(existsSync(saved));
+  assert.equal(readFileSync(join(row.thread_dir, "report.md"), "utf8"), "replacement report\n");
 });
 
 test("the ticker resolves no merged or idle thread while the daemon that says whether its agent works does not answer", async () => {

@@ -10,6 +10,7 @@ import { prefix } from "./project.mjs";
 import * as inbox from "./inbox.mjs";
 import * as cleanup from "./cleanup.mjs";
 import * as ovnfs from "./ovnfs.mjs";
+import * as workingCopy from "./working-copy.mjs";
 import { validPrUrl } from "./pr.mjs";
 
 
@@ -75,7 +76,7 @@ export function update(project, id, change) {
   });
 }
 
-function allocate(project, fill) {
+function allocate(project, task, fill) {
   return project.lock(() => {
     const next = Math.max(0, ...list(project).map((t) => Number(t.id.slice(2)))) + 1;
     const t = {
@@ -87,6 +88,7 @@ function allocate(project, fill) {
     };
     fill(t);
     if (existsSync(recordPath(project, t.id))) throw new Error(`thread id ${t.id} is already taken`);
+    writeAtomic(taskPath(project, t.id), task.trimEnd() + "\n");
     writeJson(recordPath(project, t.id), t);
     return t;
   });
@@ -244,7 +246,8 @@ export const GROUPS = {
 export function group(t, live, at = Date.now()) {
   const hasReport = Boolean(t.report_hash);
   if (t.status === "resolved") return { group: "resolved", note: t.resolved_reason || "resolved" };
-  if (t.status === "starting") return secondsSince(t.created, at) < STARTING_TIMEOUT_SECS ? { group: "working", note: "starting" } : { group: "waiting-on-you", note: "start timed out" };
+  if (t.working_copy?.blocker) return { group: "waiting-on-you", note: "worktree unconfirmed" };
+  if (t.status === "starting") return secondsSince(t.launch_started ?? t.created, at) < STARTING_TIMEOUT_SECS ? { group: "working", note: "starting" } : { group: "waiting-on-you", note: "start timed out" };
   if (t.status === "failed") return { group: "waiting-on-you", note: "start failed" };
   if (!live.exists && !hasReport) return { group: "waiting-on-you", note: "agent gone" };
   if (live.state === "error") return { group: "waiting-on-you", note: "agent error" };
@@ -283,7 +286,10 @@ export async function rows(project) {
 export function copyHome(project, t, withLibrary = false, exclude = []) {
   if (!t.thread_dir) return { outcome: "complete", notes: [], hash: null };
   let h;
-  try { h = host(t.machine); } catch (e) { return { outcome: "failed", error: e.message, notes: [] }; }
+  try {
+    h = host(t.machine);
+    if (t.working_copy) verifyWorktree(h, t);
+  } catch (e) { return { outcome: "failed", error: e.message, notes: [] }; }
   if (!h.isDir(t.thread_dir)) {
     // Gone before a final copy. Only a complete one recorded for this agent proves the library home whole: a library
     // folder home may be a copy that failed part way, a record without `archive` (older pp) a `--force` that skipped
@@ -331,6 +337,81 @@ export function copyHome(project, t, withLibrary = false, exclude = []) {
 
 export const hasBranchCheckout = (t) => t.kind === "worktree" || t.kind === "ovnfs";
 
+function worktreeRecord(t) {
+  const w = t.working_copy;
+  if (w.backend !== "git-worktree" || w.owner !== t.id || w.source !== t.repo || w.machine !== t.machine || (t.cwd && w.path !== t.cwd)) {
+    throw new Error(`${t.id}'s worktree record does not match its checkout`);
+  }
+  return w;
+}
+
+function verifyWorktree(h, t) {
+  const path = workingCopy.verify(h, worktreeRecord(t));
+  if (path !== t.cwd) throw new Error(`${t.id}'s worktree record does not match its checkout`);
+  return path;
+}
+
+function reconcileWorktree(project, t, h) {
+  if (worktreeRecord(t).phase === "creating") {
+    let identity;
+    try { identity = workingCopy.recover(h, t.working_copy); }
+    catch (e) {
+      // Another pass may have recorded the identity and released the creation lock.
+      t = load(project, t.id);
+      if (worktreeRecord(t).phase !== "ready") throw e;
+    }
+    if (identity) t = update(project, t.id, (r) => {
+      const w = worktreeRecord(r);
+      if (w.phase !== "creating") return;
+      Object.assign(w, { phase: "ready", identity, blocker: "" });
+      r.cwd = w.path;
+      r.thread_dir = threadDir(w.path, project.slug, r.id);
+      r.branch_start = { name: w.branch, oid: w.baseline };
+    });
+  }
+  verifyWorktree(h, t);
+  workingCopy.unlockCreation(h, t.working_copy);
+  return t;
+}
+
+function setWorktreeBlocker(project, t, blocker) {
+  return blocker === t.working_copy.blocker ? t : update(project, t.id, (r) => {
+    if (r.working_copy.phase === t.working_copy.phase) r.working_copy.blocker = blocker;
+  });
+}
+
+function prepareWorktree(project, t, h) {
+  let created;
+  if (worktreeRecord(t).phase === "planned") {
+    t = update(project, t.id, (r) => {
+      const w = worktreeRecord(r);
+      if (w.phase !== "planned") throw new Error(`${r.id}'s worktree creation already started`);
+      w.phase = "creating";
+    });
+    created = workingCopy.create(h, t.working_copy);
+  }
+  try {
+    t = reconcileWorktree(project, t, h);
+    return setWorktreeBlocker(project, t, "").cwd;
+  } catch (e) {
+    const message = created && !created.ok ? `${e.message}; git worktree add: ${created.out}` : e.message;
+    setWorktreeBlocker(project, load(project, t.id), message);
+    throw new Error(message);
+  }
+}
+
+/** Ticker checks the resource, but never starts a new worktree or agent. */
+export function checkWorktree(project, t, at) {
+  if (!t.working_copy || ["planned", "removed"].includes(t.working_copy.phase)) return t;
+  if (t.status === "starting" && secondsSince(t.launch_started ?? t.created, at) < STARTING_TIMEOUT_SECS) return t;
+  try {
+    t = reconcileWorktree(project, t, host(t.machine));
+    return setWorktreeBlocker(project, t, "");
+  } catch (e) {
+    return setWorktreeBlocker(project, load(project, t.id), e.message);
+  }
+}
+
 function requireLocalPaseo() {
   const { hostname } = new URL(process.env.PASEO_URL || "ws://127.0.0.1:6767/ws");
   if (!["127.0.0.1", "localhost", "[::1]"].includes(hostname)) throw new Error("an OVNFS thread needs a local Paseo daemon");
@@ -358,11 +439,12 @@ function ovnfsCwd(project, t) {
  * under the repo; its folder stays threads/<id>/. A restart reuses the workspace (creating twice makes two).
  * shortcut: a repo Paseo has no project for gets null (the thread's own workspace, as before); add the project then.
  */
-export async function tabWorkspace(c, cwd, repo, title) {
+export async function tabWorkspace(c, cwd, repo, title, remote = false) {
   if (!repo) return null;
-  const p = (await c.projects.list()).projects.find((x) => canonical(x.projectRootPath) === canonical(repo));
+  const pathOf = remote ? (path) => path.replace(/\/+$/, "") : canonical;
+  const p = (await c.projects.list()).projects.find((x) => pathOf(x.projectRootPath) === pathOf(repo));
   if (!p) return null;
-  const old = (await c.workspaces.list()).entries.find((w) => w.projectId === p.projectId && canonical(w.workspaceDirectory) === canonical(cwd));
+  const old = (await c.workspaces.list()).entries.find((w) => w.projectId === p.projectId && pathOf(w.workspaceDirectory) === pathOf(cwd));
   return old ? c.workspaces.ref(old.id) : c.workspaces.create({ source: { kind: "directory", path: cwd, projectId: p.projectId }, title });
 }
 
@@ -399,33 +481,37 @@ export async function start(project, a) {
     origin = h.shell("git remote get-url origin", repo).stdout.trim();
   }
 
-  const t = allocate(project, (t) => {
+  const baseline = kind === "worktree" ? workingCopy.gitBaseline(h, repo, a.base ?? "HEAD") : "";
+  const t = allocate(project, a.task, (t) => {
     Object.assign(t, { title: a.title.trim(), kind, repo, origin, machine, base: a.base ?? "", profile: profile.name, provider: profile.provider, ...(a.reviews ? { reviews: a.reviews } : {}) });
     if (hasBranchCheckout(t)) t.branch = branchName(project.slug, t.id, t.title);
+    if (kind === "worktree") t.working_copy = workingCopy.plan(t, baseline);
     if (kind === "ovnfs") t.ovnfs_name = ovnfs.checkoutName();
   });
-  writeAtomic(taskPath(project, t.id), a.task.trimEnd() + "\n");
 
   try {
     const c = await client(h.url);
-    const cwd = kind === "tab" ? project.path("threads", t.id) : kind === "ovnfs" ? ovnfsCwd(project, t) : repo;
+    const cwd = t.working_copy ? prepareWorktree(project, t, h) : kind === "tab" ? project.path("threads", t.id) : kind === "ovnfs" ? ovnfsCwd(project, t) : repo;
     if (kind === "tab") mkdirSync(cwd, { recursive: true });
-    const ws = kind === "tab" || kind === "ovnfs" ? await tabWorkspace(c, cwd, repo, t.title) : null;
+    const ws = kind === "checkout" ? null : await tabWorkspace(c, cwd, repo, t.title, h.remote);
+    if (t.working_copy) verifyWorktree(h, load(project, t.id));
     const handle = await (ws ? ws.agents : c.agents).create({
       config: agentConfig(profile, safety),
       cwd,
       title: `${project.displayName(settings)} · ${t.id} ${t.title}`.slice(0, 120),
       labels: { project: project.slug, role: "thread", thread: t.id },
       env: machine ? undefined : { PP_THREAD: `${project.slug}/${t.id}` },
-      ...(kind === "worktree" ? { worktree: { mode: "branch-off", newBranch: t.branch, ...(t.base ? { base: t.base } : {}) } } : {}),
     });
+    if (t.working_copy) update(project, t.id, (r) => { r.agent_id = handle.id; });
     await handle.refresh();
     const snap = handle.current();
-    const branchStart = kind === "worktree" ? h.shell(`git rev-parse --verify -q ${q(`refs/heads/${t.branch}`)}`, repo, undefined, 5000) : null;
     const placed = update(project, t.id, (r) => Object.assign(r, {
-      agent_id: handle.id, workspace_id: snap?.workspaceId ?? ws?.id ?? "", cwd: kind === "ovnfs" ? cwd : snap?.cwd ?? cwd, branch: t.branch,
-      ...(branchStart?.ok ? { branch_start: { name: t.branch, oid: branchStart.stdout.trim() } } : {}),
+      agent_id: handle.id, workspace_id: snap?.workspaceId ?? ws?.id ?? "", cwd: t.working_copy || kind === "ovnfs" ? cwd : snap?.cwd ?? cwd, branch: t.branch,
     }));
+    if (placed.working_copy) {
+      if (snap?.cwd !== cwd) throw new Error(`Paseo did not confirm the agent at its worktree ${cwd}`);
+      verifyWorktree(h, placed);
+    }
     placed.thread_dir = threadDir(placed.cwd, project.slug, t.id);
     update(project, t.id, (r) => { r.thread_dir = placed.thread_dir; });
     writeBrief(project, placed, false);
@@ -483,25 +569,55 @@ export function carryReport(h, from, to, home) {
 export async function restart(project, id, requested, opts = {}) {
   const t = load(project, id);
   if (t.status === "resolved") throw new Error(`${id} is resolved; \`thread resolve --reopen\` first`);
-  if (t.status === "starting" && secondsSince(t.created) < STARTING_TIMEOUT_SECS) throw new Error(`${id} is still starting`);
+  if (t.status === "starting" && secondsSince(t.launch_started ?? t.created) < STARTING_TIMEOUT_SECS) throw new Error(`${id} is still starting`);
   const agents = await agentsOf(project, new Set([t.machine]));
-  const live = liveOf(t, agents.get(t.agent_id), null);
-  if (live.exists && live.state !== "error") throw new Error(`${id} is running: it has an agent (${live.state}); \`thread prompt\` reaches it`);
+  const managed = Boolean(t.working_copy);
+  if (managed && agents.unreachable?.length) throw new Error(`cannot verify ${id}'s agents: ${agents.error}`);
+  for (const a of agents.values()) {
+    if (a.id !== t.agent_id && (!managed || a.labels?.thread !== id)) continue;
+    const live = liveOf(t, a, null);
+    const interrupted = t.status === "failed" || t.status === "starting";
+    if (live.exists && live.state !== "error" && !(managed && interrupted && live.state === "idle")) {
+      throw new Error(`${id} is running: it has an agent (${live.state}); \`thread prompt\` reaches it`);
+    }
+  }
   const { settings } = project.read();
   const config = loadConfig();
   const safety = loadSafety(config, project.dir);
   const profile = resolveProfile(config, safety, settings, "thread", requested || t.profile, project.slug);
   const h = host(t.machine, config);
   const c = await client(h.url);
+  if (!managed) return restartAt(project, t, h, c, agents, settings, safety, profile, opts);
+  update(project, id, (r) => {
+    if (r.status !== t.status || r.agent_id !== t.agent_id || r.launch_started !== t.launch_started) throw new Error(`${id} changed during restart; try again`);
+    r.status = "starting";
+    r.launch_started = now();
+  });
+  try { return await restartAt(project, t, h, c, agents, settings, safety, profile, opts); }
+  catch (e) {
+    update(project, id, (r) => { r.status = "failed"; r.error = e.message; });
+    throw e;
+  }
+}
+
+async function restartAt(project, t, h, c, agents, settings, safety, profile, opts) {
+  const { id } = t;
   let cwd = t.cwd, worktree;
-  if (t.kind === "ovnfs") {
+  if (t.working_copy) {
+    cwd = prepareWorktree(project, t, h);
+    for (const a of agents.values()) {
+      if ((a.id !== t.agent_id && a.labels?.thread !== id) || !liveOf(t, a, null).exists) continue;
+      const { archivedAt } = await c.agents.ref(a.id).archive();
+      if (!archivedAt) throw new Error(`Paseo did not confirm archive of agent ${a.id}`);
+    }
+  } else if (t.kind === "ovnfs") {
     requireLocalPaseo();
     cwd = ovnfsCwd(project, t);
   }
-  if (t.agent_id && agents.has(t.agent_id)) await c.agents.ref(t.agent_id).archive().catch(() => {});
+  if (!t.working_copy && t.agent_id && agents.has(t.agent_id)) await c.agents.ref(t.agent_id).archive().catch(() => {});
 
   if (t.kind === "tab") { cwd = project.path("threads", id); mkdirSync(cwd, { recursive: true }); }
-  else if (!cwd || !h.isDir(cwd)) {
+  else if (!t.working_copy && (!cwd || !h.isDir(cwd))) {
     if (t.kind !== "worktree") throw new Error(`${t.repo} is gone`);
     if (!t.branch || !h.shell(`git show-ref --verify --quiet ${q(`refs/heads/${t.branch}`)}`, t.repo).ok) throw new Error(`${id}'s worktree and branch are both gone; start a new thread`);
     cwd = t.repo;
@@ -513,7 +629,8 @@ export async function restart(project, id, requested, opts = {}) {
   const cfg = agentConfig(profile, safety);
   const title = `${project.displayName(settings)} · ${id} ${t.title}`.slice(0, 120);
   const labels = { project: project.slug, role: "thread", thread: id };
-  const ws = t.kind === "tab" || t.kind === "ovnfs" ? await tabWorkspace(c, cwd, t.repo, t.title) : null;
+  const ws = t.working_copy || t.kind === "tab" || t.kind === "ovnfs" ? await tabWorkspace(c, cwd, t.repo, t.title, h.remote) : null;
+  if (t.working_copy) verifyWorktree(h, load(project, id));
   let handle;
   if (session) {
     // shortcut: an imported agent has no PP_THREAD; the brief's `report` command names the thread anyway.
@@ -528,18 +645,25 @@ export async function restart(project, id, requested, opts = {}) {
       ...(worktree ? { worktree } : {}),
     });
   }
+  if (t.working_copy) update(project, id, (r) => { r.agent_id = handle.id; });
   await handle.refresh();
   const snap = handle.current();
   const placed = update(project, id, (r) => Object.assign(r, {
-    agent_id: handle.id, workspace_id: snap?.workspaceId ?? ws?.id ?? r.workspace_id, cwd: t.kind === "ovnfs" ? cwd : snap?.cwd ?? cwd,
-    profile: profile.name, provider: profile.provider, status: "open", error: "", session,
+    agent_id: handle.id, workspace_id: snap?.workspaceId ?? ws?.id ?? r.workspace_id, cwd: t.working_copy || t.kind === "ovnfs" ? cwd : snap?.cwd ?? cwd,
+    profile: profile.name, provider: profile.provider, session,
+    ...(t.working_copy ? {} : { status: "open", error: "" }),
   }));
+  if (placed.working_copy) {
+    if (snap?.cwd !== cwd) throw new Error(`Paseo did not confirm the agent at its worktree ${cwd}`);
+    verifyWorktree(h, placed);
+  }
   placed.thread_dir = threadDir(placed.cwd, project.slug, id);
   update(project, id, (r) => { r.thread_dir = placed.thread_dir; });
   carryReport(h, t.thread_dir, placed.thread_dir, readText(homeReportPath(project, id)));
   writeBrief(project, placed, true);
+  if (placed.working_copy) refreshBranch(project, placed);
   await handle.send(launchPrompt(project.slug, id));
-  return placed;
+  return placed.working_copy ? update(project, id, (r) => { r.status = "open"; r.error = ""; }) : placed;
 }
 
 // ------------------------------------------------------------ talking to a thread
@@ -560,6 +684,10 @@ export async function prompt(project, id, text) {
   const t = load(project, id);
   if (t.status === "resolved") throw new Error(`${id} is resolved`);
   const { handle, snap } = await handleOf(project, t);
+  if (t.working_copy) {
+    if (snap.cwd !== t.cwd) throw new Error(`Paseo did not confirm the agent at its worktree ${t.cwd}`);
+    verifyWorktree(host(t.machine), t);
+  }
   if (snap.pendingPermissions?.length) throw new Error(`${id} is blocked on a permission request: \`thread permissions ${project.slug} ${id}\` shows it; answer it first`);
   appendFollowUp(project, id, text);
   const state = snap.status === "running" ? "working" : snap.status;
@@ -609,6 +737,10 @@ export function describePermission(p) {
 export async function answer(project, id, { behavior, request, action, message, answers }) {
   const t = load(project, id);
   const { handle, snap } = await handleOf(project, t);
+  if (t.working_copy && behavior === "allow") {
+    if (snap.cwd !== t.cwd) throw new Error(`Paseo did not confirm the agent at its worktree ${t.cwd}`);
+    verifyWorktree(host(t.machine), t);
+  }
   const pending = snap.pendingPermissions ?? [];
   if (!pending.length) throw new Error(`${id} has no pending permission request`);
   const p = request ? pending.find((x) => x.id === request) : pending.length === 1 ? pending[0] : null;
@@ -638,7 +770,9 @@ export function reportProgress(project, id, percent, activity) {
 export function refreshBranch(project, t) {
   if (!hasBranchCheckout(t) || !t.cwd) return t;
   try {
-    const r = host(t.machine).shell("git branch --show-current", t.cwd, undefined, 5000);
+    const h = host(t.machine);
+    if (t.working_copy) verifyWorktree(h, t);
+    const r = h.shell("git branch --show-current", t.cwd, undefined, 5000);
     const b = r.ok ? r.stdout.trim() : "";
     if (b && b !== t.branch) return update(project, t.id, (x) => { x.branch = b; });
   } catch {}
@@ -663,7 +797,10 @@ async function archiveWorkspace(url, id) {
 export async function clean(project, t, { keepWorktree = false, copyComplete = true, archive, mergedHead = "", dryRun = false } = {}) {
   const notes = [];
   let h;
-  try { h = host(t.machine); } catch (e) { return [e.message]; }
+  try {
+    h = host(t.machine);
+    if (t.working_copy) verifyWorktree(h, t);
+  } catch (e) { return [e.message]; }
   let agentArchived = !t.agent_id || dryRun;
   if (t.agent_id && !dryRun) {
     try {
@@ -683,13 +820,19 @@ export async function clean(project, t, { keepWorktree = false, copyComplete = t
   const paseoAutoArchive = t.kind === "worktree" && t.workspace_id ? await autoArchiveAfterMerge(h.url) : { on: false };
   const refreshArchive = t.kind === "ovnfs" ? () => finalCopy(project, t) : undefined;
   let done;
-  try { done = await cleanup.run(project, t, h, { keepWorktree, copyComplete, archive, refreshArchive, agentArchived, mergedHead, dryRun, paseoAutoArchive }); }
+  try {
+    if (t.working_copy) verifyWorktree(h, t);
+    done = await cleanup.run(project, t, h, { keepWorktree, copyComplete, archive, refreshArchive, agentArchived, mergedHead, dryRun, paseoAutoArchive });
+  }
   catch (e) { return [...notes, `cleanup failed: ${e.message}; \`thread cleanup ${project.slug} ${t.id}\` retries`]; }
   notes.push(...done.notes);
   if (dryRun || t.kind !== "worktree") return notes;
   if (!done.worktreeGone) {
     if (t.workspace_id) notes.push("Paseo workspace kept: archiving it could delete the worktree");
     return notes;
+  }
+  if (t.working_copy && done.items.some((i) => i.kind === "worktree" && i.status === "removed")) {
+    update(project, t.id, (r) => { r.working_copy.phase = "removed"; r.working_copy.blocker = ""; });
   }
   if (t.workspace_id) notes.push(await archiveWorkspace(h.url, t.workspace_id));
   if (mergedHead && t.branch) {
@@ -728,8 +871,10 @@ function cleanReviewBranch(h, t) {
 
 /** Final copy, then resolved, then cleanup, then one inbox item. */
 export async function resolve(project, id, { keepWorktree = false, force = false, skipCopy = false, reason = "user", mergedHead = "", why } = {}) {
-  const t = refreshBranch(project, load(project, id));
+  let t = load(project, id);
   if (t.status === "resolved") throw new Error(`${id} is already resolved; \`thread cleanup ${project.slug} ${id}\` cleans what is left of it`);
+  if (t.working_copy) verifyWorktree(host(t.machine), t);
+  t = refreshBranch(project, t);
   let copied = { outcome: "complete", notes: [] };
   if (!skipCopy) {
     copied = finalCopy(project, t);
@@ -748,6 +893,10 @@ export async function resolve(project, id, { keepWorktree = false, force = false
 function finalCopy(project, t) {
   if (t.kind === "ovnfs" && t.cwd) {
     try { ovnfs.mounted(t); }
+    catch (e) { return { outcome: "failed", notes: [], error: e.message }; }
+  }
+  if (t.working_copy) {
+    try { verifyWorktree(host(t.machine), t); }
     catch (e) { return { outcome: "failed", notes: [], error: e.message }; }
   }
   let excludes = [];

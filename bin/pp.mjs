@@ -146,6 +146,13 @@ async function main() {
     case "safety": return safetyCommand(pos.slice(1), f, root, proj);
     case "profile": return profileCommand(pos.slice(1), f, root, proj);
     case "board": {
+      if (a1 === "thread") {
+        const p = proj(a2, "board thread <slug> <id>");
+        const t = threads.load(p, need(a3, "board thread <slug> <id>"));
+        const report = readText(threads.homeReportPath(p, t.id));
+        console.log(JSON.stringify({ report: report || "(no report yet)", next: threads.allNext(p, t.id), cwd: t.cwd ?? "", status: t.status ?? "", error: t.error ?? "", working_copy: t.working_copy ?? null }));
+        return;
+      }
       if (a1 === "settings") { const choices = await boardChoices(root); console.log(JSON.stringify({ ...boardData(root, a1, choices.kinds), choices })); return; }
       if (a1 !== "edit") { console.log(JSON.stringify(boardData(root, a1))); return; }
       // Runs the edit as its own command line, so the dialog and the error name that command.
@@ -189,6 +196,11 @@ async function threadCommand([sub, slug, id], f, root, proj) {
       console.log(threads.rowLine(r));
       console.log(`state: ${threads.stateLine(r.live)}`);
       for (const [k, v] of [["kind", t.kind], ["branch", t.branch], ["cwd", t.cwd], ["agent", t.agent_id], ["created", t.created], ["pr", t.pr && `${t.pr} (${t.pr_state}${t.pr_review ? `, ${t.pr_review}` : ""})`], ["error", t.error], ["report", threads.homeReportPath(p, t.id)]]) if (v) console.log(`${k}: ${v}`);
+      if (t.working_copy) {
+        const w = t.working_copy;
+        console.log(`working copy: ${w.backend} (${w.phase}) ${w.path}\nbaseline: ${w.baseline}`);
+        if (w.blocker) console.log(`working copy blocker: ${w.blocker}`);
+      }
       threads.allNext(p, t.id).forEach((l, i) => console.log(`next ${i + 1}: ${l}`));
       return;
     }

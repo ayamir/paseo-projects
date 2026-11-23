@@ -19,7 +19,7 @@ The coordinator never does the work itself, so it's always free to answer you. E
 | herdr-projects | paseo-projects |
 |---|---|
 | coordinator pane | a Paseo agent in the project folder, labelled `project=<slug>, role=coordinator` |
-| thread pane and worktree | a Paseo agent with a `branch-off` worktree, branch `pp-<slug>-t-NNNN-<title>` |
+| thread pane and worktree | a Paseo agent in a Git worktree registered and created by `pp`, branch `pp-<slug>-t-NNNN-<title>` |
 | reading the pane, sending keys | Paseo's structured permission requests: `thread permissions`, `allow`, `deny` |
 | typing a prompt | `send` with `steer`, so a busy agent gets it inside its current turn |
 | SSH machines | remote Paseo daemons (`machines.<name>.url`), plus `ssh` to copy reports home |

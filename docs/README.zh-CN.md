@@ -18,7 +18,7 @@ node bin/pp.mjs open myproj       # 启动 coordinator 和常驻 ticker
 | herdr-projects | paseo-projects |
 |---|---|
 | coordinator pane | Paseo agent，cwd 为项目目录，labels `project=<slug>, role=coordinator` |
-| thread pane + worktree | Paseo agent，`worktree: branch-off`，labels `role=thread, thread=t-NNNN`，分支 `pp-<slug>-t-NNNN-<title>` |
+| thread pane + worktree | `pp` 登记并创建 Git worktree，Paseo agent 在其中运行，labels `role=thread, thread=t-NNNN`，分支 `pp-<slug>-t-NNNN-<title>` |
 | `thread read` / `thread keys` | `thread permissions` / `thread allow` / `thread deny`（Paseo 的结构化权限请求） |
 | 粘贴 brief | brief 写入 `<worktree>/.paseo-project/<slug>-<id>/brief.md`，并发送一行启动提示 |
 | `prompt` 打字回车 | `send`，使用 `activeTurnBehavior: "steer"`（忙时插入当前回合） |
