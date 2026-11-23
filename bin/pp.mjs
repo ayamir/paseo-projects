@@ -177,7 +177,7 @@ async function threadCommand([sub, slug, id], f, root, proj) {
         ({ profile, machine } = tasks.launchFor(found, profile, machine));
         task = tasks.delegated(text, f["from-task"], task || found.title);
       }
-      const { thread: t, warnings } = await threads.start(p, { title: f.title, task, repo: f.repo, kind: f.kind, machine: machine ?? undefined, profile: profile ?? undefined, base: f.base, reviews: f.reviews, from_snapshot: f["from-snapshot"] });
+      const { thread: t, warnings } = await threads.start(p, { title: f.title, task, repo: f.repo, kind: f.kind, machine: machine ?? undefined, profile: profile ?? undefined, base: f.base, reviews: f.reviews, from_snapshot: f["from-snapshot"], inherit_dirty: f["inherit-dirty"] });
       warnings.forEach((w) => console.log(`warning: ${w}`));
       console.log(`started ${t.id} (${t.kind}${t.branch ? `, branch ${t.branch}` : ""}, profile ${t.profile}) agent ${t.agent_id}`);
       return;
@@ -214,6 +214,10 @@ async function threadCommand([sub, slug, id], f, root, proj) {
       const copies = threads.resourceView(p, t);
       for (const w of [copies.working_copy, ...copies.working_copies].filter(Boolean)) {
         console.log(`working copy: ${w.backend} (${w.phase}) ${w.path}\nbaseline: ${w.baseline}\nresource: ${w.nonce}`);
+        if (w.selection) console.log(`working copy fallback (${w.selection.policy}): ${w.selection.reason}`);
+        if (w.seed?.oid) console.log(`dirty seed: ${w.seed.oid}`);
+        if (w.retained_input) console.log(`retained input: ${w.retained_input.path} (${w.retained_input.reason})`);
+        if (w.cache) console.log(`working copy cache: ${w.cache.state}${w.cache.reason ? ` (${w.cache.reason})` : ""}`);
         if (w.disposal) {
           console.log(`disposal: ${w.disposal.phase}`);
           if (w.disposal.evidence) console.log(`disposal evidence: ${w.disposal.evidence.path}`);

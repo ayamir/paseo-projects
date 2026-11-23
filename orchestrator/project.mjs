@@ -103,8 +103,11 @@ export function writeAgentsMd(project) {
   writeJson(project.path(".claude", "settings.json"), { permissions: { allow: [`Bash(${prefix(project.root)}:*)`, `Edit(/${project.dir}/**)`] } });
 }
 
+const WORKING_COPY_SETTINGS = ["working_copy_max_resources", "working_copy_min_free_bytes", "working_copy_policy"];
+
 export function frontMatter(settings) {
   const lines = ["name", "goal", "coordinator_profile", "thread_profile", "max_parallel_threads", "auto_resolve_days", "nudge", "mute", "pr_checks"].map((k) => tomlLine(k, settings[k] ?? DEFAULT_SETTINGS[k]));
+  for (const k of WORKING_COPY_SETTINGS) if (settings[k] !== undefined) lines.push(tomlLine(k, settings[k]));
   for (const r of settings.repos ?? []) {
     lines.push("", "[[repos]]", tomlLine("path", r.path));
     if (r.machine) lines.push(tomlLine("machine", r.machine));
@@ -147,6 +150,9 @@ export const SET_KEYS = {
   name: "text", goal: "text", coordinator_profile: "profile name", thread_profile: "profile name",
   max_parallel_threads: "number", auto_resolve_days: "number (0 = never)", nudge: "true/false", mute: "true/false",
   pr_checks: "true/false (false: CI check results are ignored: no inbox item, notification or checks-failed routine)",
+  working_copy_max_resources: "project limit for managed copies, snapshots and retained input repositories (whole number or off)",
+  working_copy_min_free_bytes: "free-space warning line in bytes on each allocation volume (whole number or off)",
+  working_copy_policy: "git-worktree (default) or ovnfs-preferred (preflight fallback only)",
   "repos.add": "PATH or PATH@MACHINE", "repos.remove": "PATH",
 };
 export function applySetting(settings, key, value) {
@@ -155,6 +161,18 @@ export function applySetting(settings, key, value) {
   const num = (v) => { if (!/^\d+$/.test(v)) throw new Error(`${key} takes a whole number`); return Number(v); };
   switch (key) {
     case "name": case "goal": case "coordinator_profile": case "thread_profile": s[key] = value; break;
+    case "working_copy_max_resources": case "working_copy_min_free_bytes": {
+      if (value === "off") delete s[key];
+      else {
+        s[key] = num(value);
+        if (!Number.isSafeInteger(s[key])) throw new Error(`${key} takes a safe whole number or off`);
+      }
+      break;
+    }
+    case "working_copy_policy":
+      if (!["git-worktree", "ovnfs-preferred"].includes(value)) throw new Error("working_copy_policy takes git-worktree or ovnfs-preferred");
+      s[key] = value;
+      break;
     case "max_parallel_threads": s[key] = Math.max(1, num(value)); break;
     case "auto_resolve_days": s[key] = num(value); break;
     case "nudge": case "mute": case "pr_checks": s[key] = bool(value); break;

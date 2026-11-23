@@ -4,6 +4,7 @@ import { dirname, isAbsolute, join } from "node:path";
 import { lstatSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { sh } from "./lib.mjs";
+import { verifyCapture } from "./copy-inputs.mjs";
 
 const PIN = "v0.8.0";
 const ADMIN = fileURLToPath(new URL("./ovnfs-admin.mjs", import.meta.url));
@@ -81,13 +82,13 @@ export function plan(t, baseline, ns, parent = null) {
   const nonce = randomUUID(), name = `pp-${nonce}`;
   return { owner: t.id, backend: "ovnfs", phase: "planned", baseline, source: t.repo, machine: t.machine,
     branch: t.branch, path: join(ns.mount, name), nonce, identity: null, blocker: "", depends_on: parent ? [parent.nonce] : [],
-    ovnfs: { namespace: ns, name, ...(parent ? { from: { owner: parent.owner, resource: parent.resource, base: parent.ovnfs.from.base, snapshot: parent.identity } } : {}) } };
+    ovnfs: { namespace: ns, name, ...(parent ? { capture: parent.ovnfs.capture, from: { owner: parent.owner, resource: parent.resource, base: parent.ovnfs.from.base, snapshot: parent.identity } } : {}) } };
 }
 
 export function snapshotPlan(source, resource) {
   const { owner, baseline, machine, source: repo } = source, nonce = randomUUID();
   return { owner, backend: "ovnfs", resource, phase: "planned", baseline, source: repo, machine, branch: "", path: "", nonce, identity: null, blocker: "",
-    depends_on: [source.nonce], ovnfs: { namespace: source.ovnfs.namespace, label: `pp-${nonce}`, from: { checkout: source.identity.name, base: source.identity.base, parent: source.identity.parent } } };
+    depends_on: [source.nonce], ovnfs: { namespace: source.ovnfs.namespace, capture: source.ovnfs.capture, label: `pp-${nonce}`, from: { checkout: source.identity.name, base: source.identity.base, parent: source.identity.parent } } };
 }
 
 function registry(h, ns) {
@@ -128,10 +129,12 @@ export function ensureAvailable(h, w) {
 }
 
 export function create(h, w) {
-  const { namespace: ns, name, label, from } = w.ovnfs;
+  const { namespace: ns, name, label, from, capture } = w.ovnfs;
   if (label) return admin(h, ns, "snap", { checkout: from.checkout, label, wait: true });
   if (from) return admin(h, ns, "new", { snapshot: from.snapshot.id, name });
-  return admin(h, ns, "new", { dir: w.source, name, rev: w.baseline, rules: ["hidden *"] });
+  if (!capture?.oid) throw new Error("OVNFS needs a verified clean capture; no checkout was allocated");
+  verifyCapture(capture);
+  return admin(h, ns, "new", { dir: capture.path, name, rev: capture.oid, rules: ["hidden *"] });
 }
 
 function git(cwd, ...args) {
@@ -147,7 +150,7 @@ function checkoutIdentity(h, w, creating = false) {
   if (from && creating) verifySnapshot(ls.snapshots, from.snapshot);
   const found = ls.checkouts.filter((c) => c.name === name || c.path === w.path);
   const c = found[0];
-  if (found.length !== 1 || c.name !== name || c.path !== w.path || c.source !== w.source || !nonempty(c.base) || !stamp(c.created) || Date.parse(c.created) < Date.parse(started_at) || c.git !== true || c.jj ||
+  if (found.length !== 1 || c.name !== name || c.path !== w.path || c.source !== (w.ovnfs.capture?.path ?? w.source) || !nonempty(c.base) || !stamp(c.created) || Date.parse(c.created) < Date.parse(started_at) || c.git !== true || c.jj ||
       (c.parent ?? "") !== (from?.snapshot.id ?? "") || (from && c.base !== from.base)) {
     throw new Error(`OVNFS checkout identity could not be confirmed at ${w.path}`);
   }
@@ -163,7 +166,7 @@ function checkoutIdentity(h, w, creating = false) {
   const identity = { name, base: c.base, created: c.created, parent: c.parent ?? "", git_dir: gd, directory: fileId(w.path), registration: fileId(gd) };
   if (creating) {
     const oid = git(w.path, "rev-parse", "--verify", "HEAD^{commit}");
-    if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(oid) || (!from && oid !== w.baseline)) throw new Error(`OVNFS checkout does not match its baseline at ${w.path}`);
+    if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(oid) || (!from && oid !== (w.seed?.oid ?? w.baseline))) throw new Error(`OVNFS checkout does not match its baseline at ${w.path}`);
     try { writeFileSync(mark, `${w.nonce}\n${oid}\n`, { flag: "wx", mode: 0o600 }); } catch (e) { if (e.code !== "EEXIST") throw e; }
     identity.initial_oid = oid;
   } else identity.initial_oid = w.identity?.initial_oid;

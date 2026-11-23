@@ -156,6 +156,10 @@ export function BoardScreen({ theme, layout }: PluginScreenProps) {
             <View key={worktree.nonce || `${worktree.machine}:${worktree.path}`} style={{ marginTop: 8 }}>
               <Text style={styles.meta}>工作副本：{worktree.backend} · {worktree.phase}{worktree.machine ? ` · ${worktree.machine}` : ""}</Text>
               <Text style={styles.mono}>{worktree.path}{"\n"}基线：{worktree.baseline}</Text>
+              {worktree.selection ? <Text style={styles.note}>预检回退（{worktree.selection.policy}）：{worktree.selection.reason}</Text> : null}
+              {worktree.seed?.oid ? <Text style={styles.mono}>显式起点：{worktree.seed.oid}</Text> : null}
+              {worktree.retained_input ? <Text style={styles.note}>保留输入：{worktree.retained_input.path}{"\n"}{worktree.retained_input.reason}</Text> : null}
+              {worktree.cache ? <Text style={styles.meta}>缓存：{worktree.cache.state}{worktree.cache.reason ? ` · ${worktree.cache.reason}` : ""}</Text> : null}
               {worktree.disposal ? <Text style={styles.meta}>回收：{worktree.disposal.phase}</Text> : null}
               {(worktree.blockers ?? [worktree.blocker, worktree.disposal?.blocker].filter(Boolean)).map((blocker) => <Text key={blocker} style={styles.note}>{blocker}</Text>)}
               {worktree.actions?.map((action) => <Text key={action} style={styles.mono}>{action}</Text>)}
