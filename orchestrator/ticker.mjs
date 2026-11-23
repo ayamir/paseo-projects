@@ -108,7 +108,7 @@ export async function tick(project, started = now()) {
   }
 
   // Live state, copies, transitions.
-  const open = threads.list(project).filter(threads.isOpen);
+  const open = threads.list(project).filter((t) => threads.isOpen(t) && threads.supportsKind(t));
   const agents = await threads.agentsOf(project, new Set(["", ...open.map((t) => t.machine || "")]));
   for (const m of new Set([...Object.keys(state.outages), ...(agents.unreachable ?? [])])) {
     const down = (agents.unreachable ?? []).includes(m);
@@ -166,7 +166,7 @@ async function followPrs(project, settings, state, agents, at) {
   const own = new Map();
   const ownOf = (origin) => { const h = pr.hostOf(origin); if (!own.has(h)) own.set(h, pr.ownLogin(origin)); return own.get(h); };
   let ghFailed = false;
-  for (let t of threads.list(project).filter(threads.isOpen)) {
+  for (let t of threads.list(project).filter((t) => threads.isOpen(t) && threads.supportsKind(t))) {
     t = threads.refreshBranch(project, t);
     const report = readText(threads.homeReportPath(project, t.id));
     const line = pr.prLine(report);
@@ -207,7 +207,7 @@ async function followPrs(project, settings, state, agents, at) {
 
 async function followOwnPr(project, settings, t, declared, ownOf, agents, at, reviewedUrl) {
   let url = declared ?? (t.pr || null);
-  if (!url && threads.hasBranchCheckout(t) && t.branch) url = pr.findByBranch(t.origin, t.branch);
+  if (!url && t.kind === "worktree" && t.branch) url = pr.findByBranch(t.origin, t.branch);
   if (!url) return;
   const reduced = pr.reduce(pr.view(url, t.origin), t.branch, t.origin);
   if (reduced.ignored) {
@@ -303,7 +303,7 @@ async function resolveMerged(project, t, url, s, agents, at, reviewedUrl) {
 async function autoResolve(project, settings, state, agents, at) {
   const days = settings.auto_resolve_days;
   if (!days) return;
-  for (const t of threads.list(project).filter(threads.isOpen)) {
+  for (const t of threads.list(project).filter((t) => threads.isOpen(t) && threads.supportsKind(t))) {
     if (t.status !== "open" || agentUnknown(agents, t)) continue;
     const live = threads.liveOf(t, agents.get(t.agent_id), threads.progressOf(project, t.id), at);
     if (threads.group(t, live, at).group !== "idle") continue;
