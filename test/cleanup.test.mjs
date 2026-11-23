@@ -345,15 +345,20 @@ test("managed OVNFS resolve retains every resource with the missing backend guar
   assert.ok(f.start().ok);
   assert.ok(f.pp("thread", "experiment", "demo", f.next, "--name", "scratch").ok);
   assert.ok(f.pp("thread", "snapshot", "demo", f.next, "--name", "save", "--resource", "scratch").ok);
+  const held = f.pp("thread", "hold", "demo", f.next, "--reason", "debugging", "--until", "2099-01-01T00:00:00Z");
+  assert.ok(held.ok, held.out);
   for (const cmd of [["resolve"], ["cleanup"]]) {
     const r = f.pp("thread", ...cmd, "demo", f.next);
     assert.ok(r.ok, r.out);
     assert.match(r.out, /no identity- or dependency-fenced/);
     const rec = f.show(f.next);
     assert.equal(rec.status, "resolved");
+    assert.match(rec.working_copy.disposal.blocker, /debugging/);
+    const board = JSON.parse(f.pp("board", "thread", "demo", f.next).out);
+    for (const w of [board.working_copy, ...board.working_copies]) assert.ok(w.blockers.some((b) => /no identity- or dependency-fenced/.test(b)), w.resource);
     for (const w of [rec.working_copy, ...rec.working_copies]) {
       assert.equal(w.disposal.phase, "retained", w.resource);
-      assert.match(w.disposal.blocker, /OVNFS v0\.8\.0 has no identity- or dependency-fenced rm\/drop/);
+      assert.match(w.disposal.check_blocker ?? w.disposal.blocker, /OVNFS v0\.8\.0 has no identity- or dependency-fenced rm\/drop/);
       assert.notEqual(w.phase, "removed");
       if (w.path) assert.ok(existsSync(w.path), w.path);
     }

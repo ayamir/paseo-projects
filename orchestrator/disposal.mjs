@@ -267,9 +267,12 @@ function evidence(project, w, manifest) {
 export const OVNFS_RETAINED = "OVNFS v0.8.0 has no identity- or dependency-fenced rm/drop, so pp cannot prove removal safe and keeps this resource";
 
 function retainOvnfs(w, { keepWorktree, holdBlocker, dryRun, save }) {
-  const blocker = holdBlocker || (keepWorktree || w.kept_worktree ? `explicit --keep-worktree hold; ${OVNFS_RETAINED}` : OVNFS_RETAINED);
-  if (!dryRun && (w.disposal?.phase !== "retained" || w.disposal.blocker !== blocker)) save({ phase: "retained", blocker });
-  return { gone: false, note: `OVNFS ${w.resource} kept: ${w.path || w.identity?.id || w.nonce}: ${blocker}` };
+  const hold = holdBlocker || (keepWorktree || w.kept_worktree ? "explicit --keep-worktree hold" : "");
+  const blocker = hold || OVNFS_RETAINED;
+  if (!dryRun && (w.disposal?.phase !== "retained" || w.disposal.blocker !== blocker || (w.disposal.hold_blocker ?? "") !== hold)) {
+    save({ phase: "retained", blocker, ...(hold ? { hold_blocker: hold, check_blocker: OVNFS_RETAINED } : {}) });
+  }
+  return { gone: false, note: `OVNFS ${w.resource} kept: ${w.path || w.identity?.id || w.nonce}: ${[hold, OVNFS_RETAINED].filter(Boolean).join("; ")}` };
 }
 
 export function dispose(project, t, h, w, options) {
