@@ -14,7 +14,7 @@ import { LifecycleBusy, withLifecycleLock } from "./lifecycle-lock.mjs";
 import * as ovnfs from "./ovnfs.mjs";
 import * as managedOvnfs from "./managed-ovnfs.mjs";
 import * as workingCopy from "./working-copy.mjs";
-import { capturePlan, checkCapacity, createCapture, importSeed, materializeCache, planCache } from "./copy-inputs.mjs";
+import { capturePlan, checkCapacity, createCapture, importSeed, materializeCache, planCache, verifySeed } from "./copy-inputs.mjs";
 import { validPrUrl } from "./pr.mjs";
 
 
@@ -392,7 +392,9 @@ function reconcileWorktree(project, t, h) {
       if (worktreeRecord(t).phase !== "ready") throw e;
     }
     if (identity) {
-      const cache = stageCache(project, h, worktreeRecord(t), identity, (intent) => {
+      const w = worktreeRecord(t);
+      if (w.seed) verifySeed(w, w.path);
+      const cache = stageCache(project, h, w, identity, (intent) => {
         update(project, t.id, (r) => { worktreeRecord(r).cache = intent; });
       });
       t = update(project, t.id, (r) => {
@@ -538,7 +540,10 @@ function prepareCheckout(project, t, h) {
       const w = t.working_copy;
       admitWorkingCopy(project, h, { repo: w.backend === "git-worktree" ? w.source : undefined, namespace: w.ovnfs?.namespace, inputs: Boolean(w.seed || w.ovnfs?.capture) });
       t = prepareInputs(project, t, { recoverSeed: true });
-      if (w.backend === "git-worktree" && t.working_copy.seed) importSeed(t.working_copy);
+      if (t.working_copy.seed) {
+        if (w.backend === "git-worktree") importSeed(t.working_copy);
+        else verifySeed(t.working_copy);
+      }
       copyBackend(t.working_copy).ensureAvailable?.(h, t.working_copy);
       t = update(project, t.id, (r) => {
         const w = worktreeRecord(r);

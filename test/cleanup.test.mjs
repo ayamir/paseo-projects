@@ -233,6 +233,10 @@ const server = createServer((client) => {
         mkdirSync(join(state, "git"), { recursive: true });
         git("clone", "--no-checkout", "--", dir, path);
         git("-C", path, "checkout", "--detach", rev);
+        if (behavior === "seed-byte-mismatch") {
+          const file = join(path, "package.json");
+          writeFileSync(file, readFileSync(file, "utf8").replace(/\\n/g, "\\r\\n"));
+        }
         if (input) for (const f of readdirSync(input.disk)) cpSync(join(input.disk, f), join(path, f), { recursive: true });
         git("-C", path, "config", "ovnfs.checkout", name);
         renameSync(join(path, ".git"), gd);
@@ -1201,6 +1205,72 @@ for (const backend of ["git-worktree", "ovnfs"]) test(`managed inputs: ${backend
   assert.equal(git(restored, "rev-parse", "HEAD^"), base);
   assert.equal(readFileSync(join(restored, "package.json"), "utf8"), '{"effective": true}\n');
   assert.equal(existsSync(join(restored, "package-lock.json")), false);
+});
+
+for (const backend of ["git-worktree", "ovnfs"]) test(`managed inputs: ${backend} restores exact UTF-16LE dirty seed bytes`, { skip: backend === "ovnfs" && process.platform !== "darwin" }, async (t) => {
+  const f = backend === "ovnfs" ? await managedOvnfsFixture(t, "off", "off") : await managedFixture(t);
+  const file = "package.json", source = join(f.repo, file);
+  write(join(f.repo, ".gitattributes"), `${file} working-tree-encoding=UTF-16LE\n`);
+  write(source, Buffer.from('{"base": "a"}\n', "utf16le"));
+  git(f.repo, "add", "--", ".gitattributes", file); git(f.repo, "commit", "-qm", "encoded source");
+  const edited = Buffer.from('{"edit": "one"}\n', "utf16le");
+  write(source, edited);
+  const r = f.start("--inherit-dirty"); assert.ok(r.ok, r.out);
+  const w = f.show(f.next ?? f.id).working_copy;
+  assert.equal(w.phase, "ready");
+  assert.ok(readFileSync(join(w.path, file)).equals(edited), "checkout must preserve the working bytes");
+  assert.ok(readFileSync(join(w.seed.path, file)).equals(edited), "retained seed must preserve the working bytes");
+  assert.ok(readFileSync(source).equals(edited), "source must remain unchanged");
+  const restored = join(f.root, "encoded-restored");
+  git(f.root, "clone", "--no-local", "--", w.seed.path, restored);
+  assert.ok(readFileSync(join(restored, file)).equals(edited), "independent Git restore must preserve the working bytes");
+});
+
+for (const backend of ["git-worktree", "ovnfs"]) test(`managed inputs: ${backend} restores CRLF and refuses non-round-tripping LF under eol=crlf`, { skip: backend === "ovnfs" && process.platform !== "darwin" }, async (t) => {
+  const f = backend === "ovnfs" ? await managedOvnfsFixture(t, "off", "off") : await managedFixture(t);
+  const file = "package.json", source = join(f.repo, file);
+  write(join(f.repo, ".gitattributes"), `${file} text eol=crlf\n`);
+  write(source, '{"base": true}\r\n');
+  git(f.repo, "add", "--", ".gitattributes", file); git(f.repo, "commit", "-qm", "CRLF source");
+  const id = f.next ?? f.id, crlf = Buffer.from('{"crlf": true}\r\n');
+  write(source, crlf);
+  const first = f.start("--inherit-dirty"); assert.ok(first.ok, first.out);
+  const w = f.show(id).working_copy, restored = join(f.root, "crlf-restored");
+  git(f.root, "clone", "--no-local", "--", w.seed.path, restored);
+  for (const path of [w.path, w.seed.path, restored]) assert.ok(readFileSync(join(path, file)).equals(crlf), "exact CRLF is restorable");
+
+  // Even when canonical content is from HEAD, normalizing edited working bytes
+  // on restore is not equivalent to inheriting the requested source.
+  const lf = Buffer.from('{"base": true}\n');
+  write(source, lf);
+  const failed = f.start("--inherit-dirty"); assert.equal(failed.ok, false);
+  assert.match(failed.out, /dirty seed does not round-trip to the source working-tree bytes/);
+  const next = f.show(`t-${Number(id.slice(2)) + 1}`).working_copy;
+  assert.equal(next.phase, "planned"); assert.equal(existsSync(next.path), false);
+  if (backend === "ovnfs") assert.equal(f.calls().filter((m) => m.new).length, 1);
+  assert.ok(readFileSync(source).equals(lf), "refusal preserves the source bytes");
+});
+
+for (const backend of ["git-worktree", "ovnfs"]) test(`managed inputs: ${backend} blocks an allocated checkout with changed seed bytes`, { skip: backend === "ovnfs" && process.platform !== "darwin" }, async (t) => {
+  const f = backend === "ovnfs" ? await managedOvnfsFixture(t, "seed-byte-mismatch", "off") : await managedFixture(t);
+  const file = "package.json", source = join(f.repo, file), expected = Buffer.from('{"dirty": true}\n');
+  write(source, expected);
+  if (backend === "git-worktree") {
+    // A normal linked Git worktree uses local .git/info/attributes, which were
+    // not (and must not be) carried into the independently recoverable seed.
+    write(join(f.repo, ".git/info/attributes"), `${file} text eol=crlf\n`);
+  }
+  const failed = f.start("--inherit-dirty"); assert.equal(failed.ok, false);
+  assert.match(failed.out, /dirty seed does not round-trip.*in the allocated checkout/);
+  const id = f.next ?? f.id;
+  const w = f.show(id).working_copy;
+  assert.equal(w.phase, "creating");
+  assert.ok(readFileSync(join(w.seed.path, file)).equals(expected), "retained seed is unaffected by the backend conversion");
+  assert.ok(readFileSync(source).equals(expected), "source remains unchanged");
+  const retry = f.pp("thread", "restart", "demo", id, "--fresh");
+  assert.equal(retry.ok, false); assert.match(retry.out, /dirty seed does not round-trip.*in the allocated checkout/);
+  assert.equal(f.show(id).working_copy.nonce, w.nonce);
+  if (backend === "ovnfs") assert.equal(f.calls().filter((m) => m.new).length, 1);
 });
 
 test("managed inputs: ordinary Git filters still work without a verified cache claim", async (t) => {
