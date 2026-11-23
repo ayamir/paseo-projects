@@ -1,6 +1,90 @@
 // The Git backend owns the linked worktree before Paseo is asked to run an agent in it.
 import { randomUUID } from "node:crypto";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
+import { closeSync, constants, lstatSync, openSync, readFileSync, readSync, realpathSync } from "node:fs";
+import { sh } from "./lib.mjs";
+
+export const commitOid = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
+
+function readGit(path, ...args) {
+  const env = Object.fromEntries(Object.keys(process.env).filter((k) => k.startsWith("GIT_")).map((k) => [k, undefined]));
+  const r = sh(["git", "--no-replace-objects", "-C", path, ...args], undefined, undefined, {
+    env: { ...env, GIT_OPTIONAL_LOCKS: "0", GIT_NO_LAZY_FETCH: "1", GIT_ALLOW_PROTOCOL: "" }, timeout: 5000,
+  });
+  if (!r.ok || r.stderr || r.stdout.includes("�")) throw new Error("could not read Git registration or origin");
+  return r.stdout.replace(/\n$/, "");
+}
+
+export function linkedWorktrees(source) {
+  const raw = readGit(source, "worktree", "list", "--porcelain", "-z");
+  if (!raw.endsWith("\0\0")) throw new Error("malformed Git worktree registry");
+  return raw.slice(0, -2).split("\0\0").map((row) => {
+    const [p, ...fields] = row.split("\0");
+    const path = p.slice("worktree ".length);
+    if (!p.startsWith("worktree ") || !isAbsolute(path)) throw new Error("malformed Git worktree registry");
+    const branch = fields.find((f) => f.startsWith("branch refs/heads/"))?.slice("branch refs/heads/".length) ?? "";
+    const head = fields.find((f) => f.startsWith("HEAD "))?.slice(5) ?? "";
+    return { path, branch, head, unavailable: fields.some((f) => /^(locked|prunable)( |$)/.test(f)) };
+  }).slice(1); // The first entry is the source's main worktree, never an adoption candidate.
+}
+
+function birthId(path, isDir) {
+  const s = lstatSync(path, { bigint: true });
+  if (!(isDir ? s.isDirectory() : s.isFile()) || s.birthtimeNs <= 0n || realpathSync(path) !== path) throw new Error("Git resource has no stable, canonical filesystem identity");
+  return `${s.dev}:${s.ino}:${s.birthtimeNs}`;
+}
+
+export function adoptedGitIdentity({ path, source, branch }) {
+  if (!branch || /[\x00-\x1f\x7f]/.test(path) || path === source) throw new Error("adoption requires a canonical linked worktree on a named branch");
+  const directory = birthId(path, true), link = birthId(join(path, ".git"), false);
+  const git_dir = readGit(path, "rev-parse", "--absolute-git-dir");
+  const common = readGit(source, "rev-parse", "--path-format=absolute", "--git-common-dir");
+  if (readGit(path, "rev-parse", "--show-toplevel") !== path || readGit(path, "rev-parse", "--path-format=absolute", "--git-common-dir") !== common ||
+      dirname(git_dir) !== join(common, "worktrees") || readGit(path, "symbolic-ref", "HEAD") !== `refs/heads/${branch}`) {
+    throw new Error("Git worktree and source registrations do not agree");
+  }
+  const repository = birthId(common, true), registration = birthId(git_dir, true), backlink = join(git_dir, "gitdir");
+  birthId(backlink, false);
+  if (readFileSync(backlink, "utf8").replace(/\n$/, "") !== join(path, ".git")) throw new Error("Git worktree registration does not point back to the worktree");
+  for (const file of ["locked", "pp-working-copy"]) {
+    if (lstatSync(join(git_dir, file), { throwIfNoEntry: false })) throw new Error("Git registration is locked or has a PP creation marker");
+  }
+  return { git_dir, directory, registration, link, repository };
+}
+
+function initialReflog(log, head, registration) {
+  try {
+    birthId(log, false);
+    const fd = openSync(log, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    try {
+      const buf = Buffer.alloc(4096);
+      const raw = buf.subarray(0, readSync(fd, buf, 0, buf.length, 0));
+      if (!raw.includes(10)) throw new Error();
+      const [old, base] = raw.toString("utf8", 0, raw.indexOf(10)).split(" ", 2);
+      const stamp = / (\d+) [+-]\d{4}$/.exec(raw.toString("utf8", 0, raw.indexOf(10)).split("\t", 1)[0]);
+      const born = BigInt(registration.split(":")[2]) / 1_000_000_000n;
+      // Expiring and rewriting the log can reconstruct a zero predecessor, but not its original timestamp.
+      if (old !== "0".repeat(head.length) || !commitOid.test(base) || !stamp || BigInt(stamp[1]) < born - 1n || BigInt(stamp[1]) > born + 1n) throw new Error();
+      return base;
+    } finally { closeSync(fd); }
+  } catch { throw new Error("Git registration's original checkout commit cannot be verified (the origin log may have expired)"); }
+}
+
+export const adoptionBase = ({ identity }, head) => initialReflog(join(identity.git_dir, "logs", "HEAD"), head, identity.registration);
+
+export function verifyLegacyGitOrigin(identity, branch, head, origin) {
+  const log = join(dirname(dirname(identity.git_dir)), "logs", "refs", "heads", branch);
+  return adoptionBase({ identity }, head) === origin && initialReflog(log, head, identity.registration) === origin;
+}
+
+export function verifyAdoptionBase(w, base) {
+  try {
+    for (const path of [w.source, w.path]) {
+      if (readGit(path, "rev-parse", "--verify", `${base}^{commit}`) !== base) throw new Error();
+      readGit(path, "merge-base", "--is-ancestor", base, "HEAD");
+    }
+  } catch { throw new Error("adoption base must be a commit in both the source and worktree HEAD histories"); }
+}
 
 const q = (s) => `'${String(s).replace(/'/g, "'\\''")}'`;
 const fileId = `file_id() { stat -c '%d:%i' "$1" 2>/dev/null || stat -f '%d:%i' "$1"; }`;
@@ -71,12 +155,14 @@ export function recover(h, w) {
 export function verify(h, w) {
   const missing = () => new Error(`worktree identity missing or unconfirmed at ${w.path}`);
   if (w.phase !== "ready" || !w.identity) throw missing();
-  const found = inspect(h, w, false);
+  if (w.adoption && (h.remote || w.adoption.origin?.commit !== w.baseline || w.adoption.origin?.source !== w.source)) throw missing();
+  const found = w.adoption ? adoptedGitIdentity(w) : inspect(h, w, false);
   if (Object.keys(found).some((k) => found[k] !== w.identity[k])) throw new Error(`worktree identity does not match at ${w.path}`);
   return w.path;
 }
 
 export function unlockCreation(h, w) {
+  if (w.adoption) return;
   const r = h.shell(`if [ "$(cat ${q(join(w.identity.git_dir, "locked"))} 2>/dev/null)" = ${q(lockReason(w))} ]; then git worktree unlock -- ${q(w.path)}; fi`, w.path, undefined, 5000);
   if (!r.ok) throw new Error(`could not release worktree creation lock at ${w.path}: ${r.out}`);
 }

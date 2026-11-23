@@ -27,20 +27,28 @@ const workingCopy = z.object({
   owner: z.string(), backend: z.string(), phase: z.string(), baseline: z.string(), source: z.string(),
   path: z.string(), machine: z.string(), blocker: z.string(), nonce: z.string().optional(),
   blockers: z.array(z.string()).optional(), actions: z.array(z.string()).optional(),
-  identity: z.object({ git_dir: z.string(), directory: z.string(), registration: z.string() }).nullable(),
+  identity: z.object({ git_dir: z.string().optional(), directory: z.string().optional(), registration: z.string().optional() }).nullable(),
   disposal: z.object({
     phase: z.string(), blocker: z.string(),
     evidence: z.object({ path: z.string(), manifest: z.string(), bundle: z.string() }).optional(),
   }).optional(),
 });
 
-// One thread: report, Next lines, and its registered resources.
+const resourceSummary = z.object({
+  project: z.string(), owner: z.string(), backend: z.string(), phase: z.string(), path: z.string(),
+  machine: z.string(), source: z.string(), resource: z.string().optional(), baseline: z.string().optional(),
+  blockers: z.array(z.string()), actions: z.array(z.string()), candidate: z.string(),
+});
+export type ResourceSummary = z.infer<typeof resourceSummary>;
+
+// One thread: report, Next lines, and its registered and pending resources.
 export const threadDetailRpc = defineRpc({
   name: "paseo-projects.thread.detail",
   input: z.object({ project: z.string(), id: z.string() }),
   output: z.object({
     report: z.string(), next: z.array(z.string()), cwd: z.string(), status: z.string(), error: z.string(),
     working_copy: workingCopy.nullable(), working_copies: z.array(workingCopy).default([]),
+    reconciliation: z.array(resourceSummary).default([]),
   }),
 });
 
@@ -73,8 +81,8 @@ export const inboxDoneRpc = defineRpc({
   output: z.object({ ok: z.boolean(), message: z.string() }),
 });
 
-// The tasks, routines, settings and memory tabs: `pp board <section>`, as it prints it.
-export const BOARD_SECTIONS = ["tasks", "routines", "settings", "memory"] as const;
+// The board sections use the same query as `pp board <section>`.
+export const BOARD_SECTIONS = ["tasks", "routines", "settings", "memory", "resources"] as const;
 export const boardSectionRpc = defineRpc({
   name: "paseo-projects.board.section",
   input: z.object({ section: z.enum(BOARD_SECTIONS) }),

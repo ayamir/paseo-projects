@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import { Pressable, ScrollView, Text, TextInput, View } from "react-native";
 import { openExternal } from "./web";
+import type { ResourceSummary } from "../shared/tasks";
 import { boardActionRpc, boardEditRpc, boardSectionRpc, inboxDoneRpc, inboxListRpc, tasksRpc, threadActionRpc, threadDetailRpc } from "../shared/tasks";
 
 // The thread groups of `pp`, most urgent first.
@@ -20,9 +21,10 @@ const GROUPS = [
 const TABS = [
   { key: "threads", label: "线程" }, { key: "tasks", label: "任务" }, { key: "inbox", label: "Inbox" },
   { key: "routines", label: "Routines" }, { key: "settings", label: "设置" }, { key: "memory", label: "记忆" },
+  { key: "resources", label: "资源" },
 ] as const;
 type Tab = (typeof TABS)[number]["key"];
-type Section = "tasks" | "routines" | "settings" | "memory";
+type Section = Exclude<Tab, "threads" | "inbox">;
 
 type Thread = { project: string; id: string; title: string; group: string; profile: string; branch: string | null; pr: string | null; prState: string | null };
 type Item = { project: string; id: string; kind: string; subject: string; summary: string };
@@ -160,6 +162,7 @@ export function BoardScreen({ theme, layout }: PluginScreenProps) {
               {worktree.disposal?.evidence ? <Text style={styles.mono}>{worktree.disposal.evidence.path}</Text> : null}
             </View>
           ))}
+          <ResourceSummaries rows={detail.data?.reconciliation ?? []} styles={styles} />
           {detail.data?.error ? <Text style={styles.note}>{detail.data.error}</Text> : null}
           <View style={{ flexDirection: "row", flexWrap: "wrap" as const, marginTop: 10 }}>
             <Btn label="Ack 报告" theme={theme} disabled={action.isPending} onPress={() => run("ack", selected)} />
@@ -185,7 +188,19 @@ export function BoardScreen({ theme, layout }: PluginScreenProps) {
   );
 }
 
-/** The tasks, routines, settings and memory tabs; a tapped row shows its notes, prompt or text. */
+function ResourceSummaries({ rows, styles }: { rows: ResourceSummary[]; styles: any }) {
+  return <>{rows.map((r, i) => (
+    <View key={`${r.project}:${r.owner}:${r.path}:${r.resource ?? ""}:${i}`} style={styles.card}>
+      <Text style={styles.meta}>{r.project}{r.owner ? ` · ${r.owner}` : ""} · {r.backend} · {r.phase}{r.machine ? ` · ${r.machine}` : ""}</Text>
+      {r.path || r.resource ? <Text style={styles.mono}>{r.path || r.resource}</Text> : null}
+      {r.baseline ? <Text style={styles.mono}>基线：{r.baseline}</Text> : null}
+      {r.blockers.map((b) => <Text key={b} style={styles.note}>{b}</Text>)}
+      {r.actions.map((a) => <Text key={a} style={styles.mono}>{a}</Text>)}
+    </View>
+  ))}</>;
+}
+
+/** Board sections; tasks, routines, and settings offer their existing actions. */
 function SectionView({ section, theme, styles }: { section: Section; theme: PluginScreenProps["theme"]; styles: any }) {
   const client = useQueryClient();
   const load = useRpc(boardSectionRpc);
@@ -219,6 +234,7 @@ function SectionView({ section, theme, styles }: { section: Section; theme: Plug
     </>
   );
 
+  if (section === "resources") return data.length ? <ResourceSummaries rows={data} styles={styles} /> : <Text style={styles.empty}>没有待确认或待回收的资源。</Text>;
   if (section === "tasks") {
     if (!data.length) return <Text style={styles.empty}>没有任务。让 coordinator 加一条。</Text>;
     let last = "";

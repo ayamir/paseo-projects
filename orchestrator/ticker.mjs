@@ -174,7 +174,7 @@ async function followPrs(project, settings, state, agents, at) {
   let ghFailed = false;
   for (let t of threads.list(project).filter(threads.isOpen)) {
     if (t.working_copy && (t.working_copy.phase !== "ready" || t.working_copy.blocker)) continue;
-    t = threads.refreshBranch(project, t);
+    if (t.working_copy) t = threads.refreshBranch(project, t);
     const report = readText(threads.homeReportPath(project, t.id));
     const line = pr.prLine(report);
     if (line.note && t.pr_note_hash !== t.report_hash) {

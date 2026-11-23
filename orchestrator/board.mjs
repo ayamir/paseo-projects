@@ -6,14 +6,16 @@ import { loadConfig, loadSafety, listedNames, getProfile, profileSummary, SAFETY
 import { Project, listSlugs, SET_KEYS } from "./project.mjs";
 import { readTickerState } from "./coordinator.mjs";
 import * as tasks from "./tasks.mjs";
+import * as threads from "./threads.mjs";
 import * as routines from "./routines.mjs";
 
-export const SECTIONS = ["tasks", "routines", "settings", "memory"];
+export const SECTIONS = ["tasks", "routines", "settings", "memory", "resources"];
 const SETTING_KEYS = ["name", "goal", "coordinator_profile", "thread_profile", "max_parallel_threads", "auto_resolve_days", "nudge", "mute", "pr_checks"];
 
 export function boardData(root, section, kinds) {
   if (!SECTIONS.includes(section)) throw new Error(`usage: pp board ${SECTIONS.join("|")}`);
   const projects = listSlugs(root).map((s) => new Project(root, s)).filter((p) => p.status !== "archived");
+  if (section === "resources") return projects.flatMap((p) => threads.boardResources(p));
   if (section === "tasks") {
     return projects.flatMap((p) => tasks.parse(readText(p.path("TASKS.md"))).map((t) => ({
       project: p.slug, list: t.list, title: t.title, owner: tasks.ownerText(t.owner), thread: t.thread ?? "", notes: t.description.trim(),

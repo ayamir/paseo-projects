@@ -47,18 +47,31 @@ function mountCheck(ns) {
       params.filter((p) => /^(?:mount)?port=/.test(p)).length !== 2) throw new Error(`OVNFS mount ${ns.mount} is not the configured local NFS socket`);
 }
 
+function configuredNamespace() {
+  const resolveDir = (key) => {
+    const path = process.env[key];
+    if (!path || !isAbsolute(path)) throw new Error(`OVNFS ${PIN} requires an explicit absolute ${key} for a running local daemon`);
+    return realpathSync(path);
+  };
+  return namespace(resolveDir("OVNFS_STATE"), resolveDir("OVNFS_MOUNT"));
+}
+
+// Inventory is not mount or ownership proof. Never use the CLI (including ls),
+// which can start a daemon even after an earlier status check succeeded.
+export function readInventory() {
+  const h = { remote: false };
+  local(h);
+  const ns = configuredNamespace();
+  return { namespace: ns, ...registry(h, ns) };
+}
+
 export function preflight(h) {
   local(h);
   const r = sh(["ovnfs", "--json", "version"], undefined, undefined, { timeout: 5000 });
   let version;
   try { if (r.ok) version = JSON.parse(r.stdout); } catch {}
   if (version?.version !== PIN || version.os !== "darwin") throw new Error(`OVNFS ${PIN} for macOS is required; no checkout was allocated`);
-  const resolveDir = (key) => {
-    const path = process.env[key];
-    if (!path || !isAbsolute(path)) throw new Error(`OVNFS ${PIN} requires an explicit absolute ${key} for a running local daemon`);
-    return realpathSync(path);
-  };
-  const ns = namespace(resolveDir("OVNFS_STATE"), resolveDir("OVNFS_MOUNT"));
+  const ns = configuredNamespace();
   admin(h, ns, "status");
   mountCheck(ns);
   return ns;

@@ -163,7 +163,7 @@ function fixture({ inRepo = false, daemon = "" } = {}) {
   write(join(td, "report.md"), "## Report\nfinal\n\n## Next\n");
   mkdirSync(join(td, "library"));
   write(join(repo, ".git", "info", "exclude"), ".paseo-project/\n");
-  const record = { id, title: "x", status: "open", error: "", kind: "worktree", repo, origin: "", branch, base: "", machine: "", cwd: wt, thread_dir: td, agent_id: "", workspace_id: daemon ? `wks_${id}` : "", profile: "", provider: "", created: new Date().toISOString(), updated: "", last_state: "", last_state_change: "", last_group: "", report_hash: "", last_report_change: "", last_review_item_hash: "", acked_report_hash: "", pr: "", pr_state: "", pr_review: "", resolved_reason: "", kept_worktree: false, session: null };
+  const record = { id, title: "x", status: "open", error: "", kind: "worktree", repo, origin: "", branch, branch_start: { name: branch, oid: git(repo, "rev-parse", "HEAD") }, base: "", machine: "", cwd: wt, thread_dir: td, agent_id: "", workspace_id: daemon ? `wks_${id}` : "", profile: "", provider: "", created: new Date().toISOString(), updated: "", last_state: "", last_state_change: "", last_group: "", report_hash: "", last_report_change: "", last_review_item_hash: "", acked_report_hash: "", pr: "", pr_state: "", pr_review: "", resolved_reason: "", kept_worktree: false, session: null };
   writeFileSync(p.path("threads", `${id}.json`), JSON.stringify(record));
   const cbm = join(root, "cbm.json");
   writeFileSync(cbm, JSON.stringify({ projects: [] }));
@@ -223,7 +223,10 @@ const server = createServer((client) => {
       if (m.hello) { send({ welcome: { ...meta, ops: ["status", "ls", "new", "snap"] } }); continue; }
       appendFileSync(join(state, "calls"), JSON.stringify(m) + "\\n");
       if (m.status) ok({ ...meta, socket, pid: process.pid, build_version: "v0.8.0" });
-      else if (m.ls) ok({ checkouts, snapshots });
+      else if (m.ls) {
+        const extra = behavior === "discover" ? JSON.parse(readFileSync(join(state, "discovery"), "utf8")) : {};
+        ok({ checkouts: [...checkouts, ...(extra.checkouts ?? [])], snapshots: [...snapshots, ...(extra.snapshots ?? [])] });
+      }
       else if (m.new) {
         const { name, snapshot } = m.new, path = join(mount, name), gd = join(state, "git", name);
         checkIntent("name", name);
@@ -640,10 +643,12 @@ test("submodules: a populated one keeps the worktree, an empty one does not", ()
   assert.ok(existsSync(join(f.wt, "s", ".git")));
 
   const g = fixture();
-  git(g.wt, "submodule", "add", "-q", sub, "s"); git(g.wt, "commit", "-qm", "sub");
-  git(g.repo, "worktree", "remove", "--force", g.wt); // a fresh checkout of that commit: the submodule stays empty
-  git(g.repo, "worktree", "add", "-q", g.wt, g.branch);
-  write(join(g.td, "report.md"), "## Report\nfinal\n");
+  // A gitlink with an uninitialized submodule; keep the registered worktree generation unchanged.
+  write(join(g.wt, ".gitmodules"), `[submodule "s"]\n\tpath = s\n\turl = ${sub}\n`);
+  git(g.wt, "add", ".gitmodules");
+  git(g.wt, "update-index", "--add", "--cacheinfo", `160000,${git(sub, "rev-parse", "HEAD")},s`);
+  git(g.wt, "commit", "-qm", "sub");
+  mkdirSync(join(g.wt, "s"));
   const r2 = g.pp("thread", "resolve", "demo", g.id);
   assert.match(r2.out, /worktree removed/, r2.out);
 });
@@ -988,12 +993,17 @@ test("pp archive leaves the project active when the daemon does not answer, not 
   assert.equal(f.p.status, "active");
 });
 
-function ppAtTerminal(f, ...args) {
+function terminalResult(f, ...args) {
   const command = [process.execPath, PP, "--root", f.root, ...args];
   const r = spawnSync("python3", ["-I", "-c", "import pty, subprocess, sys\nmaster, terminal = pty.openpty()\nsys.exit(subprocess.call(sys.argv[1:], stdin=terminal))", ...command], {
     encoding: "utf8", env: f.env, timeout: 45_000,
   });
-  assert.equal(r.status, 0, `${r.stdout}${r.stderr}${r.error?.message ?? ""}`);
+  return { status: r.status, out: `${r.stdout}${r.stderr}${r.error?.message ?? ""}` };
+}
+
+function ppAtTerminal(f, ...args) {
+  const { status, out } = terminalResult(f, ...args);
+  assert.equal(status, 0, out);
 }
 
 async function managedFixture(t, mode = "off", withProject = false) {
@@ -1342,6 +1352,166 @@ const tickOnce = (f, started, view, clock = "") => new Promise((ok) => {
   c.stdout.on("data", (d) => (out += d)); c.stderr.on("data", (d) => (out += d));
   const timer = setTimeout(() => c.kill(), 120_000);
   c.on("exit", (code) => { clearTimeout(timer); ok({ code, out }); });
+});
+
+test("reconciliation discovers legacy and unregistered worktrees without claiming them, including on sweep and tick", async () => {
+  const f = fixture();
+  const recordPath = f.p.path("threads", `${f.id}.json`);
+  write(recordPath, JSON.stringify({ ...JSON.parse(readFileSync(recordPath)), status: "resolved" }));
+  const record = readFileSync(recordPath, "utf8");
+  const orphan = join(f.root, "unclaimed");
+  git(f.repo, "worktree", "add", "-qb", "pp-demo-t-8000-orphan", orphan);
+  const privateFile = join(f.wt, "unclassified.txt");
+  write(privateFile, "keep the historical data\n");
+  const before = git(f.repo, "worktree", "list", "--porcelain");
+
+  const query = f.pp("thread", "discover", "demo");
+  assert.ok(query.ok, query.out);
+  const found = JSON.parse(query.out);
+  const legacy = found.find((r) => r.path === f.wt);
+  assert.equal(legacy.owner, f.id);
+  assert.equal(legacy.phase, "pending-confirmation");
+  const unknown = found.find((r) => r.path === orphan);
+  assert.equal(unknown.owner, "");
+  assert.equal(unknown.backend, "git-worktree");
+  assert.equal(unknown.phase, "pending-confirmation");
+  assert.match(unknown.blockers.join("; "), /not adopted/);
+  const board = JSON.parse(f.pp("board", "resources").out);
+  assert.ok(board.some((r) => r.project === "demo" && r.candidate === unknown.candidate));
+  const detail = JSON.parse(f.pp("board", "thread", "demo", f.id).out);
+  assert.deepEqual(detail.reconciliation, [legacy]);
+
+  const result = f.pp("sweep", "demo", "--yes");
+  assert.ok(result.ok, result.out);
+  assert.equal((await tickOnce(f, new Date().toISOString(), {})).code, 0);
+  assert.equal(git(f.repo, "worktree", "list", "--porcelain"), before);
+  assert.equal(readFileSync(recordPath, "utf8"), record);
+  assert.equal(readFileSync(privateFile, "utf8"), "keep the historical data\n");
+});
+
+test("reconciliation legacy cleanup does not remove a replacement with the same path and branch", (t) => {
+  const f = fixture();
+  t.after(() => rmSync(f.root, { recursive: true, force: true }));
+  const moved = join(f.root, "historical");
+  git(f.wt, "switch", "-qc", "moved-aside");
+  git(f.repo, "worktree", "move", f.wt, moved);
+  git(f.repo, "worktree", "add", "-q", f.wt, f.branch);
+  const result = f.pp("thread", "resolve", "demo", f.id, "--skip-copy");
+  assert.ok(result.ok, result.out);
+  assert.ok(existsSync(f.wt), result.out);
+  assert.ok(existsSync(join(moved, ".paseo-project", `demo-${f.id}`, "report.md")));
+});
+
+test("reconciliation discovers the pinned OVNFS registry without adopting or mutating it", { skip: process.platform !== "darwin" }, async (t) => {
+  const f = await managedOvnfsFixture(t, "discover", "off");
+  const checkout = join(f.mount, "outside-pp");
+  const offProject = join(f.mount, "different-project");
+  const fixture = JSON.stringify({
+    checkouts: [{ name: "outside-pp", path: checkout, source: f.repo, base: "seed", created: new Date().toISOString() },
+      { name: "different-project", path: offProject, source: "/not/a/project/repo" }],
+    snapshots: [{ checkout: "outside-pp", id: "s1", label: "do-not-surface-label" }, { checkout: "departed", id: "s2" }],
+  });
+  const file = join(f.state, "discovery");
+  write(file, fixture);
+  const reply = f.pp("thread", "discover", "demo");
+  assert.ok(reply.ok, reply.out);
+  const rows = JSON.parse(reply.out);
+  const w = rows.find((r) => r.path === checkout);
+  assert.equal(w?.backend, "ovnfs");
+  assert.equal(w.phase, "pending-confirmation");
+  assert.equal(w.candidate, "");
+  assert.match(w.blockers.join(" "), /identity.*origin/);
+  assert.ok(rows.some((r) => r.resource === "s1" && r.phase === "pending-confirmation"));
+  assert.ok(rows.some((r) => r.backend === "ovnfs" && r.blockers.some((b) => /source cannot be verified/.test(b))));
+  assert.ok(!reply.out.includes(offProject) && !reply.out.includes("do-not-surface-label"));
+  assert.equal(readFileSync(file, "utf8"), fixture);
+  assert.deepEqual([...new Set(f.calls().flatMap((m) => Object.keys(m).filter((k) => k !== "id")))].sort(), ["ls", "status"]);
+});
+
+test("reconciliation adopts only the authorized Git identity and verified origin, preserving historical data and keeps", async () => {
+  const daemon = await fakeDaemon("off");
+  try {
+    const f = fixture();
+    f.env.PASEO_URL = daemon.url;
+    const recordPath = f.p.path("threads", `${f.id}.json`);
+    const orig = { ...JSON.parse(readFileSync(recordPath)), status: "resolved", kept_worktree: true };
+    write(recordPath, JSON.stringify(orig));
+    const baseline = git(f.repo, "rev-parse", "HEAD");
+    const privateFile = join(f.wt, "historical.txt");
+    write(privateFile, "unique history\n");
+    git(f.wt, "add", "historical.txt");
+    git(f.wt, "commit", "-qm", "private");
+    const privateTip = git(f.wt, "rev-parse", "HEAD");
+    const candidate = () => JSON.parse(f.pp("thread", "discover", "demo").out).find((r) => r.owner === f.id).candidate;
+    const token = candidate();
+    assert.match(token, /^[a-f0-9]{64}$/);
+    const args = (base, proof = token) => ["thread", "adopt", "demo", f.id, "--candidate", proof, "--base", base];
+    assert.match(f.pp(...args(baseline)).out, /must be run by a person/);
+    const badBase = terminalResult(f, ...args(privateTip));
+    assert.notEqual(badBase.status, 0);
+    assert.match(badBase.out, /original checkout commit/);
+    assert.deepEqual(JSON.parse(readFileSync(recordPath)), orig);
+    assert.equal(readFileSync(privateFile, "utf8"), "unique history\n");
+
+    const otherPath = join(f.root, "displaced");
+    git(f.repo, "worktree", "move", f.wt, otherPath);
+    git(f.repo, "worktree", "add", "-qb", "replacement", f.wt, baseline);
+    const stale = terminalResult(f, ...args(baseline));
+    assert.notEqual(stale.status, 0);
+    assert.match(stale.out, /no longer verified/);
+    assert.equal(readFileSync(join(otherPath, "historical.txt"), "utf8"), "unique history\n");
+    git(f.repo, "worktree", "remove", f.wt);
+    git(f.repo, "worktree", "move", otherPath, f.wt);
+    const gitDir = git(f.wt, "rev-parse", "--absolute-git-dir");
+    const before = git(f.repo, "worktree", "list", "--porcelain");
+    ppAtTerminal(f, ...args(baseline, candidate()));
+    const detail = JSON.parse(f.pp("board", "thread", "demo", f.id).out);
+    assert.deepEqual(detail.reconciliation, []);
+    const w = detail.working_copy;
+    assert.equal(w.owner, f.id);
+    assert.equal(w.backend, "git-worktree");
+    assert.equal(w.baseline, baseline);
+    assert.deepEqual(w.adoption.origin, { kind: "git-worktree-initial-commit", source: f.repo, commit: baseline });
+    assert.ok(w.blockers.some((b) => b.includes("keep-worktree")));
+    assert.equal(git(f.repo, "worktree", "list", "--porcelain"), before);
+    assert.ok(!existsSync(join(gitDir, "pp-working-copy")));
+    const ticked = await tickOnce(f, new Date().toISOString(), {});
+    assert.equal(ticked.code, 0, ticked.out);
+    const threaded = JSON.parse(readFileSync(recordPath));
+    assert.equal(threaded.kind, orig.kind);
+    assert.equal(threaded.kept_worktree, true);
+    assert.equal(git(f.wt, "rev-parse", "HEAD"), privateTip);
+    assert.equal(readFileSync(privateFile, "utf8"), "unique history\n");
+  } finally { daemon.stop(); }
+});
+
+test("reconciliation registers an unclaimed Git resource once, even after a move", async (t) => {
+  const f = await managedFixture(t);
+  const started = f.start();
+  assert.ok(started.ok, started.out);
+  const path = join(f.root, "unregistered");
+  git(f.repo, "worktree", "add", "-qb", "external", path);
+  const discoveries = () => JSON.parse(f.pp("thread", "discover", "demo").out);
+  const row = discoveries().find((r) => r.path === path);
+  assert.equal(row.owner, "");
+  const args = ["--candidate", row.candidate, "--base", row.baseline];
+  const wrong = terminalResult(f, "thread", "adopt", "demo", f.legacy, ...args);
+  assert.notEqual(wrong.status, 0);
+  assert.match(wrong.out, /cannot be assigned/);
+  const before = f.board().working_copy;
+  ppAtTerminal(f, "thread", "adopt", "demo", f.id, ...args);
+  const registered = f.board();
+  assert.deepEqual(registered.working_copy, before);
+  assert.equal(registered.working_copies[0].path, path);
+  assert.equal(registered.working_copies[0].owner, f.id);
+  assert.ok(!discoveries().some((r) => r.path === path));
+
+  const moved = join(f.root, "unregistered-moved");
+  git(f.repo, "worktree", "move", path, moved);
+  const shifted = discoveries().find((r) => r.path === moved);
+  assert.equal(shifted?.candidate, "");
+  assert.match(shifted.blockers.join(" "), /already associated/);
+  assert.equal(f.board().working_copies.length, 1);
 });
 
 test("managed holds: terminal-authorized indefinite hold and release; unknown legacy hold stays closed", async (t) => {
@@ -1719,8 +1889,8 @@ for (const kind of ["clean", "dirty", "private commit", "published commit", "ref
       assert.equal(thread().reviewed_pr?.state, "MERGED", r.out);
       assert.equal(thread().status, kind === "own PR" ? "open" : "resolved", r.out);
       assert.equal(thread().resolved_reason, kind === "own PR" ? "" : "reviewed PR merged");
-      assert.equal(existsSync(t.cwd), !byFlag, kind);
-      assert.equal(existsSync(registry), !byFlag, kind);
+      assert.ok(existsSync(t.cwd), kind);
+      assert.ok(existsSync(registry), kind);
       if (kind === "dirty") assert.equal(readFileSync(join(t.cwd, "package.json"), "utf8"), '{"dirty":true}\n');
       if (privateTip) assert.ok(git(t.cwd, "reflog", "--format=%H").includes(privateTip));
       else if (kind.endsWith("commit")) assert.equal(git(t.cwd, "log", "-1", "--format=%s"), "reviewer change");

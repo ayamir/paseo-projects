@@ -168,8 +168,10 @@ function threadDirReasons(sh_, threadDir, discards, top, strict) {
 }
 
 /** Removes a worktree with plain `git worktree remove` (never forced) once nothing in it would be lost. */
-export async function removeWorktree(h, t, { threadDir = "", discards = [], dryRun = false } = {}) {
+export async function removeWorktree(h, t, { threadDir = "", discards = [], dryRun = false, legacyGit } = {}) {
   const item = { kind: "worktree", target: t.cwd };
+  const identity = legacyGit?.();
+  if (legacyGit && !identity) return { ...item, status: "gone" };
   if (!h.isDir(t.cwd)) {
     const wl = h.shell("git worktree list --porcelain", t.repo);
     if (!wl.ok) return { ...item, status: "failed", reason: `its folder is gone and the worktrees of ${t.repo} cannot be read: ${wl.out}` };
@@ -186,6 +188,7 @@ export async function removeWorktree(h, t, { threadDir = "", discards = [], dryR
   const reason = reasons.length ? listed(reasons) : await waitForIdle(h, top, dryRun);
   if (reason) return { ...item, status: "kept", reason };
   const kib = du(h, top);
+  if (legacyGit && JSON.stringify(legacyGit()) !== JSON.stringify(identity)) return { ...item, status: "kept", reason: "the historical Git registration changed during cleanup" };
   if (dryRun) return { ...item, status: "would-remove", kib };
   const r = h.shell(`git worktree remove -- ${q(top)}`, t.repo, undefined, LONG_MS);
   if (!r.ok) return { ...item, status: h.isDir(top) && !r.timedOut ? "kept" : "failed", reason: r.timedOut ? "git worktree remove timed out part way" : r.out };
@@ -315,13 +318,21 @@ function cleanIndexes(snap, roots, retry, dryRun) {
  * Checks everything first, lists the indexes, then deletes: declared discards, the worktree, the indexes
  * rooted in what went. Kept and skipped items are decisions, failed ones are errors; none stops the rest.
  */
-export async function run(project, t, h, { keepWorktree = false, copyComplete = true, archive = { outcome: "complete" }, refreshArchive, agentArchived = true, mergedHead, dryRun = false, paseoAutoArchive = { on: false } } = {}) {
+export async function run(project, t, h, { keepWorktree = false, copyComplete = true, archive = { outcome: "complete" }, refreshArchive, agentArchived = true, mergedHead, dryRun = false, paseoAutoArchive = { on: false }, legacyGit } = {}) {
   const ovn = t.kind === "ovnfs";
   const isolated = t.kind === "worktree" || ovn;
   const kind = ovn ? "ovnfs" : "worktree";
   const checkout = { kind, target: t.cwd };
   let occupied = "";
   const archiveNotes = [];
+  if (legacyGit) {
+    try { legacyGit(); }
+    catch {
+      const items = [{ ...checkout, status: h.isDir(t.cwd) ? "kept" : "failed", reason: "the linked worktree top level or historical PP Git registration could not be verified; nothing removed" }];
+      if (!dryRun) record(project, t, items, readJson(recordPath(project, t.id))?.declaration ?? { discard: [], keep: [] }, archive);
+      return { notes: items.map(note), worktreeGone: false, items };
+    }
+  }
   if (ovn && t.cwd) {
     let top;
     try { top = ovnfs.mounted(t); }
@@ -385,7 +396,7 @@ export async function run(project, t, h, { keepWorktree = false, copyComplete = 
     else if (strandedInLibrary.length) items.push({ ...checkout, status: "kept", reason: `not copied home: ${strandedInLibrary.map((d) => d.target).join(", ")}` });
     else {
       const remove = ovn ? removeOvnfs : removeWorktree;
-      try { items.push(await remove(h, t, { threadDir: t.thread_dir, discards, mergedHead, dryRun })); }
+      try { items.push(await remove(h, t, { threadDir: t.thread_dir, discards, mergedHead, dryRun, legacyGit })); }
       catch (e) { items.push({ ...checkout, status: "failed", reason: e.message }); }
     }
   }

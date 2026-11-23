@@ -1,11 +1,10 @@
 // Project lifecycle: pause, archive, delete, rename; sweep and doctor.
-import { existsSync, mkdirSync, realpathSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { client, autoArchiveAfterMerge, sh, readText, readJson, writeJson, isFile, isDir, secondsSince } from "./lib.mjs";
+import { client, autoArchiveAfterMerge, readText, readJson, writeJson, isFile, isDir, secondsSince } from "./lib.mjs";
 import { CONFIG_PATH, canonical, loadConfig, moveApprovals } from "./config.mjs";
 import { Project, SUBDIRS, TASKS_TEMPLATE, writeAgentsMd, writeSettings, listSlugs } from "./project.mjs";
 import * as threads from "./threads.mjs";
-import * as cleanup from "./cleanup.mjs";
 import * as inbox from "./inbox.mjs";
 import * as ticker from "./ticker.mjs";
 import { withLifecycleLock } from "./lifecycle-lock.mjs";
@@ -82,45 +81,12 @@ async function renameLocked(project, newSlug, { name, dryRun = false } = {}) {
 
 // ------------------------------------------------------------ sweep
 
-/**
- * What is left behind: `pp-<slug>-t-NNNN` worktrees of resolved threads (cleaned up again, the same way
- * resolve does; a kept one stays) and of no thread at all, merged branches of resolved threads, old done items.
- */
+/** Unclaimed and historical resources appear in discovery, not in the sweep plan. */
 export function sweepPlan(project) {
-  const plan = [];
-  const all = threads.list(project);
-  const real = (p) => { try { return realpathSync(p); } catch { return p; } };
-  const byCwd = new Map(all.flatMap((t) => {
-    const copies = [t.working_copy ?? { path: t.cwd }, ...(t.working_copies ?? [])];
-    return copies.filter((w) => w?.path).flatMap((w) => [[w.path, { t, w }], [real(w.path), { t, w }]]);
+  const plan = threads.list(project).filter(threads.pendingDisposal).map((t) => ({
+    what: `check managed resources of ${t.id}`,
+    run: async () => ({ ok: true, out: (await threads.cleanupAgain(project, t.id, { scheduled: true })).join("; ") }),
   }));
-  const managedBranches = new Set(all.flatMap((t) => t.working_copy && !t.machine ? [t.branch, t.working_copy.branch, ...(t.working_copies ?? []).map((w) => w?.branch)] : []));
-  const planned = new Set();
-  for (const repo of project.settings().repos.filter((r) => !r.machine)) {
-    const r = sh(["git", "-C", repo.path, "worktree", "list", "--porcelain"]);
-    if (!r.ok) continue;
-    for (const block of r.stdout.split("\n\n")) {
-      const path = /^worktree (.+)$/m.exec(block)?.[1];
-      const branch = /^branch refs\/heads\/(.+)$/m.exec(block)?.[1];
-      if (!path || !threads.isOwnBranch(project.slug, branch)) continue;
-      const { t, w } = byCwd.get(path) ?? {};
-      if (t && (threads.isOpen(t) || t.kept_worktree || w.phase === "removed" || planned.has(t.id))) continue;
-      if (!t && (managedBranches.has(branch) || /\/pp-t-\d{4,}-[0-9a-f-]{36}$/.test(path))) continue; // Unconfirmed managed copies are not legacy orphans.
-      if (t) {
-        planned.add(t.id);
-        plan.push({ what: `clean up ${t.id} again (worktree ${path})`, run: async () => ({ ok: true, out: (await threads.cleanupAgain(project, t.id)).join("; ") }) });
-      } else plan.push({ what: `remove worktree ${path} (${branch}), of no thread`, run: async () => {
-        const i = await cleanup.removeWorktree(threads.host(null), { cwd: path, repo: repo.path });
-        return { ok: i.status === "removed", out: i.reason ?? i.status };
-      } });
-    }
-  }
-  for (const t of all.filter((t) => t.kind === "worktree" && !t.working_copy && t.status === "resolved" && t.branch && t.repo && !t.machine && t.pr_state === "MERGED")) {
-    const tip = sh(["git", "-C", t.repo, "rev-parse", "--verify", "-q", `refs/heads/${t.branch}`]);
-    if (!tip.ok || tip.stdout.trim() !== t.pr_summary?.head_oid) continue;
-    if (isDir(t.cwd)) continue; // its worktree is still there; the worktree step goes first
-    plan.push({ what: `delete merged branch ${t.branch} (${t.id})`, run: () => sh(["git", "-C", t.repo, "branch", "-D", "--", t.branch]) });
-  }
   plan.push({ what: "delete handled inbox items older than 30 days", run: () => { inbox.pruneDone(project, 30); return { ok: true }; } });
   return plan;
 }

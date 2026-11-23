@@ -3,6 +3,7 @@
 // <cwd>/.paseo-project/<slug>-<id>/ (brief.md, report.md, library/).
 import { mkdirSync, readdirSync, readFileSync, existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
+import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { REPO, client, autoArchiveAfterMerge, importSession, sh, now, readText, readJson, writeJson, writeAtomic, sha256, secondsSince, slugify, claudeDir, isDir, requirePerson } from "./lib.mjs";
 import { loadConfig, loadSafety, resolveProfile, agentConfig, kindOf, modelOf, canonical, machine as machineOf } from "./config.mjs";
@@ -14,6 +15,7 @@ import { LifecycleBusy, withLifecycleLock } from "./lifecycle-lock.mjs";
 import * as ovnfs from "./ovnfs.mjs";
 import * as managedOvnfs from "./managed-ovnfs.mjs";
 import * as workingCopy from "./working-copy.mjs";
+import { discover, isLegacy, verifyLegacyGit } from "./reconciliation.mjs";
 import { validPrUrl } from "./pr.mjs";
 
 
@@ -964,7 +966,44 @@ function holdBlocker(project, t, w) {
   return "hold is unknown; only a person can release it";
 }
 
-export function resourceView(project, t) {
+export const reconciliation = (project) => discover(project, list(project)).items;
+
+export function boardResources(project) {
+  const listed = list(project), pending = discover(project, listed).items;
+  for (const t of listed.filter(pendingDisposal)) {
+    const { working_copy, working_copies } = resourceView(project, t, pending);
+    for (const w of [working_copy, ...working_copies].filter((w) => w && !removedResource(w))) {
+      const { owner, backend, path, source, machine, baseline, blockers, actions } = w;
+      pending.push({ project: project.slug, owner, backend, path, source, machine, baseline, blockers, actions,
+        candidate: "", resource: w.resource ?? w.nonce, phase: w.disposal?.phase ?? w.phase });
+    }
+  }
+  return pending;
+}
+
+export function adopt(project, id, candidate, base) {
+  requirePerson("thread adopt");
+  if (!/^[a-f0-9]{64}$/.test(candidate ?? "") || !workingCopy.commitOid.test(base ?? "")) throw new Error("adoption requires --candidate from thread discover and a full --base OID");
+  return withLifecycleLock(project, () => {
+    const t = load(project, id);
+    const selected = discover(project, list(project)).candidates.get(candidate);
+    if (!selected) throw new Error("resource candidate is no longer verified; rerun thread discover and review its blockers");
+    if (selected.baseline !== base) throw new Error("--base does not match the Git registration's original checkout commit");
+    if (t.id !== id || t.machine || t.repo !== selected.source || !["open", "resolved"].includes(t.status) ||
+        (selected.owner ? selected.owner !== id : !t.working_copy)) {
+      throw new Error("resource cannot be assigned to this thread; choose its historical owner or a managed thread for the same local source");
+    }
+    const w = { ...selected, owner: id, machine: t.machine ?? "", phase: "ready", nonce: randomUUID(), blocker: "", depends_on: [],
+      adoption: { at: now(), origin: { kind: "git-worktree-initial-commit", source: selected.source, commit: base } } };
+    update(project, id, (r) => {
+      if (selected.owner) r.working_copy = w;
+      else (r.working_copies ??= []).push(w);
+    });
+    return w;
+  });
+}
+
+export function resourceView(project, t, discovery) {
   const retry = `thread cleanup ${project.slug} ${t.id}`;
   const view = (w) => {
     const { disposal } = w;
@@ -977,7 +1016,8 @@ export function resourceView(project, t) {
     return { ...w, blockers, actions };
   };
   return { working_copy: t.working_copy ? view(t.working_copy) : null,
-    working_copies: resourcesOf({ working_copies: t.working_copies }).map(view) };
+    working_copies: resourcesOf({ working_copies: t.working_copies }).map(view),
+    reconciliation: isLegacy(t) ? (discovery ?? reconciliation(project)).filter((w) => w.owner === t.id) : [] };
 }
 
 function cleanupException(project, t, w, reason) {
@@ -1037,6 +1077,16 @@ async function clean(project, t, { keepWorktree = false, copyComplete = true, ar
   let h;
   try { h = host(t.machine); }
   catch (e) { return [e.message]; }
+  let legacyGit;
+  if (isLegacy(t) && t.kind === "worktree") {
+    legacyGit = () => verifyLegacyGit(project, t);
+    try { legacyGit(); }
+    catch { return (await cleanup.run(project, t, h, { archive, dryRun, legacyGit })).notes; }
+  }
+  if (isLegacy(t) && t.kind === "ovnfs" && t.cwd) {
+    try { ovnfs.mounted(t); }
+    catch { return (await cleanup.run(project, t, h, { archive, dryRun })).notes; }
+  }
   let agentArchived = !t.agent_id || dryRun;
   if (t.agent_id && !dryRun) {
     try {
@@ -1086,7 +1136,7 @@ async function clean(project, t, { keepWorktree = false, copyComplete = true, ar
       if (!done.worktreeGone && t.workspace_id && paseoAutoArchive.on !== false) {
         done.notes.push(paseoAutoArchive.on ? "Paseo merge auto-archive is on and can remove the worktree" : "Paseo merge auto-archive is unknown");
       }
-    } else done = await cleanup.run(project, t, h, { keepWorktree, copyComplete, archive, refreshArchive, agentArchived, mergedHead, dryRun, paseoAutoArchive });
+    } else done = await cleanup.run(project, t, h, { keepWorktree, copyComplete, archive, refreshArchive, agentArchived, mergedHead, dryRun, paseoAutoArchive, legacyGit });
   }
   catch (e) { return [...notes, `cleanup failed: ${e.message}; \`thread cleanup ${project.slug} ${t.id}\` retries`]; }
   notes.push(...done.notes);
@@ -1142,24 +1192,30 @@ async function resolveLocked(project, id, { keepWorktree = false, force = false,
     if (keepWorktree) requirePerson("thread resolve --keep-worktree");
     verifyWorktree(host(t.machine), t);
   }
-  t = refreshBranch(project, t);
+  const retainLegacy = reason !== "user" && isLegacy(t);
+  if (!isLegacy(t)) t = refreshBranch(project, t);
   let copied = { outcome: "complete", notes: [] };
-  if (!skipCopy) {
+  if (!skipCopy && !retainLegacy) {
     copied = finalCopy(project, t);
     if (copied.outcome === "failed") throw new Error(`the final copy failed (${copied.error}); not resolving. \`--skip-copy\` resolves without it.`);
   }
   const resolved = update(project, id, (r) => {
     r.status = "resolved"; r.resolved_reason = reason;
-    if (!resourcesOf(r).length || keepWorktree) r.kept_worktree = keepWorktree;
+    if (keepWorktree || (!resourcesOf(r).length && !isLegacy(r))) r.kept_worktree = keepWorktree;
     if (copied.hash) r.report_hash = copied.hash;
   });
-  const notes = [...copied.notes, ...(await clean(project, resolved, { keepWorktree, copyComplete: copied.outcome === "complete" || force, archive: skipCopy ? { outcome: "skipped" } : copied, mergedHead }))];
+  const notes = retainLegacy ? ["legacy resource retained pending confirmation; background resolution does not clean it"] :
+    [...copied.notes, ...(await clean(project, resolved, { keepWorktree: keepWorktree || (isLegacy(resolved) && legacyHold(resolved)), copyComplete: copied.outcome === "complete" || force, archive: skipCopy ? { outcome: "skipped" } : copied, mergedHead }))];
   inbox.write(project, "thread-state", id, "resolved", `${id} "${t.title}" ${why ?? "was resolved"}: ${notes.join("; ")}`);
   return notes;
 }
 
 /** Report and library home, less the library paths the thread declared disposable. */
 function finalCopy(project, t) {
+  if (isLegacy(t) && t.kind === "worktree") {
+    try { verifyLegacyGit(project, t); }
+    catch { return { outcome: "unknown", notes: ["legacy worktree copy skipped: the historical PP registration could not be verified"], unknown: ["report", "library"] }; }
+  }
   if (t.kind === "ovnfs" && !t.working_copy && t.cwd) {
     try { ovnfs.mounted(t); }
     catch (e) { return { outcome: "failed", notes: [], error: e.message }; }
@@ -1190,7 +1246,7 @@ async function cleanupLocked(project, id, { dryRun = false, scheduled = false } 
     notes.push(...copied.notes, ...(copied.error ? [`the copy home failed: ${copied.error}`] : []));
   } else if (dryRun) notes.push("preview: assumes the final copy completes");
   const mergedHead = t.kind === "ovnfs" && t.resolved_reason === "merged" && t.pr_summary?.state === "MERGED" ? t.pr_summary.head_oid : "";
-  return [...notes, ...(await clean(project, t, { keepWorktree: t.status === "resolved" && t.kept_worktree, copyComplete: !copied || copied.outcome === "complete", archive: copied, mergedHead, dryRun }))];
+  return [...notes, ...(await clean(project, t, { keepWorktree: t.status === "resolved" && legacyHold(t), copyComplete: !copied || copied.outcome === "complete", archive: copied, mergedHead, dryRun }))];
 }
 
 export function reopen(project, id) {
@@ -1203,8 +1259,8 @@ export function reopen(project, id) {
 
 // ------------------------------------------------------------ printing
 
-export function rowJson(project, row) {
-  return { ...row.t, ...resourceView(project, row.t), group: row.group, group_label: GROUPS[row.group].label, note: row.note, state: row.live.state, progress: row.live.progress, next: allNext(project, row.t.id), report: homeReportPath(project, row.t.id) };
+export function rowJson(project, row, discovery) {
+  return { ...row.t, ...resourceView(project, row.t, discovery), group: row.group, group_label: GROUPS[row.group].label, note: row.note, state: row.live.state, progress: row.live.progress, next: allNext(project, row.t.id), report: homeReportPath(project, row.t.id) };
 }
 
 export function rowLine(row) {

@@ -2,7 +2,7 @@
 
 线程 resolve 时自动清理它留下的东西。只删能确认属于这个线程、并且确实可以丢掉的东西；拿不准就保留，并写下原因。
 
-resolve 自动触发、`pp thread cleanup` 重试、`--dry-run` 预览和 `pp sweep` 用的是同一份实现：`orchestrator/cleanup.mjs` 里的 `run`。
+已登记工作副本按资源检查回收；下面的旧清理流程仅保留为明确指定历史线程时的兼容行为，不代表接管。针对未接管的旧 Git worktree / OVNFS 线程，ticker 可以记录线程完成，但不会清理、归档其工作区或删除分支。
 
 ## 归属规则（只有这一条）
 
@@ -99,7 +99,9 @@ worktree 删除前要满足这些条件，任何一条不满足就保留并写�
 - `resolve` 会归档 Paseo agent。工作树已经移除时，也会归档侧边栏里的 workspace。工作树需要保留时，workspace 也保留，因为 Paseo 的 workspace 归档可能删除工作树。`resolve` 和 `thread cleanup` 的输出都会说明 Paseo 归档结果，失败后可以用 `thread cleanup` 重试。
 - 再次 `thread resolve` 会报错，并提示改用 `thread cleanup`。
 - `--dry-run` 会预览 worktree、声明路径和索引，列出 would-remove，不删东西，也不写记录。它不会重新拷贝，所以 library 里的成品可能还没归档。只有 worktree 已经移除时才检查本地分支并归档 workspace。这两项的结果写在命令输出或 resolve 的 inbox 里。
-- `pp sweep` 会对 resolved 线程残留的 worktree 再跑一次 `thread cleanup`，跳过保留的。不属于任何线程的 `pp-<slug>-t-NNNN` worktree 也走同样的 worktree 检查。
+- `pp sweep` 只重试已登记工作副本的回收，并清理过期的已处理 inbox 项；不会按线程状态、目录名或分支名清扫未接管的历史资源。
+- `pp thread discover <slug>` 列出已配置仓库的 Git worktree、历史线程记录及已配置并正在运行的本机 OVNFS 注册表中能与项目关联的条目，不会启动 OVNFS daemon。`pp board resources` 和线程详情显示待确认资源、实际后端、阶段、阻碍和操作。
+- 人确认候选项及实际创建基线后，才可运行 `pp thread adopt <slug> <id> --candidate TOKEN --base OID`。已核对的历史 Git worktree 登记到原线程；无归属的 Git worktree 只能登记到同源的托管线程。接管只写 PP 记录，保留原后端、文件、提交和保留约束；身份或起点证据不足时不提供可用候选项。未接管的 OVNFS 和远程资源仅报告阻碍。
 
 ## OVNFS checkout
 

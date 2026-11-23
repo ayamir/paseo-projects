@@ -188,9 +188,18 @@ async function threadCommand([sub, slug, id], f, root, proj) {
       console.log(`${id}/${w.resource}: ${sub} ${w.path || w.identity.id}`);
       return;
     }
+    case "discover": console.log(JSON.stringify(threads.reconciliation(p))); return;
+    case "adopt": {
+      const w = threads.adopt(p, tid(), f.candidate, f.base);
+      console.log(`${id}: adopted ${w.backend} resource ${w.nonce}; existing lifecycle checks still apply`);
+      return;
+    }
     case "list": {
       const rows = threads.sortRows((await threads.rows(p)).filter((r) => f.all || threads.isOpen(r.t)));
-      if (f.json) { console.log(JSON.stringify(rows.map((r) => threads.rowJson(p, r)), null, 2)); return; }
+      if (f.json) {
+        const discovery = threads.reconciliation(p);
+        console.log(JSON.stringify(rows.map((r) => threads.rowJson(p, r, discovery)), null, 2)); return;
+      }
       for (const r of rows) console.log(`${r.t.id}\t${threads.GROUPS[r.group].label}\t${r.note}\t${r.t.title}`);
       return;
     }
@@ -212,6 +221,7 @@ async function threadCommand([sub, slug, id], f, root, proj) {
         for (const blocker of w.blockers) console.log(`working copy blocker: ${blocker}`);
         for (const action of w.actions) console.log(`working copy action: ${action}`);
       }
+      for (const w of copies.reconciliation) console.log(`reconciliation: ${w.backend} (${w.phase}) ${w.path}\n${[...w.blockers, ...w.actions].join("\n")}`);
       threads.allNext(p, t.id).forEach((l, i) => console.log(`next ${i + 1}: ${l}`));
       return;
     }
