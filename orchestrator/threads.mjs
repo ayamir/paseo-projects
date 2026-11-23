@@ -4,15 +4,15 @@
 import { mkdirSync, readdirSync, readFileSync, existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { REPO, client, autoArchiveAfterMerge, importSession, sh, now, readText, readJson, writeJson, writeAtomic, sha256, secondsSince, slugify, claudeDir, isDir } from "./lib.mjs";
+import { REPO, client, autoArchiveAfterMerge, importSession, sh, now, readText, readJson, writeJson, writeAtomic, sha256, secondsSince, slugify, claudeDir, isDir, requirePerson } from "./lib.mjs";
 import { loadConfig, loadSafety, resolveProfile, agentConfig, kindOf, modelOf, canonical, machine as machineOf } from "./config.mjs";
 import { prefix } from "./project.mjs";
 import * as inbox from "./inbox.mjs";
 import * as cleanup from "./cleanup.mjs";
 import { dispose } from "./disposal.mjs";
+import { LifecycleBusy, withLifecycleLock } from "./lifecycle-lock.mjs";
 import * as ovnfs from "./ovnfs.mjs";
 import * as managedOvnfs from "./managed-ovnfs.mjs";
-import * as lifecycle from "./lifecycle.mjs";
 import * as workingCopy from "./working-copy.mjs";
 import { validPrUrl } from "./pr.mjs";
 
@@ -74,7 +74,7 @@ export function update(project, id, change) {
     const t = load(project, id);
     change(t);
     t.updated = now();
-    writeJson(recordPath(project, id), t);
+    writeJson(recordPath(project, id), t, Boolean(t.working_copy || t.working_copies?.length));
     return t;
   });
 }
@@ -386,13 +386,11 @@ function setWorktreeBlocker(project, t, blocker) {
   });
 }
 
-const ovnfsLock = (project, fn) => lifecycle.withLifecycleLock ? lifecycle.withLifecycleLock(project, fn) : fn();
-
 function ovnfsResources(t) { return [t.working_copy, ...(t.working_copies ?? [])].filter(Boolean); }
 
 export function ovnfsResource(project, id, type, name, { base, resource = "main" } = {}) {
   if (!/^[a-z][a-z0-9-]{0,47}$/.test(name ?? "") || name === "main") throw new Error("give --name (lowercase letters, digits, hyphens; 'main' is reserved)");
-  return ovnfsLock(project, () => {
+  return withLifecycleLock(project, () => {
     const t = load(project, id), h = host(t.machine);
     if (project.status !== "active" || t.status === "resolved") throw new Error("OVNFS resources require an active project and unresolved thread");
     if (t.kind !== "ovnfs" || t.working_copy?.backend !== "ovnfs") throw new Error("OVNFS resources require a managed OVNFS thread; existing legacy checkouts are not adopted");
@@ -463,7 +461,7 @@ function reconcileOvnfsResource(project, t, h, w, { start = false } = {}) {
 }
 
 function prepareWorktree(project, t, h) {
-  if (t.working_copy.backend === "ovnfs") return ovnfsLock(project, () => prepareCheckout(project, load(project, t.id), h));
+  if (t.working_copy.backend === "ovnfs") return withLifecycleLock(project, () => prepareCheckout(project, load(project, t.id), h));
   return prepareCheckout(project, t, h);
 }
 
@@ -510,7 +508,13 @@ function prepareCheckout(project, t, h) {
 
 /** Ticker checks the resource, but never starts a new worktree or agent. */
 export function checkWorktree(project, t, at) {
-  if (!t.working_copy || ["planned", "removed"].includes(t.working_copy.phase)) return t;
+  if (!t.working_copy) return t;
+  try { return withLifecycleLock(project, () => checkWorktreeLocked(project, load(project, t.id), at)); }
+  catch (e) { if (e instanceof LifecycleBusy) return load(project, t.id); throw e; }
+}
+
+function checkWorktreeLocked(project, t, at) {
+  if (!t.working_copy || t.status === "resolved" || ["planned", "removed"].includes(t.working_copy.phase)) return t;
   if (t.status === "starting" && secondsSince(t.launch_started ?? t.created, at) < STARTING_TIMEOUT_SECS) return t;
   const check = () => {
     if (t.working_copy.backend === "ovnfs") {
@@ -527,7 +531,7 @@ export function checkWorktree(project, t, at) {
       return setWorktreeBlocker(project, load(project, t.id), e.message);
     }
   };
-  return t.working_copy.backend === "ovnfs" ? ovnfsLock(project, check) : check();
+  return t.working_copy.backend === "ovnfs" ? withLifecycleLock(project, check) : check();
 }
 
 function requireLocalPaseo() {
@@ -568,6 +572,10 @@ export async function tabWorkspace(c, cwd, repo, title, remote = false) {
 
 /** `thread start`: places the agent, writes the brief, sends the one-line prompt. */
 export async function start(project, a) {
+  return withLifecycleLock(project, () => startLocked(project, a));
+}
+
+async function startLocked(project, a) {
   const status = project.status;
   if (status !== "active") throw new Error(`\`${project.slug}\` is ${status}; \`thread start\` is refused until it is active again`);
   if (!a.title?.trim()) throw new Error("--title may not be empty");
@@ -613,7 +621,7 @@ export async function start(project, a) {
       if (kind === "ovnfs") t.working_copy = managedOvnfs.plan(t, baseline, ns, parent);
     });
   };
-  const t = ns ? ovnfsLock(project, register) : register();
+  const t = ns ? withLifecycleLock(project, register) : register();
 
   try {
     const c = await client(h.url);
@@ -692,7 +700,11 @@ export function carryReport(h, from, to, home) {
 }
 
 /** `thread restart`: an agent on the same worktree, folder or branch; it picks up the old session unless `fresh`. */
-export async function restart(project, id, requested, opts = {}) {
+export async function restart(project, id, requested, opts) {
+  return withLifecycleLock(project, () => restartLocked(project, id, requested, opts));
+}
+
+async function restartLocked(project, id, requested, opts = {}) {
   const t = load(project, id);
   if (t.status === "resolved") throw new Error(`${id} is resolved; \`thread resolve --reopen\` first`);
   if (t.status === "starting" && secondsSince(t.launch_started ?? t.created) < STARTING_TIMEOUT_SECS) throw new Error(`${id} is still starting`);
@@ -920,7 +932,107 @@ async function archiveWorkspace(url, id) {
  * Archives the agent, then runs cleanup: declared discards, the worktree (never forced), and its indexes.
  * A worktree workspace is archived only once the worktree is gone: Paseo's archive can delete it.
  */
-export async function clean(project, t, { keepWorktree = false, copyComplete = true, archive, mergedHead = "", dryRun = false } = {}) {
+const resourcesOf = (t) => [t.working_copy, ...(Array.isArray(t.working_copies) ? t.working_copies : [])].filter(Boolean);
+const removedResource = (w) => w.phase === "removed" && w.disposal?.phase === "removed";
+export const pendingDisposal = (t) => t.status === "resolved" && resourcesOf(t).some((w) => !removedResource(w));
+const legacyHold = (r) => Object.hasOwn(r, "kept_worktree") && r.kept_worktree !== false;
+
+function utcDeadline(value) {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/.test(value)) return NaN;
+  const at = Date.parse(value);
+  return Number.isFinite(at) && new Date(at).toISOString() === value.replace(/(?<!\.\d{3})Z$/, ".000Z") ? at : NaN;
+}
+
+function holdBlocker(project, t, w) {
+  if ([t, w].some((r) => legacyHold(r) && r.kept_worktree !== true)) return "legacy hold is unknown; only a person can release it";
+  if (legacyHold(t) || legacyHold(w)) return "explicit --keep-worktree hold (legacy)";
+  if (!Object.hasOwn(w, "hold")) return "";
+  const hold = w.hold;
+  const validReason = typeof hold?.reason === "string" && hold.reason.trim();
+  if (validReason && Object.keys(hold).length === 2) {
+    if (hold.indefinite === true) return `indefinite hold: ${hold.reason}`;
+    const at = utcDeadline(hold.until);
+    if (Number.isFinite(at)) return at <= Date.now() ? "" : `hold: ${hold.reason} (until ${hold.until})`;
+    if (hold.until_resolved && hold.until_resolved !== t.id) {
+      try {
+        const other = load(project, hold.until_resolved);
+        if (other.id === hold.until_resolved && other.status === "resolved") return "";
+        if (other.id === hold.until_resolved && ["open", "starting"].includes(other.status)) return `hold: ${hold.reason} (until ${other.id} resolves)`;
+      } catch {}
+    }
+  }
+  return "hold is unknown; only a person can release it";
+}
+
+export function resourceView(project, t) {
+  const retry = `thread cleanup ${project.slug} ${t.id}`;
+  const view = (w) => {
+    const { disposal } = w;
+    const hold = removedResource(w) ? "" : holdBlocker(project, t, w);
+    const check = disposal?.hold_blocker === disposal?.blocker ? disposal?.check_blocker : disposal?.blocker;
+    const blockers = [...new Set([hold, w.blocker, check].filter(Boolean))];
+    const actions = [];
+    if (hold) actions.push(`person: thread release ${project.slug} ${t.id}${legacyHold(t) ? "" : ` --resource ${w.nonce}`}`);
+    if (t.status === "resolved" && !removedResource(w)) actions.push(`preview: ${retry} --dry-run`, `retry: ${retry}`);
+    return { ...w, blockers, actions };
+  };
+  return { working_copy: t.working_copy ? view(t.working_copy) : null,
+    working_copies: resourcesOf({ working_copies: t.working_copies }).map(view) };
+}
+
+function cleanupException(project, t, w, reason) {
+  if (!reason) return;
+  const key = `${w.nonce}:${reason.replace(/occupied by process \d+/g, "occupied by process").replace(/\bcommit [a-f0-9]{40,64}\b/g, "commit")}`;
+  inbox.write(project, "cleanup", t.id, "resource retained", `${t.id} ${w.backend} ${w.path || w.nonce}: ${reason}; thread cleanup ${project.slug} ${t.id} retries`, "", key);
+}
+
+function selectedResource(t, nonce) {
+  const matches = nonce === undefined ? [t.working_copy].filter(Boolean) : resourcesOf(t).filter((w) => w.nonce === nonce);
+  if (matches.length !== 1 || matches[0].owner !== t.id) throw new Error("managed resource is missing or ambiguous");
+  return matches[0];
+}
+
+export function hold(project, id, options) {
+  return withLifecycleLock(project, () => holdLocked(project, id, options));
+}
+
+function holdLocked(project, id, { resource, reason, until, untilResolved, indefinite }) {
+  if (typeof reason !== "string" || !reason.trim()) throw new Error("a hold requires a reason");
+  if ([until !== undefined, untilResolved !== undefined, Boolean(indefinite)].filter(Boolean).length !== 1) {
+    throw new Error("a hold requires one deadline or condition; a person can request --indefinite");
+  }
+  let constraint;
+  if (indefinite) {
+    requirePerson("thread hold --indefinite");
+    constraint = { indefinite: true };
+  } else if (untilResolved !== undefined) {
+    const other = load(project, untilResolved);
+    if (other.id !== untilResolved || other.id === id || !["open", "starting"].includes(other.status)) throw new Error("condition must name another unresolved thread in this project");
+    constraint = { until_resolved: other.id };
+  } else {
+    const at = utcDeadline(until);
+    if (!(at > Date.now())) throw new Error("hold --until requires a valid future UTC deadline");
+    constraint = { until: new Date(at).toISOString() };
+  }
+  return update(project, id, (t) => {
+    const w = selectedResource(t, resource);
+    if (w.phase === "removed" || ["removing", "unknown", "removed"].includes(w.disposal?.phase)) throw new Error("resource removal is complete or unconfirmed");
+    if (holdBlocker(project, t, w)) throw new Error("resource has an active hold; only a person can release it first");
+    w.hold = { reason: reason.trim(), ...constraint };
+  });
+}
+
+export function release(project, id, nonce) {
+  requirePerson("thread release");
+  return withLifecycleLock(project, () => update(project, id, (t) => {
+    const w = selectedResource(t, nonce);
+    delete w.hold;
+    delete w.kept_worktree;
+    if (nonce === undefined) t.kept_worktree = false;
+  }));
+}
+
+async function clean(project, t, { keepWorktree = false, copyComplete = true, archive, mergedHead = "", dryRun = false } = {}) {
   const notes = [];
   let h;
   try { h = host(t.machine); }
@@ -949,14 +1061,26 @@ export async function clean(project, t, { keepWorktree = false, copyComplete = t
       const resources = [worktreeRecord(t), ...(t.working_copies ?? [])];
       const results = resources.map((w, i) => {
         try {
-          return dispose(project, t, h, w, { keepWorktree, agentArchived, dryRun, save: (disposal) => update(project, t.id, (r) => {
+          const hold = holdBlocker(project, t, w);
+          const result = dispose(project, t, h, w, { keepWorktree, agentArchived, dryRun, holdBlocker: hold, save: (disposal) => update(project, t.id, (r) => {
             const current = i === 0 ? worktreeRecord(r) : r.working_copies?.[i - 1];
             if (r.status !== "resolved" || current?.nonce !== w.nonce || current.path !== w.path) throw new Error("thread or resource changed during disposal");
-            if (disposal.phase === "removing" && (r.kept_worktree || current.kept_worktree)) throw new Error("explicit --keep-worktree hold");
+            if (disposal.phase === "removing" && holdBlocker(project, r, current)) throw new Error("resource still has a hold");
             current.disposal = disposal;
             if (disposal.phase === "removed") current.phase = "removed";
           }) });
-        } catch (e) { return { gone: false, note: `resource cleanup failed: ${e.message}` }; }
+          if (!dryRun && !result.gone) {
+            const r = load(project, t.id);
+            const disposal = (i === 0 ? r.working_copy : r.working_copies?.[i - 1])?.disposal;
+            const reason = disposal?.check_blocker ?? disposal?.blocker;
+            if (reason && reason !== hold) cleanupException(project, t, w, reason);
+            if (hold.includes("hold is unknown;")) cleanupException(project, t, w, hold);
+          }
+          return result;
+        } catch (e) {
+          if (!dryRun) cleanupException(project, t, w, e.message);
+          return { gone: false, note: `resource cleanup failed: ${e.message}` };
+        }
       });
       done = { notes: results.map((r) => r.note), worktreeGone: results.every((r) => r.gone) };
       if (!done.worktreeGone && t.workspace_id && paseoAutoArchive.on !== false) {
@@ -1007,10 +1131,17 @@ function cleanReviewBranch(h, t) {
 }
 
 /** Final copy, then resolved, then cleanup, then one inbox item. */
-export async function resolve(project, id, { keepWorktree = false, force = false, skipCopy = false, reason = "user", mergedHead = "", why } = {}) {
+export async function resolve(project, id, options) {
+  return withLifecycleLock(project, () => resolveLocked(project, id, options));
+}
+
+async function resolveLocked(project, id, { keepWorktree = false, force = false, skipCopy = false, reason = "user", mergedHead = "", why } = {}) {
   let t = load(project, id);
   if (t.status === "resolved") throw new Error(`${id} is already resolved; \`thread cleanup ${project.slug} ${id}\` cleans what is left of it`);
-  if (t.working_copy) verifyWorktree(host(t.machine), t);
+  if (t.working_copy) {
+    if (keepWorktree) requirePerson("thread resolve --keep-worktree");
+    verifyWorktree(host(t.machine), t);
+  }
   t = refreshBranch(project, t);
   let copied = { outcome: "complete", notes: [] };
   if (!skipCopy) {
@@ -1018,7 +1149,8 @@ export async function resolve(project, id, { keepWorktree = false, force = false
     if (copied.outcome === "failed") throw new Error(`the final copy failed (${copied.error}); not resolving. \`--skip-copy\` resolves without it.`);
   }
   const resolved = update(project, id, (r) => {
-    r.status = "resolved"; r.resolved_reason = reason; r.kept_worktree = keepWorktree;
+    r.status = "resolved"; r.resolved_reason = reason;
+    if (!resourcesOf(r).length || keepWorktree) r.kept_worktree = keepWorktree;
     if (copied.hash) r.report_hash = copied.hash;
   });
   const notes = [...copied.notes, ...(await clean(project, resolved, { keepWorktree, copyComplete: copied.outcome === "complete" || force, archive: skipCopy ? { outcome: "skipped" } : copied, mergedHead }))];
@@ -1042,12 +1174,18 @@ function finalCopy(project, t) {
 }
 
 /** `thread cleanup`: copy home again, then the same cleanup for a resolved thread; `dryRun` previews any thread. */
-export async function cleanupAgain(project, id, { dryRun = false } = {}) {
+export async function cleanupAgain(project, id, options) {
+  return withLifecycleLock(project, () => cleanupLocked(project, id, options));
+}
+
+async function cleanupLocked(project, id, { dryRun = false, scheduled = false } = {}) {
   const t = load(project, id);
+  if (scheduled && !pendingDisposal(t)) return [];
   if (t.status !== "resolved" && !dryRun) throw new Error(`${id} is not resolved; \`thread resolve\` cleans up (\`thread cleanup --dry-run\` previews)`);
   let copied;
   const notes = [];
-  if (!dryRun && t.working_copy?.phase !== "removed") {
+  // Disposal preserves current evidence independently; a background retry must not overwrite home copies.
+  if (!dryRun && !scheduled && t.working_copy?.phase !== "removed") {
     copied = finalCopy(project, t);
     notes.push(...copied.notes, ...(copied.error ? [`the copy home failed: ${copied.error}`] : []));
   } else if (dryRun) notes.push("preview: assumes the final copy completes");
@@ -1056,15 +1194,17 @@ export async function cleanupAgain(project, id, { dryRun = false } = {}) {
 }
 
 export function reopen(project, id) {
-  const t = load(project, id);
-  if (t.status !== "resolved") throw new Error(`${id} is not resolved`);
-  return update(project, id, (r) => { r.status = "open"; r.resolved_reason = ""; });
+  return withLifecycleLock(project, () => update(project, id, (t) => {
+    if (t.status !== "resolved") throw new Error(`${id} is not resolved`);
+    t.status = "open";
+    t.resolved_reason = "";
+  }));
 }
 
 // ------------------------------------------------------------ printing
 
 export function rowJson(project, row) {
-  return { ...row.t, group: row.group, group_label: GROUPS[row.group].label, note: row.note, state: row.live.state, progress: row.live.progress, next: allNext(project, row.t.id), report: homeReportPath(project, row.t.id) };
+  return { ...row.t, ...resourceView(project, row.t), group: row.group, group_label: GROUPS[row.group].label, note: row.note, state: row.live.state, progress: row.live.progress, next: allNext(project, row.t.id), report: homeReportPath(project, row.t.id) };
 }
 
 export function rowLine(row) {

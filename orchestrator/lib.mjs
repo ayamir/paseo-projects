@@ -4,10 +4,11 @@ import { createPaseoClient } from "@getpaseo/client";
 import { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, cpSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { lifecycleStdio } from "./lifecycle-lock.mjs";
 
 export const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
 export const log = (...a) => console.log(...a);
@@ -91,7 +92,7 @@ export function placeClaudeSession(id, cwd, base = join(homedir(), ".claude", "p
 }
 
 export function sh(tokens, cwd, stdin, { timeout = 60_000, env } = {}) {
-  const r = spawnSync(tokens[0], tokens.slice(1), { encoding: "utf8", cwd, input: stdin, timeout, env: env ? { ...process.env, ...env } : undefined });
+  const r = spawnSync(tokens[0], tokens.slice(1), { encoding: "utf8", cwd, input: stdin, timeout, stdio: lifecycleStdio(), env: env ? { ...process.env, ...env } : undefined });
   const out = `${r.stdout ?? ""}${r.stderr ?? ""}`.trim();
   return { ok: r.status === 0, code: r.status, timedOut: r.error?.code === "ETIMEDOUT", stdout: r.stdout ?? "", stderr: r.stderr ?? "", out };
 }
@@ -110,12 +111,16 @@ export function readText(path) {
 export function readJson(path, fallback = null) {
   try { return JSON.parse(readFileSync(path, "utf8")); } catch { return fallback; }
 }
-export function writeAtomic(path, data) {
+export function writeAtomic(path, data, durable = false) {
   const tmp = `${path}.${process.pid}.tmp`;
-  writeFileSync(tmp, data);
+  writeFileSync(tmp, data, { flush: durable });
   renameSync(tmp, path);
+  if (durable) {
+    const fd = openSync(dirname(path), "r");
+    try { fsyncSync(fd); } finally { closeSync(fd); }
+  }
 }
-export const writeJson = (path, value) => writeAtomic(path, JSON.stringify(value, null, 2) + "\n");
+export const writeJson = (path, value, durable) => writeAtomic(path, JSON.stringify(value, null, 2) + "\n", durable);
 export const isFile = (p) => { try { return statSync(p).isFile(); } catch { return false; } };
 export const isDir = (p) => { try { return statSync(p).isDirectory(); } catch { return false; } };
 

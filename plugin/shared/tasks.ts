@@ -25,7 +25,8 @@ export const tasksRpc = defineRpc({
 
 const workingCopy = z.object({
   owner: z.string(), backend: z.string(), phase: z.string(), baseline: z.string(), source: z.string(),
-  path: z.string(), machine: z.string(), blocker: z.string(),
+  path: z.string(), machine: z.string(), blocker: z.string(), nonce: z.string().optional(),
+  blockers: z.array(z.string()).optional(), actions: z.array(z.string()).optional(),
   identity: z.object({ git_dir: z.string(), directory: z.string(), registration: z.string() }).nullable(),
   disposal: z.object({
     phase: z.string(), blocker: z.string(),

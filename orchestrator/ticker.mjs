@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { REPO, sh, now, secondsSince, writeJson, readText, closeClients } from "./lib.mjs";
 import { loadConfig, loadSafety, isApproved } from "./config.mjs";
 import { Project, listSlugs } from "./project.mjs";
+import { LifecycleBusy } from "./lifecycle-lock.mjs";
 import * as threads from "./threads.mjs";
 import * as inbox from "./inbox.mjs";
 import * as pr from "./pr.mjs";
@@ -118,7 +119,7 @@ export async function tick(project, started = now()) {
   const unreachable = new Set((agents.unreachable ?? []).map((m) => (m === "local" ? "" : m)));
   for (let t of open) {
     if (!t.machine || pollPrs) t = threads.checkWorktree(project, t, at);
-    if (unreachable.has(t.machine || "")) continue;
+    if (!threads.isOpen(t) || unreachable.has(t.machine || "")) continue;
     if ((!t.machine || pollPrs) && !t.working_copy?.blocker) {
       const c = threads.copyHome(project, t);
       if (c.hash && c.hash !== t.report_hash) t = threads.update(project, t.id, (r) => { r.report_hash = c.hash; r.last_report_change = now(); });
@@ -150,6 +151,10 @@ export async function tick(project, started = now()) {
     }
   }
 
+  for (const t of threads.list(project).filter(threads.pendingDisposal)) {
+    try { await threads.cleanupAgain(project, t.id, { scheduled: true }); }
+    catch (e) { if (!(e instanceof LifecycleBusy)) console.error(`${now()} ${project.slug} ${t.id}: ${e.message}`); }
+  }
   if (pollPrs) {
     await followPrs(project, settings, state, agents, at);
     await autoResolve(project, settings, state, agents, at);

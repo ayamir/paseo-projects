@@ -149,13 +149,14 @@ export function BoardScreen({ theme, layout }: PluginScreenProps) {
           </View>
           <Text style={styles.title}>{selected.title}</Text>
           <Text style={styles.meta}>{selected.project} · {selected.id} · {selected.profile}{selected.branch ? ` · ${selected.branch}` : ""}</Text>
+          {detail.data?.status ? <Text style={styles.meta}>线程状态：{detail.data.status}</Text> : null}
           {copies.map((worktree) => (
-            <View key={`${worktree.machine}:${worktree.path}`} style={{ marginTop: 8 }}>
+            <View key={worktree.nonce || `${worktree.machine}:${worktree.path}`} style={{ marginTop: 8 }}>
               <Text style={styles.meta}>工作副本：{worktree.backend} · {worktree.phase}{worktree.machine ? ` · ${worktree.machine}` : ""}</Text>
               <Text style={styles.mono}>{worktree.path}{"\n"}基线：{worktree.baseline}</Text>
-              {worktree.blocker ? <Text style={styles.note}>{worktree.blocker}</Text> : null}
               {worktree.disposal ? <Text style={styles.meta}>回收：{worktree.disposal.phase}</Text> : null}
-              {worktree.disposal?.blocker ? <Text style={styles.note}>{worktree.disposal.blocker}</Text> : null}
+              {(worktree.blockers ?? [worktree.blocker, worktree.disposal?.blocker].filter(Boolean)).map((blocker) => <Text key={blocker} style={styles.note}>{blocker}</Text>)}
+              {worktree.actions?.map((action) => <Text key={action} style={styles.mono}>{action}</Text>)}
               {worktree.disposal?.evidence ? <Text style={styles.mono}>{worktree.disposal.evidence.path}</Text> : null}
             </View>
           ))}
