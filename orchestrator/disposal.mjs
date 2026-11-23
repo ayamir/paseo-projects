@@ -262,7 +262,19 @@ function evidence(project, w, manifest) {
   } finally { rmSync(stage, { recursive: true, force: true }); }
 }
 
-export function dispose(project, t, h, w, { keepWorktree, agentArchived, dryRun, save }) {
+// shortcut: OVNFS v0.8.0 `rm`/`drop` take a bare name or id with no identity, dependent or writer fence, so pp
+// retains managed OVNFS resources instead of guessing; upgrade when upstream ships a conditional removal.
+export const OVNFS_RETAINED = "OVNFS v0.8.0 has no identity- or dependency-fenced rm/drop, so pp cannot prove removal safe and keeps this resource";
+
+function retainOvnfs(w, { keepWorktree, holdBlocker, dryRun, save }) {
+  const blocker = holdBlocker || (keepWorktree || w.kept_worktree ? `explicit --keep-worktree hold; ${OVNFS_RETAINED}` : OVNFS_RETAINED);
+  if (!dryRun && (w.disposal?.phase !== "retained" || w.disposal.blocker !== blocker)) save({ phase: "retained", blocker });
+  return { gone: false, note: `OVNFS ${w.resource} kept: ${w.path || w.identity?.id || w.nonce}: ${blocker}` };
+}
+
+export function dispose(project, t, h, w, options) {
+  if (w.backend === "ovnfs") return retainOvnfs(w, options);
+  const { keepWorktree, agentArchived, dryRun, save } = options;
   const path = w.path;
   let proof = w.disposal?.evidence, pathKeep = w.disposal?.path_keep;
   let phase = ["removing", "unknown", "removed"].includes(w.disposal?.phase) ? "unknown" : "retained";

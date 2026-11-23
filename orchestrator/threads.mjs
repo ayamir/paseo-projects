@@ -11,6 +11,8 @@ import * as inbox from "./inbox.mjs";
 import * as cleanup from "./cleanup.mjs";
 import { dispose } from "./disposal.mjs";
 import * as ovnfs from "./ovnfs.mjs";
+import * as managedOvnfs from "./managed-ovnfs.mjs";
+import * as lifecycle from "./lifecycle.mjs";
 import * as workingCopy from "./working-copy.mjs";
 import { validPrUrl } from "./pr.mjs";
 
@@ -338,16 +340,19 @@ export function copyHome(project, t, withLibrary = false, exclude = []) {
 
 export const hasBranchCheckout = (t) => t.kind === "worktree" || t.kind === "ovnfs";
 
+const copyBackend = (w) => w.backend === "ovnfs" ? managedOvnfs : workingCopy;
+
 function worktreeRecord(t) {
   const w = t.working_copy;
-  if (w.backend !== "git-worktree" || w.owner !== t.id || w.source !== t.repo || w.machine !== t.machine || (t.cwd && w.path !== t.cwd)) {
+  if (w.backend !== (t.kind === "ovnfs" ? "ovnfs" : "git-worktree") || w.owner !== t.id || w.source !== t.repo || w.machine !== t.machine || (t.cwd && w.path !== t.cwd)) {
     throw new Error(`${t.id}'s worktree record does not match its checkout`);
   }
   return w;
 }
 
 function verifyWorktree(h, t) {
-  const path = workingCopy.verify(h, worktreeRecord(t));
+  const w = worktreeRecord(t);
+  const path = copyBackend(w).verify(h, w);
   if (path !== t.cwd) throw new Error(`${t.id}'s worktree record does not match its checkout`);
   return path;
 }
@@ -355,7 +360,7 @@ function verifyWorktree(h, t) {
 function reconcileWorktree(project, t, h) {
   if (worktreeRecord(t).phase === "creating") {
     let identity;
-    try { identity = workingCopy.recover(h, t.working_copy); }
+    try { identity = copyBackend(t.working_copy).recover(h, t.working_copy); }
     catch (e) {
       // Another pass may have recorded the identity and released the creation lock.
       t = load(project, t.id);
@@ -367,11 +372,11 @@ function reconcileWorktree(project, t, h) {
       Object.assign(w, { phase: "ready", identity, blocker: "" });
       r.cwd = w.path;
       r.thread_dir = threadDir(w.path, project.slug, r.id);
-      r.branch_start = { name: w.branch, oid: w.baseline };
+      r.branch_start = { name: w.branch, oid: identity.initial_oid ?? w.baseline };
     });
   }
   verifyWorktree(h, t);
-  workingCopy.unlockCreation(h, t.working_copy);
+  copyBackend(t.working_copy).unlockCreation?.(h, t.working_copy);
   return t;
 }
 
@@ -381,21 +386,123 @@ function setWorktreeBlocker(project, t, blocker) {
   });
 }
 
-function prepareWorktree(project, t, h) {
-  let created;
-  if (worktreeRecord(t).phase === "planned") {
-    t = update(project, t.id, (r) => {
-      const w = worktreeRecord(r);
-      if (w.phase !== "planned") throw new Error(`${r.id}'s worktree creation already started`);
-      w.phase = "creating";
+const ovnfsLock = (project, fn) => lifecycle.withLifecycleLock ? lifecycle.withLifecycleLock(project, fn) : fn();
+
+function ovnfsResources(t) { return [t.working_copy, ...(t.working_copies ?? [])].filter(Boolean); }
+
+export function ovnfsResource(project, id, type, name, { base, resource = "main" } = {}) {
+  if (!/^[a-z][a-z0-9-]{0,47}$/.test(name ?? "") || name === "main") throw new Error("give --name (lowercase letters, digits, hyphens; 'main' is reserved)");
+  return ovnfsLock(project, () => {
+    const t = load(project, id), h = host(t.machine);
+    if (project.status !== "active" || t.status === "resolved") throw new Error("OVNFS resources require an active project and unresolved thread");
+    if (t.kind !== "ovnfs" || t.working_copy?.backend !== "ovnfs") throw new Error("OVNFS resources require a managed OVNFS thread; existing legacy checkouts are not adopted");
+    const all = ovnfsResources(t), main = worktreeRecord(t);
+    const source = resource === "main" ? main : all.find((w) => w.resource === resource);
+    const snapshot = type === "snapshot";
+    if (snapshot && (!source || source.owner !== id || source.backend !== "ovnfs" || source.ovnfs.label)) throw new Error(`no owned OVNFS checkout named ${resource}`);
+    let w = all.find((r) => r.resource === name);
+    if (w && (w.owner !== id || w.backend !== "ovnfs" || Boolean(w.ovnfs.label) !== snapshot ||
+        (snapshot && w.depends_on[0] !== source.nonce) || (base !== undefined && w.ovnfs.ref !== base))) throw new Error(`OVNFS resource ${name} already has a different immutable intent`);
+    if (!w) {
+      managedOvnfs.verify(h, snapshot ? source : main);
+      if (snapshot) w = managedOvnfs.snapshotPlan(source, name);
+      else {
+        const branch = `${main.branch}-${name}`;
+        w = managedOvnfs.plan({ ...t, branch }, workingCopy.gitBaseline(h, t.repo, base ?? (t.base || "HEAD")), main.ovnfs.namespace);
+        w.resource = name;
+        w.ovnfs.ref = base;
+      }
+      update(project, id, (r) => { (r.working_copies ??= []).push(w); });
+    }
+    const current = reconcileOvnfsResource(project, t, h, w, { start: true });
+    if (current.blocker) throw new Error(current.blocker);
+    return current;
+  });
+}
+
+function reconcileOvnfsResource(project, t, h, w, { start = false } = {}) {
+  const snapshot = Boolean(w.ovnfs.label);
+  const save = (change) => {
+    update(project, t.id, (r) => {
+      const item = r.working_copies?.find((entry) => entry.nonce === w.nonce);
+      if (!item || item.owner !== t.id || item.phase !== w.phase) throw new Error("OVNFS resource intent changed while reconciling");
+      Object.assign(item, change);
+      w = item;
     });
-    created = workingCopy.create(h, t.working_copy);
-  }
+  };
+  const verifySource = () => {
+    const matches = ovnfsResources(load(project, t.id)).filter((r) => r.nonce === w.depends_on[0]);
+    if (matches.length !== 1 || matches[0].owner !== t.id || matches[0].identity?.name !== w.ovnfs.from.checkout || matches[0].identity?.base !== w.ovnfs.from.base) throw new Error("OVNFS snapshot source identity changed");
+    managedOvnfs.verify(h, matches[0]);
+  };
+  let failed;
   try {
+    if (w.phase === "planned" && start) {
+      if (snapshot) verifySource();
+      const parents = managedOvnfs.ensureAvailable(h, w);
+      save({ phase: "creating", ovnfs: { ...w.ovnfs, started_at: now(), ...(snapshot ? { parents } : {}) } });
+      try { managedOvnfs.create(h, w); } catch (e) { failed = e.message; }
+    }
+    if (w.phase === "creating") {
+      if (snapshot) verifySource();
+      const identity = managedOvnfs.recover(h, w);
+      if (snapshot && !identity.tree) save({ identity, blocker: "OVNFS snapshot is registered; tree hashing is not yet confirmed" });
+      else {
+        managedOvnfs.verify(h, { ...w, phase: "ready", identity });
+        save({ identity, phase: "ready", blocker: "" });
+      }
+    } else if (w.phase === "ready" && start) {
+      managedOvnfs.verify(h, w);
+      if (w.blocker) save({ blocker: "" });
+    }
+  } catch (e) {
+    const blocker = failed ? `${e.message}; ${failed}` : e.message;
+    if (blocker !== w.blocker) save({ blocker });
+  }
+  return w;
+}
+
+function prepareWorktree(project, t, h) {
+  if (t.working_copy.backend === "ovnfs") return ovnfsLock(project, () => prepareCheckout(project, load(project, t.id), h));
+  return prepareCheckout(project, t, h);
+}
+
+function snapshotSource(project, h, ref) {
+  const match = /^(t-[0-9]+)\/([a-z][a-z0-9-]{0,47})$/.exec(ref ?? "");
+  if (!match) throw new Error("--from-snapshot requires THREAD/RESOURCE in the same Project");
+  const owner = load(project, match[1]);
+  const rows = ovnfsResources(owner).filter((w) => w.resource === match[2]);
+  const w = rows[0];
+  if (rows.length !== 1 || w.owner !== owner.id || w.backend !== "ovnfs" || !w.ovnfs.label) throw new Error(`no managed OVNFS snapshot ${ref}`);
+  managedOvnfs.verify(h, w);
+  return w;
+}
+
+function prepareCheckout(project, t, h) {
+  let createError;
+  try {
+    if (worktreeRecord(t).phase === "planned") {
+      const from = t.working_copy.ovnfs?.from;
+      if (from) {
+        const s = snapshotSource(project, h, `${from.owner}/${from.resource}`);
+        if (s.nonce !== t.working_copy.depends_on[0] || s.ovnfs.from.base !== from.base || s.source !== t.repo) throw new Error("OVNFS snapshot dependency changed");
+      }
+      copyBackend(t.working_copy).ensureAvailable?.(h, t.working_copy);
+      t = update(project, t.id, (r) => {
+        const w = worktreeRecord(r);
+        if (w.phase !== "planned") throw new Error(`${r.id}'s worktree creation already started`);
+        w.phase = "creating";
+        if (w.backend === "ovnfs") w.ovnfs.started_at = now();
+      });
+      try {
+        const created = copyBackend(t.working_copy).create(h, t.working_copy);
+        if (created && !created.ok && t.working_copy.backend === "git-worktree") createError = `git worktree add: ${created.out}`;
+      } catch (e) { createError = e.message; }
+    }
     t = reconcileWorktree(project, t, h);
     return setWorktreeBlocker(project, t, "").cwd;
   } catch (e) {
-    const message = created && !created.ok ? `${e.message}; git worktree add: ${created.out}` : e.message;
+    const message = createError ? `${e.message}; ${createError}` : e.message;
     setWorktreeBlocker(project, load(project, t.id), message);
     throw new Error(message);
   }
@@ -405,12 +512,22 @@ function prepareWorktree(project, t, h) {
 export function checkWorktree(project, t, at) {
   if (!t.working_copy || ["planned", "removed"].includes(t.working_copy.phase)) return t;
   if (t.status === "starting" && secondsSince(t.launch_started ?? t.created, at) < STARTING_TIMEOUT_SECS) return t;
-  try {
-    t = reconcileWorktree(project, t, host(t.machine));
-    return setWorktreeBlocker(project, t, "");
-  } catch (e) {
-    return setWorktreeBlocker(project, load(project, t.id), e.message);
-  }
+  const check = () => {
+    if (t.working_copy.backend === "ovnfs") {
+      t = load(project, t.id);
+      for (const w of t.working_copies ?? []) {
+        if (w.owner === t.id && w.backend === "ovnfs" && w.phase === "creating") reconcileOvnfsResource(project, t, host(t.machine), w);
+      }
+      t = load(project, t.id);
+    }
+    try {
+      t = reconcileWorktree(project, t, host(t.machine));
+      return setWorktreeBlocker(project, t, "");
+    } catch (e) {
+      return setWorktreeBlocker(project, load(project, t.id), e.message);
+    }
+  };
+  return t.working_copy.backend === "ovnfs" ? ovnfsLock(project, check) : check();
 }
 
 function requireLocalPaseo() {
@@ -461,34 +578,42 @@ export async function start(project, a) {
   const safety = loadSafety(config, project.dir);
   const machine = a.machine ?? "";
   if (machine && !a.repo) throw new Error("a remote thread needs --repo: a task with no repository runs as a folder thread in the project, which is local");
-  const kind = a.kind ?? (a.repo ? "worktree" : "tab");
+  const derive = a.from_snapshot !== undefined;
+  const kind = a.kind ?? (derive ? "ovnfs" : a.repo ? "worktree" : "tab");
   if (!["worktree", "ovnfs", "tab", "checkout"].includes(kind)) throw new Error(`\`${kind}\` is not a thread kind (worktree, ovnfs, tab or checkout)`);
-  if (kind !== "tab" && !a.repo) throw new Error(`a ${kind} thread needs --repo`);
+  if (derive && (kind !== "ovnfs" || a.base !== undefined)) throw new Error("--from-snapshot selects OVNFS and does not accept --base");
+  if (kind !== "tab" && !a.repo && !derive) throw new Error(`a ${kind} thread needs --repo`);
   if (kind !== "worktree" && machine) throw new Error(`a ${kind} thread runs locally; a remote repo needs a worktree thread`);
   if (kind === "ovnfs") requireLocalPaseo();
   const profile = resolveProfile(config, safety, settings, "thread", a.profile, project.slug);
   const h = host(machine, config);
+  const ns = kind === "ovnfs" ? managedOvnfs.preflight(h) : null;
   const warnings = [];
   if (a.repo && !settings.repos.some((r) => r.path.replace(/\/+$/, "") === a.repo.replace(/\/+$/, "") && (r.machine ?? "") === machine)) warnings.push(`${a.repo} is not one of the project's repos (\`set ${project.slug} repos.add\` lists it)`);
   const open = list(project).filter((t) => t.status !== "resolved").length;
   if (open >= settings.max_parallel_threads) warnings.push(`${open} threads are already open (max_parallel_threads is ${settings.max_parallel_threads})`);
 
   let repo = "", origin = "";
-  if (a.repo) {
-    repo = a.repo.replace(/\/+$/, "");
-    const top = h.shell("git rev-parse --show-toplevel", repo);
-    if (!top.ok) throw new Error(`${repo}${machine ? ` on ${machine}` : ""} is not a git repository: ${top.out}`);
-    repo = top.stdout.trim();
-    origin = h.shell("git remote get-url origin", repo).stdout.trim();
-  }
-
-  const baseline = kind === "worktree" ? workingCopy.gitBaseline(h, repo, a.base ?? "HEAD") : "";
-  const t = allocate(project, a.task, (t) => {
-    Object.assign(t, { title: a.title.trim(), kind, repo, origin, machine, base: a.base ?? "", profile: profile.name, provider: profile.provider, ...(a.reviews ? { reviews: a.reviews } : {}) });
-    if (hasBranchCheckout(t)) t.branch = branchName(project.slug, t.id, t.title);
-    if (kind === "worktree") t.working_copy = workingCopy.plan(t, baseline);
-    if (kind === "ovnfs") t.ovnfs_name = ovnfs.checkoutName();
-  });
+  const register = () => {
+    const parent = derive ? snapshotSource(project, h, a.from_snapshot) : null;
+    if (parent) managedOvnfs.requireSameNamespace(ns, parent.ovnfs.namespace);
+    if (a.repo || parent) {
+      repo = (a.repo ?? parent.source).replace(/\/+$/, "");
+      const top = h.shell("git rev-parse --show-toplevel", repo);
+      if (!top.ok) throw new Error(`${repo}${machine ? ` on ${machine}` : ""} is not a git repository: ${top.out}`);
+      repo = top.stdout.trim();
+      if (parent && repo !== parent.source) throw new Error("--repo does not match the OVNFS snapshot source");
+      origin = h.shell("git remote get-url origin", repo).stdout.trim();
+    }
+    const baseline = parent?.baseline ?? (hasBranchCheckout({ kind }) ? workingCopy.gitBaseline(h, repo, a.base ?? "HEAD") : "");
+    return allocate(project, a.task, (t) => {
+      Object.assign(t, { title: a.title.trim(), kind, repo, origin, machine, base: a.base ?? "", profile: profile.name, provider: profile.provider, ...(a.reviews ? { reviews: a.reviews } : {}) });
+      if (hasBranchCheckout(t)) t.branch = branchName(project.slug, t.id, t.title);
+      if (kind === "worktree") t.working_copy = workingCopy.plan(t, baseline);
+      if (kind === "ovnfs") t.working_copy = managedOvnfs.plan(t, baseline, ns, parent);
+    });
+  };
+  const t = ns ? ovnfsLock(project, register) : register();
 
   try {
     const c = await client(h.url);
@@ -813,8 +938,8 @@ export async function clean(project, t, { keepWorktree = false, copyComplete = t
       notes.push(`agent not archived: ${e.message}`);
     }
   }
-  // A tab thread's workspace goes with it (its folder stays); a worktree's goes with the worktree below.
-  if ((t.kind === "tab" || (t.kind === "ovnfs" && agentArchived)) && t.workspace_id && !dryRun) notes.push(await archiveWorkspace(h.url, t.workspace_id));
+  // A tab thread's workspace goes with it (its folder stays); a worktree's (and a managed OVNFS copy's) stays with its resource.
+  if ((t.kind === "tab" || (t.kind === "ovnfs" && !t.working_copy && agentArchived)) && t.workspace_id && !dryRun) notes.push(await archiveWorkspace(h.url, t.workspace_id));
   // Paseo's merge auto-archive removes a workspace's worktree whatever pp keeps, so a kept one says so (or that it is unknown).
   const paseoAutoArchive = t.kind === "worktree" && t.workspace_id ? await autoArchiveAfterMerge(h.url) : { on: false };
   const refreshArchive = t.kind === "ovnfs" ? () => finalCopy(project, t) : undefined;
@@ -903,7 +1028,7 @@ export async function resolve(project, id, { keepWorktree = false, force = false
 
 /** Report and library home, less the library paths the thread declared disposable. */
 function finalCopy(project, t) {
-  if (t.kind === "ovnfs" && t.cwd) {
+  if (t.kind === "ovnfs" && !t.working_copy && t.cwd) {
     try { ovnfs.mounted(t); }
     catch (e) { return { outcome: "failed", notes: [], error: e.message }; }
   }

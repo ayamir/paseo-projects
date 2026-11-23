@@ -31,7 +31,9 @@ const SECTIONS = [
     ["board edit <json>", "a settings edit from the board, as the command it maps to"],
   ]],
   ["Threads", [
-    ["thread start <slug> --title T (--task T | --task-file F|- | --from-task TITLE) [--repo PATH] [--kind worktree|ovnfs|tab|checkout] [--machine M] [--profile P] [--base REF] [--reviews PR_URL]"],
+    ["thread start <slug> --title T (--task T | --task-file F|- | --from-task TITLE) [--repo PATH] [--kind worktree|ovnfs|tab|checkout] [--machine M] [--profile P] [--base REF | --from-snapshot THREAD/RESOURCE] [--reviews PR_URL]"],
+    ["thread experiment <slug> <id> --name NAME [--base REF]", "create an owned OVNFS experiment distinct from the main checkout"],
+    ["thread snapshot <slug> <id> --name NAME [--resource NAME]", "freeze an owned OVNFS checkout (main by default) for derivation, not archival"],
     ["thread list <slug> [--all] [--json]"],
     ["thread show <slug> <id> [--json]"],
     ["thread prompt <slug> <id> (--text T | --text-file F|-)"],

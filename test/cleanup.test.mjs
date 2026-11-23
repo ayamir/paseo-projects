@@ -10,6 +10,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
+import { randomUUID } from "node:crypto";
 
 const TMP = realpathSync(tmpdir());
 const BASE = mkdtempSync(join(TMP, "pp-cleanup-"));
@@ -178,7 +179,190 @@ function fixture({ inRepo = false, daemon = "" } = {}) {
   return { id, root, p, repo, wt, td, branch, env, pp, cleanup, item, indexes };
 }
 
-async function ovnfsFixture(mode, fn, startFlags = []) {
+test("explicit OVNFS refuses an unavailable pinned backend before allocating a thread", (t) => {
+  const f = fixture();
+  t.after(() => rmSync(f.root, { recursive: true, force: true }));
+  const before = readdirSync(f.p.path("threads"));
+  const config = join(f.root, "config.json");
+  write(config, JSON.stringify({ profiles: { fake: { provider: "claude/fake-model" } } }));
+  Object.assign(f.env, { PP_CONFIG: config, PATH: `${BASE}:${f.env.PATH}`, FAKE_OVNFS_STATE: join(f.root, "absent") });
+  const r = f.pp("thread", "start", "demo", "--title", "Unavailable OVNFS", "--task", "test", "--kind", "ovnfs", "--repo", f.repo, "--profile", "fake");
+  assert.equal(r.ok, false, r.out);
+  assert.match(r.out, /OVNFS v0\.8\.0/);
+  assert.deepEqual(readdirSync(f.p.path("threads")), before);
+});
+
+const FAKE_OVN_ADMIN = join(BASE, "fake-ovn-admin.mjs");
+write(FAKE_OVN_ADMIN, `import { createServer } from "node:net";
+import { appendFileSync, chmodSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { execFileSync } from "node:child_process";
+const [state, mount, behavior] = process.argv.slice(2);
+const socket = join(state, "admin.sock"), checkouts = [], snapshots = [];
+const meta = { version: 5, proto: "nfs", port: 0, mount, state };
+const git = (...args) => execFileSync("git", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+const contents = new Map();
+const checkIntent = (where, value) => {
+  const dir = readFileSync(join(state, "intent"), "utf8");
+  const intents = readdirSync(dir).filter((n) => /^t-[0-9]+\\.json$/.test(n)).flatMap((n) => {
+    const t = JSON.parse(readFileSync(join(dir, n), "utf8"));
+    return [t.working_copy, ...(t.working_copies ?? [])].filter((w) => w?.owner === t.id);
+  });
+  const matches = intents.filter((w) => w.phase === "creating" && w.ovnfs[where] === value);
+  if (matches.length !== 1) throw new Error("expected one preexisting owned intention for " + value);
+};
+const server = createServer((client) => {
+  let buf = Buffer.alloc(0);
+  const send = (msg) => { const data = Buffer.from(JSON.stringify(msg)), size = Buffer.alloc(4); size.writeUInt32LE(data.length); client.write(Buffer.concat([size, data])); };
+  client.on("error", () => {});
+  client.on("data", (data) => {
+    buf = Buffer.concat([buf, data]);
+    while (buf.length >= 4 && buf.length >= 4 + buf.readUInt32LE()) {
+      const end = 4 + buf.readUInt32LE(), m = JSON.parse(buf.subarray(4, end)); buf = buf.subarray(end);
+      const ok = (data) => send({ id: m.id, ok: data });
+      if (m.hello) { send({ welcome: { ...meta, ops: ["status", "ls", "new", "snap"] } }); continue; }
+      appendFileSync(join(state, "calls"), JSON.stringify(m) + "\\n");
+      if (m.status) ok({ ...meta, socket, pid: process.pid, build_version: "v0.8.0" });
+      else if (m.ls) ok({ checkouts, snapshots });
+      else if (m.new) {
+        const { name, snapshot } = m.new, path = join(mount, name), gd = join(state, "git", name);
+        checkIntent("name", name);
+        const input = snapshot && contents.get(snapshot);
+        if (snapshot ? (!input || m.new.dir || m.new.rev || m.new.rules) : (!m.new.rev || m.new.rules?.[0] !== "hidden *")) throw new Error("unsafe new");
+        const dir = input?.source ?? m.new.dir, rev = input?.rev ?? m.new.rev;
+        mkdirSync(join(state, "git"), { recursive: true });
+        git("clone", "--no-checkout", "--", dir, path);
+        git("-C", path, "checkout", "--detach", rev);
+        if (input) for (const f of readdirSync(input.disk)) cpSync(join(input.disk, f), join(path, f), { recursive: true });
+        git("-C", path, "config", "ovnfs.checkout", name);
+        renameSync(join(path, ".git"), gd);
+        writeFileSync(join(path, ".git"), "gitdir: " + gd + "\\n");
+        const c = { name, path, source: dir, base: input?.base ?? "base-capture-" + (checkouts.length + 1), parent: snapshot, created: new Date().toISOString(), git: true };
+        checkouts.push(c);
+        if (behavior === "ambiguous-new") client.destroy(); else ok({ checkout: c });
+      } else if (m.snap) {
+        const { checkout, label } = m.snap, c = checkouts.find((c) => c.name === checkout);
+        checkIntent("label", label);
+        if (!c || !m.snap.wait) throw new Error("unexpected snapshot input");
+        const id = "s" + (snapshots.length + 1), disk = join(state, id);
+        const row = { id, checkout, label, created: new Date().toISOString(), parent: snapshots.filter((s) => s.checkout === checkout).at(-1)?.id ?? c.parent };
+        mkdirSync(disk);
+        for (const f of readdirSync(c.path).filter((n) => n !== ".git")) cpSync(join(c.path, f), join(disk, f), { recursive: true });
+        contents.set(id, { disk, source: c.source, base: c.base, rev: git("-C", c.path, "rev-parse", "HEAD") });
+        snapshots.push(row);
+        if (behavior !== "pending-snap") row.tree = "tree-" + id;
+        else setTimeout(() => { row.tree = "tree-" + id; }, 1500);
+        if (behavior.includes("-snap")) client.destroy(); else ok({ snapshot: row });
+      } else send({ id: m.id, error: { code: "invalid", message: "unexpected op" } });
+    }
+  });
+});
+server.listen(socket, () => { chmodSync(socket, 0o600); console.log("ready"); });
+`);
+
+async function managedOvnfsFixture(t, mode = "ambiguous-new", daemon = "create-retry") {
+  const projectFile = join(BASE, `managed-ovnfs-project-${n}`);
+  const d = await fakeDaemon(daemon, projectFile);
+  t.after(d.stop);
+  const f = fixture({ daemon: d.url });
+  t.after(() => rmSync(f.root, { recursive: true, force: true }));
+  write(projectFile, f.repo);
+  const bin = join(f.root, "bin"), state = join(f.root, "s"), mount = join(f.root, "mnt");
+  mkdirSync(state, { mode: 0o700 }); mkdirSync(mount);
+  write(join(state, "intent"), f.p.path("threads"));
+  const executable = (name, source) => { const p = join(bin, name); write(p, `#!${process.execPath}\n${source}`); chmodSync(p, 0o755); };
+  executable("ovnfs", `if (process.argv.slice(2).join(" ") === "--json version") console.log(JSON.stringify({ version: "v0.8.0", os: "darwin" })); else process.exit(1);`);
+  executable("ps", `console.log("ovnfs serve --no-git-remotes");`);
+  executable("nfsstat", `import { existsSync } from "node:fs"; const { OVNFS_STATE: s, OVNFS_MOUNT: m } = process.env; console.log(JSON.stringify(existsSync(s + "/unmounted") ? {} : { nfs: { "Mount Point": m, "Current mount parameters": { "NFS parameters": ["vers=3", "ticotsord", "port=" + s + "/nfs.sock", "mountport=" + s + "/nfs.sock"] } } }));`);
+  const admin = spawn(process.execPath, [FAKE_OVN_ADMIN, state, mount, mode], { stdio: ["ignore", "pipe", "inherit"] });
+  t.after(() => admin.kill());
+  await Promise.race([once(admin.stdout, "data"), once(admin, "exit").then(() => { throw new Error("fake OVNFS admin exited"); })]);
+  const config = join(f.root, "config.json");
+  write(config, JSON.stringify({ profiles: { fake: { provider: "claude/fake-model" } } }));
+  Object.assign(f.env, { PP_CONFIG: config, OVNFS_STATE: state, OVNFS_MOUNT: mount, PATH: `${bin}:${f.env.PATH}` });
+  return { ...f, state, mount, next: `t-${Number(f.id.slice(2)) + 1}`,
+    start: (...args) => f.pp("thread", "start", "demo", "--title", "Managed OVNFS", "--task", "test", "--kind", "ovnfs", "--repo", f.repo, "--profile", "fake", ...args),
+    show: (id) => JSON.parse(f.pp("--json", "thread", "show", "demo", id).out),
+    calls: () => readFileSync(join(state, "calls"), "utf8").trim().split("\n").map(JSON.parse) };
+}
+
+test("managed OVNFS reconciles an ambiguous allocation before Agent start and never reallocates", { skip: process.platform !== "darwin" }, async (t) => {
+  const f = await managedOvnfsFixture(t);
+  const r = f.start();
+  assert.equal(r.ok, false, r.out);
+  assert.match(r.out, /agent create refused/);
+  const failed = f.show(f.next);
+  assert.equal(failed.working_copy.backend, "ovnfs");
+  assert.equal(failed.working_copy.owner, f.next);
+  assert.equal(failed.working_copy.phase, "ready");
+  assert.equal(failed.cwd, join(f.mount, f.calls().find((x) => x.new).new.name));
+  write(join(f.state, "unmounted"), "fake");
+  const missing = f.pp("thread", "restart", "demo", f.next);
+  assert.equal(missing.ok, false, missing.out);
+  assert.match(missing.out, /mount/);
+  rmSync(join(f.state, "unmounted"));
+  const retry = f.pp("thread", "restart", "demo", f.next);
+  assert.ok(retry.ok, retry.out);
+  assert.equal(f.show(f.next).cwd, failed.cwd);
+  assert.equal(f.calls().filter((entry) => entry.new).length, 1);
+  assert.equal(git(f.repo, "branch", "--list", failed.branch), "");
+});
+
+test("managed OVNFS registers an experiment and snapshots its own checkout before deriving a new owner", { skip: process.platform !== "darwin" }, async (t) => {
+  const f = await managedOvnfsFixture(t, "ambiguous-snap", "off");
+  const started = f.start(); assert.ok(started.ok, started.out);
+  const experiment = f.pp("thread", "experiment", "demo", f.next, "--name", "scratch");
+  assert.ok(experiment.ok, experiment.out);
+  const parent = f.show(f.next), ex = parent.working_copies.find((w) => w.resource === "scratch");
+  assert.equal(ex.owner, f.next);
+  assert.notEqual(ex.path, parent.cwd);
+  write(join(ex.path, "experiment.txt"), "the frozen input\n");
+  const snap = f.pp("thread", "snapshot", "demo", f.next, "--name", "save", "--resource", "scratch");
+  assert.ok(snap.ok, snap.out);
+  const snapshot = f.show(f.next).working_copies.find((w) => w.resource === "save");
+  assert.equal(snapshot.owner, f.next);
+  assert.equal(snapshot.phase, "ready");
+  assert.equal(snapshot.depends_on[0], ex.nonce);
+  assert.equal(snapshot.identity.checkout, ex.identity.name);
+  assert.equal(f.calls().filter((m) => m.snap).length, 1);
+  const child = f.start("--from-snapshot", `${f.next}/save`);
+  assert.ok(child.ok, child.out);
+  const newId = `t-${Number(f.next.slice(2)) + 1}`, derived = f.show(newId).working_copy;
+  assert.equal(derived.owner, newId);
+  assert.equal(derived.depends_on[0], snapshot.nonce);
+  assert.equal(derived.identity.parent, snapshot.identity.id);
+  assert.equal(readFileSync(join(derived.path, "experiment.txt"), "utf8"), "the frozen input\n");
+  write(join(derived.path, "experiment.txt"), "changed in derived checkout\n");
+  assert.equal(readFileSync(join(ex.path, "experiment.txt"), "utf8"), "the frozen input\n");
+  assert.equal(existsSync(join(f.repo, "experiment.txt")), false);
+  const board = f.pp("board", "thread", "demo", f.next);
+  assert.ok(board.ok, board.out);
+  assert.equal(JSON.parse(board.out).working_copies.find((w) => w.resource === "save").identity.id, snapshot.identity.id);
+});
+
+test("managed OVNFS resolve retains every resource with the missing backend guarantee and never calls rm or drop", { skip: process.platform !== "darwin" }, async (t) => {
+  const f = await managedOvnfsFixture(t, "off", "off");
+  assert.ok(f.start().ok);
+  assert.ok(f.pp("thread", "experiment", "demo", f.next, "--name", "scratch").ok);
+  assert.ok(f.pp("thread", "snapshot", "demo", f.next, "--name", "save", "--resource", "scratch").ok);
+  for (const cmd of [["resolve"], ["cleanup"]]) {
+    const r = f.pp("thread", ...cmd, "demo", f.next);
+    assert.ok(r.ok, r.out);
+    assert.match(r.out, /no identity- or dependency-fenced/);
+    const rec = f.show(f.next);
+    assert.equal(rec.status, "resolved");
+    for (const w of [rec.working_copy, ...rec.working_copies]) {
+      assert.equal(w.disposal.phase, "retained", w.resource);
+      assert.match(w.disposal.blocker, /OVNFS v0\.8\.0 has no identity- or dependency-fenced rm\/drop/);
+      assert.notEqual(w.phase, "removed");
+      if (w.path) assert.ok(existsSync(w.path), w.path);
+    }
+  }
+  assert.deepEqual(f.calls().filter((m) => m.rm || m.drop), []);
+});
+
+// A legacy OVNFS thread (no working_copy) as earlier pp versions recorded it; `--kind ovnfs` now starts managed ones.
+async function ovnfsFixture(mode, fn, extra = {}) {
   const projectFile = join(BASE, `ovnfs-project-${n}`);
   const d = await fakeDaemon(mode, projectFile);
   try {
@@ -191,9 +375,13 @@ async function ovnfsFixture(mode, fn, startFlags = []) {
     const base = git(f.repo, "rev-parse", "HEAD");
     git(f.repo, "commit", "--allow-empty", "-qm", "next");
     git(f.repo, "remote", "add", "origin", "https://github.com/o/r");
-    const r = f.pp("thread", "start", "demo", "--title", "OVNFS test", "--task", "test", "--kind", "ovnfs", "--repo", f.repo, "--base", base, "--profile", "fake", ...startFlags);
-    assert.ok(r.ok, r.out);
     const id = `t-${Number(f.id.slice(2)) + 1}`;
+    const legacy = { ...JSON.parse(readFileSync(f.p.path("threads", `${f.id}.json`), "utf8")), id, title: "OVNFS test", status: "failed", kind: "ovnfs", repo: f.repo,
+      origin: "https://github.com/o/r", branch: `pp-demo-${id}-ovnfs-test`, base, cwd: "", thread_dir: "", workspace_id: "", profile: "fake", provider: "claude/fake-model", ovnfs_name: `pp-${randomUUID()}`, ...extra };
+    writeFileSync(f.p.path("threads", `${id}.json`), JSON.stringify(legacy));
+    writeFileSync(f.p.path("threads", `${id}.task.md`), "test\n");
+    const r = f.pp("thread", "restart", "demo", id);
+    assert.ok(r.ok, r.out);
     const thread = () => JSON.parse(readFileSync(f.p.path("threads", `${id}.json`), "utf8"));
     const t = thread();
     assert.equal(git(t.cwd, "rev-parse", "HEAD"), base);
@@ -1301,7 +1489,7 @@ for (const kind of ["clean", "dirty", "private commit", "published commit", "ref
       if (kind === "dirty") assert.equal(readFileSync(join(t.cwd, "package.json"), "utf8"), '{"dirty":true}\n');
       if (privateTip) assert.ok(git(t.cwd, "reflog", "--format=%H").includes(privateTip));
       else if (kind.endsWith("commit")) assert.equal(git(t.cwd, "log", "-1", "--format=%s"), "reviewer change");
-    }, byFlag ? ["--reviews", REVIEW_URL] : []);
+    }, byFlag ? { reviews: REVIEW_URL } : {});
   });
 }
 
