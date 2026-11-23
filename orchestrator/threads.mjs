@@ -1062,7 +1062,8 @@ async function cleanupLocked(project, id, { dryRun = false, scheduled = false } 
   if (t.status !== "resolved" && !dryRun) throw new Error(`${id} is not resolved; \`thread resolve\` cleans up (\`thread cleanup --dry-run\` previews)`);
   let copied;
   const notes = [];
-  if (!dryRun && t.working_copy?.phase !== "removed") {
+  // Disposal preserves current evidence independently; a background retry must not overwrite home copies.
+  if (!dryRun && !scheduled && t.working_copy?.phase !== "removed") {
     copied = finalCopy(project, t);
     notes.push(...copied.notes, ...(copied.error ? [`the copy home failed: ${copied.error}`] : []));
   } else if (dryRun) notes.push("preview: assumes the final copy completes");

@@ -1185,22 +1185,28 @@ test("managed holds: an expired deadline does not authorize removal of unknown f
   const f = await managedFixture(t);
   assert.ok(f.start().ok);
   const { cwd } = f.board();
+  const thread = JSON.parse(f.pp("thread", "show", "demo", f.id, "--json").out);
+  const library = f.p.path("library", f.id, "notes.txt");
+  write(join(thread.thread_dir, "library", "notes.txt"), "original notes\n");
   const until = new Date(Date.now() + 60_000).toISOString();
   const future = new Date(Date.parse(until) + 1).toISOString();
   const pp = (sub, ...flags) => f.pp("thread", sub, "demo", f.id, ...flags);
   assert.ok(pp("hold", "--reason", "investigating", "--until", until).ok);
   assert.ok(pp("resolve").ok);
   assert.match(f.board().working_copy.disposal.blocker, /hold: investigating/);
+  write(library, "notes edited at home after resolve\n");
   const mystery = join(cwd, "new-data");
   write(mystery, "not cleared for removal\n");
   const tick = async () => assert.equal((await tickOnce(f, future, {}, future)).code, 0);
   await tick();
   assert.match(f.board().working_copy.disposal.blocker, /new-data/);
   assert.equal(readFileSync(mystery, "utf8"), "not cleared for removal\n");
+  assert.equal(readFileSync(library, "utf8"), "notes edited at home after resolve\n");
   rmSync(mystery);
   await tick();
   assert.equal(f.board().working_copy.phase, "removed");
   assert.ok(!existsSync(cwd));
+  assert.equal(readFileSync(library, "utf8"), "notes edited at home after resolve\n");
 });
 
 test("managed cleanup visibility: concurrent blockers and durable, deduplicated exceptions", async (t) => {
