@@ -23,17 +23,23 @@ export const tasksRpc = defineRpc({
   }),
 });
 
-// One thread: report, Next lines, and its registered worktree (null for legacy threads).
+const workingCopy = z.object({
+  owner: z.string(), backend: z.string(), phase: z.string(), baseline: z.string(), source: z.string(),
+  path: z.string(), machine: z.string(), blocker: z.string(),
+  identity: z.object({ git_dir: z.string(), directory: z.string(), registration: z.string() }).nullable(),
+  disposal: z.object({
+    phase: z.string(), blocker: z.string(),
+    evidence: z.object({ path: z.string(), manifest: z.string(), bundle: z.string() }).optional(),
+  }).optional(),
+});
+
+// One thread: report, Next lines, and its registered resources.
 export const threadDetailRpc = defineRpc({
   name: "paseo-projects.thread.detail",
   input: z.object({ project: z.string(), id: z.string() }),
   output: z.object({
     report: z.string(), next: z.array(z.string()), cwd: z.string(), status: z.string(), error: z.string(),
-    working_copy: z.object({
-      owner: z.string(), backend: z.string(), phase: z.string(), baseline: z.string(), source: z.string(),
-      path: z.string(), machine: z.string(), blocker: z.string(),
-      identity: z.object({ git_dir: z.string(), directory: z.string(), registration: z.string() }).nullable(),
-    }).nullable(),
+    working_copy: workingCopy.nullable(), working_copies: z.array(workingCopy).default([]),
   }),
 });
 

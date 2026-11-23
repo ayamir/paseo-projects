@@ -5,9 +5,9 @@ import { once } from "node:events";
 import { setTimeout as delay } from "node:timers/promises";
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
 
@@ -817,6 +817,186 @@ async function managedFixture(t, mode = "off", withProject = false) {
     board: (tid = id) => query("board", "thread", "demo", tid), legacy: f.id };
 }
 
+test("managed disposal: private commits need an explicit declaration, then restore with report and product after removal", async (t) => {
+  const f = await managedFixture(t);
+  const started = f.start();
+  assert.ok(started.ok, started.out);
+  const { cwd, thread_dir: td } = f.show();
+  write(join(cwd, "package.json"), '{"deliverable":true}\n');
+  git(cwd, "commit", "-qam", "private result");
+  const commit = git(cwd, "rev-parse", "HEAD");
+  write(join(td, "report.md"), "final preserved report\n");
+  write(join(td, "library", "result.txt"), "preserved artifact\n");
+  const retained = f.pp("thread", "resolve", "demo", f.id, "--force");
+  assert.ok(retained.ok, retained.out);
+  assert.equal(f.show().status, "resolved");
+  assert.ok(existsSync(cwd));
+  assert.match(retained.out, /commit .*not declared/);
+  assert.equal(f.board().working_copy.disposal.phase, "retained");
+
+  write(join(td, "cleanup.json"), JSON.stringify({ commits: [commit] }));
+  const removed = f.pp("thread", "cleanup", "demo", f.id);
+  assert.ok(removed.ok, removed.out);
+  assert.ok(!existsSync(cwd), removed.out);
+  assert.ok(!git(f.repo, "worktree", "list", "--porcelain").includes(cwd));
+  const w = f.show().working_copy;
+  assert.deepEqual(f.board().working_copy, w);
+  assert.equal(w.phase, "removed");
+  const evidence = w.disposal.evidence;
+  assert.ok(evidence.path.startsWith(f.p.dir + "/"));
+  assert.ok(!evidence.path.startsWith(cwd + "/"));
+  const restored = join(f.root, "restored.git");
+  git(f.root, "clone", "--mirror", join(evidence.path, "commits.bundle"), restored);
+  assert.equal(git(restored, "show", `${commit}:package.json`), '{"deliverable":true}');
+  assert.equal(readFileSync(join(evidence.path, "files", relative(cwd, td), "report.md"), "utf8"), "final preserved report\n");
+  assert.equal(readFileSync(join(evidence.path, "files", relative(cwd, td), "library", "result.txt"), "utf8"), "preserved artifact\n");
+});
+
+test("managed disposal: force and skip-copy do not classify ignored files, tracked edits or abandoned commits", async (t) => {
+  const f = await managedFixture(t);
+  const started = f.start();
+  assert.ok(started.ok, started.out);
+  const { cwd, branch, repo, thread_dir: td } = f.show();
+  const retained = (pattern, ...cmd) => {
+    const result = f.pp("thread", ...cmd, "demo", f.id, ...(cmd[0] === "resolve" ? ["--force", "--skip-copy"] : []));
+    assert.ok(result.ok, result.out);
+    assert.ok(existsSync(cwd));
+    assert.match(f.board().working_copy.disposal.blocker, pattern);
+  };
+  write(join(cwd, "node_modules", ".package-lock.json"), "{}\n");
+  write(join(cwd, "node_modules", "private"), "not a cache\n");
+  write(join(cwd, "out", "result.bin"), "\0classified product\n");
+  write(join(cwd, "TEMP"), "not inherently disposable\n");
+  retained(/unclassified file: TEMP/, "resolve");
+  write(join(td, "cleanup.json"), JSON.stringify({ discard: [{ path: join(cwd, "TEMP") }] }));
+  retained(/unclassified file: node_modules/, "cleanup");
+  const discard = ["TEMP", "node_modules"].map((name) => ({ path: join(cwd, name) }));
+  const save = [{ path: join(cwd, "out", "result.bin") }];
+  write(join(td, "cleanup.json"), JSON.stringify({ discard, save }));
+  write(join(cwd, "package.json"), "modified\n");
+  retained(/unclassified Git modifications/, "cleanup");
+  git(cwd, "commit", "-qam", "abandoned experiment");
+  const abandoned = git(cwd, "rev-parse", "HEAD");
+  git(cwd, "reset", "--hard", "HEAD^");
+  retained(/commit .*not declared/, "cleanup");
+  write(join(td, "cleanup.json"), JSON.stringify({ discard, save, commits: [abandoned] }));
+  const baseline = git(cwd, "rev-parse", "HEAD");
+  const branchOnly = git(repo, "commit-tree", `${baseline}^{tree}`, "-p", baseline, "-m", "branch-only experiment");
+  git(repo, "update-ref", `refs/heads/${branch}`, branchOnly);
+  git(repo, "update-ref", `refs/heads/${branch}`, baseline);
+  retained(new RegExp(`commit ${branchOnly} not declared`), "cleanup");
+  write(join(td, "cleanup.json"), JSON.stringify({ discard, save, commits: [abandoned, branchOnly] }));
+  const removed = f.pp("thread", "cleanup", "demo", f.id);
+  assert.ok(removed.ok, removed.out);
+  assert.ok(!existsSync(cwd), removed.out);
+  const archive = f.board().working_copy.disposal.evidence.path;
+  assert.equal(readFileSync(join(archive, "files", "out", "result.bin"), "utf8"), "\0classified product\n");
+  const restored = join(f.root, "restored.git");
+  git(f.root, "clone", "--mirror", join(archive, "commits.bundle"), restored);
+  assert.equal(git(restored, "show", `${abandoned}:package.json`), "modified");
+  assert.equal(git(restored, "log", "-1", "--format=%s", `refs/heads/saved/${branchOnly}`), "branch-only experiment");
+});
+
+test("managed disposal: recorded path keeps and --keep-worktree survive cleanup and sweep", async (t) => {
+  const f = await managedFixture(t);
+  assert.ok(f.start().ok);
+  const { cwd, thread_dir: td } = f.show();
+  const declaration = join(td, "cleanup.json");
+  const savedDeclaration = f.p.path("threads", `${f.id}.cleanup.json`);
+  write(savedDeclaration, JSON.stringify({ declaration: { keep: [{ path: ".", why: "audit" }] } }));
+  const resolve = f.pp("thread", "resolve", "demo", f.id, "--force");
+  assert.ok(resolve.ok, resolve.out);
+  assert.match(f.board().working_copy.disposal.blocker, /explicit path keep/);
+  rmSync(savedDeclaration);
+  const retry = f.pp("thread", "cleanup", "demo", f.id);
+  assert.ok(retry.ok, retry.out);
+  assert.match(f.board().working_copy.disposal.blocker, /explicit path keep/);
+  assert.ok(existsSync(cwd));
+  write(declaration, "{}");
+  assert.ok(f.pp("thread", "resolve", "demo", f.id, "--reopen").ok);
+  assert.ok(f.pp("thread", "resolve", "demo", f.id, "--keep-worktree", "--force", "--skip-copy").ok);
+  const sweep = f.pp("sweep", "demo", "--yes");
+  assert.ok(sweep.ok, sweep.out);
+  assert.ok(existsSync(cwd));
+  assert.match(f.board().working_copy.disposal.blocker, /--keep-worktree hold/);
+});
+
+test("managed disposal: backend failure leaves recoverable evidence and missing, corrupt or stale proof blocks retry", async (t) => {
+  const f = await managedFixture(t);
+  assert.ok(f.start().ok);
+  const { cwd, thread_dir: td } = f.show();
+  const report = join(td, "report.md");
+  write(report, "verified report\n");
+  const bin = join(f.root, "bin"), realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+  const mode = join(f.root, "backend-mode");
+  write(join(bin, "git"), `#!/usr/bin/env node
+const fs = require('node:fs'), args = process.argv.slice(2);
+const mode = fs.readFileSync(${JSON.stringify(mode)}, 'utf8');
+if (args.includes('status') && mode === 'bad-inspection') {
+  console.error('cannot inspect checkout files');
+  process.exit(0);
+}
+if (args.includes('worktree') && args.includes('remove')) {
+  if (mode === 'noop') process.exit(0);
+  if (mode === 'refuse') process.exit(42);
+}
+const result = require('node:child_process').spawnSync(${JSON.stringify(realGit)}, args, { stdio: 'inherit' });
+if (args.includes('worktree') && args.includes('remove') && fs.readFileSync(${JSON.stringify(mode)}, 'utf8') === 'lost-result' && result.status === 0) process.exit(43);
+process.exit(result.status ?? 1);
+`);
+  chmodSync(join(bin, "git"), 0o755);
+  f.env.PATH = `${bin}:${f.env.PATH}`;
+  const retry = (pattern) => {
+    const result = f.pp("thread", "cleanup", "demo", f.id);
+    assert.ok(result.ok, result.out);
+    if (pattern) {
+      assert.ok(existsSync(cwd), result.out);
+      assert.match(f.board().working_copy.disposal.blocker, pattern);
+    }
+    return result;
+  };
+  write(mode, "bad-inspection");
+  const resolve = f.pp("thread", "resolve", "demo", f.id);
+  assert.ok(resolve.ok, resolve.out);
+  assert.ok(existsSync(cwd), resolve.out);
+  assert.match(f.board().working_copy.disposal.blocker, /cannot inspect checkout files/);
+  write(mode, "refuse");
+  retry(/backend worktree removal failed/);
+  const disposal = f.board().working_copy.disposal;
+  assert.equal(disposal.phase, "unknown");
+  const proof = disposal.evidence;
+  write(mode, "noop");
+  retry(/backend removal could not be verified/);
+  write(mode, "remove");
+  const record = f.p.path("threads", `${f.id}.json`);
+  const savedRecord = readFileSync(record, "utf8");
+  const incomplete = JSON.parse(savedRecord);
+  delete incomplete.working_copy.disposal.evidence;
+  write(record, JSON.stringify(incomplete));
+  renameSync(proof.path, `${proof.path}.backup`);
+  retry(/previous disposal has no verified evidence/);
+  assert.ok(!existsSync(proof.path));
+  renameSync(`${proof.path}.backup`, proof.path);
+  write(record, savedRecord);
+  const saved = join(proof.path, "files", relative(cwd, report));
+  const bundle = join(proof.path, "commits.bundle"), original = readFileSync(bundle);
+  rmSync(bundle);
+  retry(/evidence missing or corrupt: commits.bundle/);
+  write(bundle, original);
+  write(saved, "copied but corrupted\n");
+  retry(/evidence missing or corrupt: .*report.md/);
+  write(saved, "verified report\n");
+  write(report, "changed after verification\n");
+  retry(/evidence is stale/);
+  write(report, "verified report\n");
+  write(mode, "lost-result");
+  const interrupted = retry();
+  assert.ok(!existsSync(cwd), interrupted.out);
+  assert.equal(f.show().working_copy.disposal.phase, "unknown");
+  const reconciled = retry();
+  assert.equal(f.show().working_copy.disposal.phase, "removed", reconciled.out);
+});
+
 test("managed worktree: explicit committed baseline, dirty source unchanged, same resource in CLI and board", async (t) => {
   const f = await managedFixture(t);
   const base = git(f.repo, "rev-parse", "HEAD");
@@ -936,6 +1116,63 @@ const tickOnce = (f, started, view) => new Promise((ok) => {
   c.stdout.on("data", (d) => (out += d)); c.stderr.on("data", (d) => (out += d));
   const timer = setTimeout(() => c.kill(), 120_000);
   c.on("exit", (code) => { clearTimeout(timer); ok({ code, out }); });
+});
+
+test("managed disposal: ticker finishes the thread and removes only unoccupied, dependency-free copies", async (t) => {
+  const f = await managedFixture(t);
+  for (let i = 0; i < 3; i++) assert.ok(f.start().ok);
+  const idAt = (offset) => `t-${Number(f.id.slice(2)) + offset}`;
+  const record = (id) => f.p.path("threads", `${id}.json`);
+  const extras = [idAt(1), idAt(2)].map((id) => {
+    const r = JSON.parse(readFileSync(record(id), "utf8"));
+    rmSync(record(id));
+    return { ...r.working_copy, thread_dir: r.thread_dir, owner: f.id };
+  });
+  const main = JSON.parse(readFileSync(record(f.id), "utf8"));
+  main.working_copies = extras;
+  const reviewed = "https://github.com/o/r/pull/9";
+  write(join(main.thread_dir, "report.md"), `Reviewed-PR: ${reviewed}\n\n## Report\nDone\n`);
+  write(record(f.id), JSON.stringify(main));
+  const progress = f.pp("report", "--thread", `demo/${f.id}`, "--percent", "100");
+  assert.ok(progress.ok, progress.out);
+  const bin = join(f.root, "bin"), probe = join(bin, "lsof");
+  write(probe, `#!/usr/bin/env node\nprocess.stdout.write(${JSON.stringify(`p12345\0\nfcwd\0n${extras[0].path}\0\n`)});\n`);
+  chmodSync(probe, 0o755);
+  f.env.PATH = `${bin}:${f.env.PATH}`;
+  const tick = await tickOnce(f, new Date().toISOString(), { [reviewed]: { state: "MERGED" } });
+  assert.equal(tick.code, 0, tick.out);
+  const initial = f.board();
+  assert.equal(initial.status, "resolved", tick.out);
+  assert.equal(initial.working_copy.disposal.phase, "removed");
+  assert.ok(!existsSync(main.cwd));
+  assert.match(initial.working_copies[0].disposal.blocker, /occupied by process 12345/);
+  assert.ok(existsSync(extras[0].path));
+  assert.equal(initial.working_copies[1].disposal.phase, "removed");
+  assert.ok(!existsSync(extras[1].path));
+
+  const cleanup = () => {
+    const r = f.pp("thread", "cleanup", "demo", f.id);
+    assert.ok(r.ok, r.out);
+    return f.board().working_copies[0].disposal;
+  };
+  write(probe, "#!/bin/sh\nprintf 'invalid data\\000\\n'\n");
+  assert.match(cleanup().blocker, /occupancy probe returned malformed output/);
+  write(probe, "#!/bin/sh\nexit 1\n");
+  assert.match(cleanup().blocker, /occupancy probe failed/);
+  const brokenRecord = record(idAt(2));
+  write(brokenRecord, "not-json");
+  rmSync(probe);
+  assert.match(cleanup().blocker, /dependency inspection failed/);
+  const ref = JSON.parse(readFileSync(record(f.id), "utf8"));
+  ref.working_copies.push({ ...extras[1], nonce: "dependent-snapshot", backend: "snapshot", phase: "ready", disposal: undefined, depends_on: [extras[0].nonce] });
+  rmSync(brokenRecord);
+  write(record(f.id), JSON.stringify(ref));
+  assert.match(cleanup().blocker, /depends on this worktree/);
+  assert.ok(existsSync(extras[0].path));
+  ref.working_copies.pop();
+  write(record(f.id), JSON.stringify(ref));
+  assert.equal(cleanup().phase, "removed");
+  assert.ok(!existsSync(extras[0].path));
 });
 
 test("managed worktree: ticker reconciles an interrupted Git creation without launching an agent", async (t) => {
@@ -1163,19 +1400,20 @@ test("CLI and ticker: follow reviewed PRs and resolve only the merged, finished 
   assert.ok(digest.includes(`${ownUrl} merged`));
   for (const { kind, url, row } of cases.filter(({ kind }) => kind !== "both")) {
     const current = show(row.id);
-    const staysOpen = ["closed", "invalid"].includes(kind), keepsWorktree = staysOpen || kind === "keep";
+    const staysOpen = ["closed", "invalid"].includes(kind), keepsWorktree = staysOpen || ["keep", "commits"].includes(kind);
     assert.equal(current.status, staysOpen ? "open" : "resolved", kind);
     assert.equal(current.pr, "", kind);
     assert.equal(current.pr_state, "", kind);
     assert.equal(existsSync(row.cwd), keepsWorktree, kind);
-    assert.equal(git(repo, "branch", "--list", row.branch) !== "", keepsWorktree || kind === "commits", kind);
+    assert.equal(git(repo, "branch", "--list", row.branch) !== "", keepsWorktree, kind);
+    if (kind === "commits") assert.match(current.working_copy.disposal.blocker, /commit .*not declared/);
     if (staysOpen) continue;
     assert.equal(current.resolved_reason, "reviewed PR merged", kind);
     assert.ok(digest.includes(`${url} merged`), kind);
   }
   assert.equal((digest.match(/closed without merging/g) ?? []).length, 1, digest);
   assert.equal((digest.match(/`Reviewed-PR:` line is not/g) ?? []).length, 1, digest);
-  assert.match(digest, /branch .* kept: it has its own commits/);
+  assert.match(digest, /commit .*not declared for preservation/);
   assert.doesNotMatch(digest, /PR ignored|routine .* prompted/);
   t.diagnostic(digest.split("\n").filter((line) => /closed without merging|was resolved|`Reviewed-PR:` line is not/.test(line)).join("\n"));
 });

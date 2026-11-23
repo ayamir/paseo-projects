@@ -45,7 +45,7 @@ const keepsOf = (t, decl) => decl.keep.map((k) => canon(isAbsolute(k.path) ? k.p
  * Whether a declared path is the thread's to delete (see the rule at the top). `keeps`: the real paths it
  * declared kept; `removedBefore`: the targets an earlier run removed, the only proof a missing path was its.
  */
-function checkDiscard(t, e, { keeps = [], removedBefore = new Set() } = {}) {
+export function checkDiscard(t, e, { keeps = [], removedBefore = new Set() } = {}) {
   const abs = isAbsolute(e.path) ? e.path : resolvePath(t.thread_dir, e.path);
   const item = { kind: "discard", target: canon(abs), why: e.why };
   if (t.machine) return { ...item, status: "kept", reason: "declared paths on another machine are not cleaned from here" };

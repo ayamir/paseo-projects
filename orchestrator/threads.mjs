@@ -9,6 +9,7 @@ import { loadConfig, loadSafety, resolveProfile, agentConfig, kindOf, modelOf, c
 import { prefix } from "./project.mjs";
 import * as inbox from "./inbox.mjs";
 import * as cleanup from "./cleanup.mjs";
+import { dispose } from "./disposal.mjs";
 import * as ovnfs from "./ovnfs.mjs";
 import * as workingCopy from "./working-copy.mjs";
 import { validPrUrl } from "./pr.mjs";
@@ -797,10 +798,8 @@ async function archiveWorkspace(url, id) {
 export async function clean(project, t, { keepWorktree = false, copyComplete = true, archive, mergedHead = "", dryRun = false } = {}) {
   const notes = [];
   let h;
-  try {
-    h = host(t.machine);
-    if (t.working_copy) verifyWorktree(h, t);
-  } catch (e) { return [e.message]; }
+  try { h = host(t.machine); }
+  catch (e) { return [e.message]; }
   let agentArchived = !t.agent_id || dryRun;
   if (t.agent_id && !dryRun) {
     try {
@@ -821,8 +820,24 @@ export async function clean(project, t, { keepWorktree = false, copyComplete = t
   const refreshArchive = t.kind === "ovnfs" ? () => finalCopy(project, t) : undefined;
   let done;
   try {
-    if (t.working_copy) verifyWorktree(h, t);
-    done = await cleanup.run(project, t, h, { keepWorktree, copyComplete, archive, refreshArchive, agentArchived, mergedHead, dryRun, paseoAutoArchive });
+    if (t.working_copy) {
+      const resources = [worktreeRecord(t), ...(t.working_copies ?? [])];
+      const results = resources.map((w, i) => {
+        try {
+          return dispose(project, t, h, w, { keepWorktree, agentArchived, dryRun, save: (disposal) => update(project, t.id, (r) => {
+            const current = i === 0 ? worktreeRecord(r) : r.working_copies?.[i - 1];
+            if (r.status !== "resolved" || current?.nonce !== w.nonce || current.path !== w.path) throw new Error("thread or resource changed during disposal");
+            if (disposal.phase === "removing" && (r.kept_worktree || current.kept_worktree)) throw new Error("explicit --keep-worktree hold");
+            current.disposal = disposal;
+            if (disposal.phase === "removed") current.phase = "removed";
+          }) });
+        } catch (e) { return { gone: false, note: `resource cleanup failed: ${e.message}` }; }
+      });
+      done = { notes: results.map((r) => r.note), worktreeGone: results.every((r) => r.gone) };
+      if (!done.worktreeGone && t.workspace_id && paseoAutoArchive.on !== false) {
+        done.notes.push(paseoAutoArchive.on ? "Paseo merge auto-archive is on and can remove the worktree" : "Paseo merge auto-archive is unknown");
+      }
+    } else done = await cleanup.run(project, t, h, { keepWorktree, copyComplete, archive, refreshArchive, agentArchived, mergedHead, dryRun, paseoAutoArchive });
   }
   catch (e) { return [...notes, `cleanup failed: ${e.message}; \`thread cleanup ${project.slug} ${t.id}\` retries`]; }
   notes.push(...done.notes);
@@ -830,9 +845,6 @@ export async function clean(project, t, { keepWorktree = false, copyComplete = t
   if (!done.worktreeGone) {
     if (t.workspace_id) notes.push("Paseo workspace kept: archiving it could delete the worktree");
     return notes;
-  }
-  if (t.working_copy && done.items.some((i) => i.kind === "worktree" && i.status === "removed")) {
-    update(project, t.id, (r) => { r.working_copy.phase = "removed"; r.working_copy.blocker = ""; });
   }
   if (t.workspace_id) notes.push(await archiveWorkspace(h.url, t.workspace_id));
   if (mergedHead && t.branch) {
@@ -910,10 +922,10 @@ export async function cleanupAgain(project, id, { dryRun = false } = {}) {
   if (t.status !== "resolved" && !dryRun) throw new Error(`${id} is not resolved; \`thread resolve\` cleans up (\`thread cleanup --dry-run\` previews)`);
   let copied;
   const notes = [];
-  if (!dryRun) {
+  if (!dryRun && t.working_copy?.phase !== "removed") {
     copied = finalCopy(project, t);
     notes.push(...copied.notes, ...(copied.error ? [`the copy home failed: ${copied.error}`] : []));
-  } else notes.push("preview: assumes the final copy completes");
+  } else if (dryRun) notes.push("preview: assumes the final copy completes");
   const mergedHead = t.kind === "ovnfs" && t.resolved_reason === "merged" && t.pr_summary?.state === "MERGED" ? t.pr_summary.head_oid : "";
   return [...notes, ...(await clean(project, t, { keepWorktree: t.status === "resolved" && t.kept_worktree, copyComplete: !copied || copied.outcome === "complete", archive: copied, mergedHead, dryRun }))];
 }

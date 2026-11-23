@@ -81,10 +81,11 @@ export function sweepPlan(project) {
   const all = threads.list(project);
   const real = (p) => { try { return realpathSync(p); } catch { return p; } };
   const byCwd = new Map(all.flatMap((t) => {
-    const path = t.working_copy?.path || t.cwd;
-    return path ? [[path, t], [real(path), t]] : [];
+    const copies = [t.working_copy ?? { path: t.cwd }, ...(t.working_copies ?? [])];
+    return copies.filter((w) => w?.path).flatMap((w) => [[w.path, { t, w }], [real(w.path), { t, w }]]);
   }));
-  const managedBranches = new Set(all.filter((t) => t.working_copy && !t.machine).flatMap((t) => [t.branch, t.working_copy.branch]));
+  const managedBranches = new Set(all.flatMap((t) => t.working_copy && !t.machine ? [t.branch, t.working_copy.branch, ...(t.working_copies ?? []).map((w) => w?.branch)] : []));
+  const planned = new Set();
   for (const repo of project.settings().repos.filter((r) => !r.machine)) {
     const r = sh(["git", "-C", repo.path, "worktree", "list", "--porcelain"]);
     if (!r.ok) continue;
@@ -92,17 +93,19 @@ export function sweepPlan(project) {
       const path = /^worktree (.+)$/m.exec(block)?.[1];
       const branch = /^branch refs\/heads\/(.+)$/m.exec(block)?.[1];
       if (!path || !threads.isOwnBranch(project.slug, branch)) continue;
-      const t = byCwd.get(path);
-      if (t && (threads.isOpen(t) || t.kept_worktree || t.working_copy?.phase === "removed")) continue;
-      if (!t && managedBranches.has(branch)) continue; // A moved or substituted managed copy is not a legacy orphan.
-      if (t) plan.push({ what: `clean up ${t.id} again (worktree ${path})`, run: async () => ({ ok: true, out: (await threads.cleanupAgain(project, t.id)).join("; ") }) });
-      else plan.push({ what: `remove worktree ${path} (${branch}), of no thread`, run: async () => {
+      const { t, w } = byCwd.get(path) ?? {};
+      if (t && (threads.isOpen(t) || t.kept_worktree || w.phase === "removed" || planned.has(t.id))) continue;
+      if (!t && (managedBranches.has(branch) || /\/pp-t-\d{4,}-[0-9a-f-]{36}$/.test(path))) continue; // Unconfirmed managed copies are not legacy orphans.
+      if (t) {
+        planned.add(t.id);
+        plan.push({ what: `clean up ${t.id} again (worktree ${path})`, run: async () => ({ ok: true, out: (await threads.cleanupAgain(project, t.id)).join("; ") }) });
+      } else plan.push({ what: `remove worktree ${path} (${branch}), of no thread`, run: async () => {
         const i = await cleanup.removeWorktree(threads.host(null), { cwd: path, repo: repo.path });
         return { ok: i.status === "removed", out: i.reason ?? i.status };
       } });
     }
   }
-  for (const t of all.filter((t) => t.kind === "worktree" && (!t.working_copy || t.working_copy.phase === "removed") && t.status === "resolved" && t.branch && t.repo && !t.machine && t.pr_state === "MERGED")) {
+  for (const t of all.filter((t) => t.kind === "worktree" && !t.working_copy && t.status === "resolved" && t.branch && t.repo && !t.machine && t.pr_state === "MERGED")) {
     const tip = sh(["git", "-C", t.repo, "rev-parse", "--verify", "-q", `refs/heads/${t.branch}`]);
     if (!tip.ok || tip.stdout.trim() !== t.pr_summary?.head_oid) continue;
     if (isDir(t.cwd)) continue; // its worktree is still there; the worktree step goes first
