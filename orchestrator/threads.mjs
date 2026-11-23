@@ -15,7 +15,7 @@ import { LifecycleBusy, withLifecycleLock } from "./lifecycle-lock.mjs";
 import * as ovnfs from "./ovnfs.mjs";
 import * as managedOvnfs from "./managed-ovnfs.mjs";
 import * as workingCopy from "./working-copy.mjs";
-import { discover, isLegacy, verifyLegacyGit } from "./reconciliation.mjs";
+import { branchIdentityBlocker, discover, isLegacy, verifyLegacyGit } from "./reconciliation.mjs";
 import { validPrUrl } from "./pr.mjs";
 
 
@@ -1009,7 +1009,7 @@ export function resourceView(project, t, discovery) {
     const { disposal } = w;
     const hold = removedResource(w) ? "" : holdBlocker(project, t, w);
     const check = disposal?.hold_blocker === disposal?.blocker ? disposal?.check_blocker : disposal?.blocker;
-    const blockers = [...new Set([hold, w.blocker, check].filter(Boolean))];
+    const blockers = [...new Set([hold, w.blocker, check, w === t.working_copy && branchIdentityBlocker(t)].filter(Boolean))];
     const actions = [];
     if (hold) actions.push(`person: thread release ${project.slug} ${t.id}${legacyHold(t) ? "" : ` --resource ${w.nonce}`}`);
     if (t.status === "resolved" && !removedResource(w)) actions.push(`preview: ${retry} --dry-run`, `retry: ${retry}`);
@@ -1140,12 +1140,15 @@ async function clean(project, t, { keepWorktree = false, copyComplete = true, ar
   }
   catch (e) { return [...notes, `cleanup failed: ${e.message}; \`thread cleanup ${project.slug} ${t.id}\` retries`]; }
   notes.push(...done.notes);
+  const branchBlocker = branchIdentityBlocker(t);
+  if (branchBlocker && (mergedHead || t.resolved_reason === "reviewed PR merged")) notes.push(`branch ${t.branch} kept: ${branchBlocker}`);
   if (dryRun || t.kind !== "worktree") return notes;
   if (!done.worktreeGone) {
     if (t.workspace_id) notes.push("Paseo workspace kept: archiving it could delete the worktree");
     return notes;
   }
   if (t.workspace_id) notes.push(await archiveWorkspace(h.url, t.workspace_id));
+  if (branchBlocker) return notes;
   if (mergedHead && t.branch) {
     const tip = h.shell(`git rev-parse --verify -q ${q(`refs/heads/${t.branch}`)}`, t.repo);
     if (!tip.ok) notes.push("no local branch left");

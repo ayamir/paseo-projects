@@ -52,29 +52,38 @@ export function adoptedGitIdentity({ path, source, branch }) {
   return { git_dir, directory, registration, link, repository };
 }
 
-function initialReflog(log, head, registration) {
+function reflogPrefix(log, count) {
+  birthId(log, false);
+  const fd = openSync(log, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
-    birthId(log, false);
-    const fd = openSync(log, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-    try {
-      const buf = Buffer.alloc(4096);
-      const raw = buf.subarray(0, readSync(fd, buf, 0, buf.length, 0));
-      if (!raw.includes(10)) throw new Error();
-      const [old, base] = raw.toString("utf8", 0, raw.indexOf(10)).split(" ", 2);
-      const stamp = / (\d+) [+-]\d{4}$/.exec(raw.toString("utf8", 0, raw.indexOf(10)).split("\t", 1)[0]);
-      const born = BigInt(registration.split(":")[2]) / 1_000_000_000n;
-      // Expiring and rewriting the log can reconstruct a zero predecessor, but not its original timestamp.
-      if (old !== "0".repeat(head.length) || !commitOid.test(base) || !stamp || BigInt(stamp[1]) < born - 1n || BigInt(stamp[1]) > born + 1n) throw new Error();
-      return base;
-    } finally { closeSync(fd); }
-  } catch { throw new Error("Git registration's original checkout commit cannot be verified (the origin log may have expired)"); }
+    const buf = Buffer.alloc(4096);
+    // The last element may be truncated; read only the required complete entries.
+    const lines = buf.toString("utf8", 0, readSync(fd, buf, 0, buf.length, 0)).split("\n");
+    if (lines.length <= count) throw new Error();
+    return lines.slice(0, count).map((line) => {
+      const [meta, action = ""] = line.split("\t", 2);
+      const [old, next] = meta.split(" ", 2);
+      const stamp = / (\d+) [+-]\d{4}$/.exec(meta);
+      if (!commitOid.test(old) || !commitOid.test(next) || !stamp) throw new Error();
+      return { old, next, action, stamp: BigInt(stamp[1]) };
+    });
+  } finally { closeSync(fd); }
 }
 
-export const adoptionBase = ({ identity }, head) => initialReflog(join(identity.git_dir, "logs", "HEAD"), head, identity.registration);
-
-export function verifyLegacyGitOrigin(identity, branch, head, origin) {
-  const log = join(dirname(dirname(identity.git_dir)), "logs", "refs", "heads", branch);
-  return adoptionBase({ identity }, head) === origin && initialReflog(log, head, identity.registration) === origin;
+export function adoptionBase({ identity, branch }, head) {
+  try {
+    const [start, reset] = reflogPrefix(join(identity.git_dir, "logs", "HEAD"), 2);
+    const [created] = reflogPrefix(join(dirname(dirname(identity.git_dir)), "logs", "refs", "heads", branch), 1);
+    const born = BigInt(identity.registration.split(":")[2]) / 1_000_000_000n;
+    const contemporaneous = (r) => r.stamp >= born - 1n && r.stamp <= born + 1n;
+    const zero = "0".repeat(head.length), base = start.next;
+    // A rewrite can fabricate a zero predecessor at the same second. Require the native
+    // linked-worktree creation sequence AND the independent branch creation entry.
+    if (start.old !== zero || start.action !== "" || reset.old !== base || reset.next !== base || reset.action !== "reset: moving to HEAD" ||
+        created.old !== zero || created.next !== base || !created.action.startsWith("branch: Created from ") ||
+        ![start, reset, created].every(contemporaneous)) throw new Error();
+    return base;
+  } catch { throw new Error("Git registration's original checkout commit cannot be verified (native creation logs may be missing or rewritten)"); }
 }
 
 export function verifyAdoptionBase(w, base) {

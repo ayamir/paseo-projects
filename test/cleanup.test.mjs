@@ -5,7 +5,7 @@ import { once } from "node:events";
 import { setTimeout as delay } from "node:timers/promises";
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -1400,6 +1400,69 @@ test("reconciliation legacy cleanup does not remove a replacement with the same 
   assert.ok(result.ok, result.out);
   assert.ok(existsSync(f.wt), result.out);
   assert.ok(existsSync(join(moved, ".paseo-project", `demo-${f.id}`, "report.md")));
+});
+
+test("reconciliation cleanup retains a same-tip replacement branch and its reflog-only commit", (t) => {
+  const f = fixture();
+  t.after(() => rmSync(f.root, { recursive: true, force: true }));
+  const file = f.p.path("threads", `${f.id}.json`);
+  const record = JSON.parse(readFileSync(file));
+  const base = record.branch_start.oid;
+  write(file, JSON.stringify({ ...record, status: "resolved", resolved_reason: "reviewed PR merged" }));
+  git(f.repo, "worktree", "remove", "--force", f.wt);
+  git(f.repo, "branch", "-D", f.branch);
+  git(f.repo, "switch", "-qc", f.branch, base);
+  git(f.repo, "commit", "-q", "--allow-empty", "-m", "reflog-only replacement commit");
+  const privateTip = git(f.repo, "rev-parse", "HEAD");
+  git(f.repo, "reset", "-q", "--hard", base);
+  git(f.repo, "switch", "-q", "main");
+  assert.equal(git(f.repo, "for-each-ref", "--contains", privateTip), "");
+  const reflog = git(f.repo, "reflog", "show", "--format=%H", f.branch);
+  assert.ok(reflog.includes(privateTip));
+
+  const result = f.pp("thread", "cleanup", "demo", f.id);
+  assert.ok(result.ok, result.out);
+  assert.match(result.out, /branch .* kept: .*branch identity/);
+  assert.equal(git(f.repo, "rev-parse", `refs/heads/${f.branch}`), base);
+  assert.equal(git(f.repo, "reflog", "show", "--format=%H", f.branch), reflog);
+  const detail = JSON.parse(f.pp("board", "thread", "demo", f.id).out);
+  assert.match(detail.reconciliation[0].blockers.join("; "), /branch identity/);
+});
+
+test("reconciliation refuses an adoption origin rewritten by git reflog delete", async (t) => {
+  const f = await managedFixture(t);
+  const started = f.start();
+  assert.ok(started.ok, started.out);
+  const path = join(f.root, "rewritten-origin");
+  git(f.repo, "worktree", "add", "-qb", "rewritten-origin", path);
+  const initial = git(path, "rev-parse", "HEAD");
+  const find = () => {
+    const result = f.pp("thread", "discover", "demo");
+    assert.ok(result.ok, result.out);
+    return JSON.parse(result.out).find((row) => row.path === path);
+  };
+  assert.equal(find().baseline, initial);
+  const gitDir = git(path, "rev-parse", "--absolute-git-dir");
+  const born = Math.floor(statSync(gitDir).birthtimeMs / 1000);
+  execFileSync("git", [...G, "-C", path, "commit", "-q", "--allow-empty", "-m", "later commit"], {
+    env: { ...process.env, GIT_COMMITTER_DATE: `@${born} +0000` }, stdio: ["ignore", "pipe", "pipe"],
+  });
+  const later = git(path, "rev-parse", "HEAD");
+  git(f.repo, "merge", "-q", "--ff-only", later); // satisfy source reachability; it is not origin evidence
+  const token = find().candidate;
+  assert.match(token, /^[a-f0-9]{64}$/);
+  // Remove the two native creation entries. Git now writes a zero predecessor for the later commit.
+  git(path, "reflog", "delete", "--rewrite", "HEAD@{2}", "HEAD@{1}");
+  const log = readFileSync(join(gitDir, "logs", "HEAD"), "utf8");
+  assert.ok(log.startsWith(`${"0".repeat(initial.length)} ${later} `), log);
+  const row = find();
+  const adopted = terminalResult(f, "thread", "adopt", "demo", f.id, "--candidate", row.candidate || token, "--base", later);
+  assert.notEqual(adopted.status, 0, adopted.out);
+  assert.match(adopted.out, /no longer verified/);
+  assert.equal(row.candidate, "");
+  assert.ok(!row.baseline);
+  assert.match(row.blockers.join("; "), /original checkout commit cannot be verified/);
+  assert.deepEqual(f.board().working_copies, []);
 });
 
 test("reconciliation discovers the pinned OVNFS registry without adopting or mutating it", { skip: process.platform !== "darwin" }, async (t) => {

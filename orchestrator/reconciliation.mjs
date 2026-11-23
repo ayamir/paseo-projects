@@ -3,9 +3,11 @@ import { lstatSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { sha256 } from "./lib.mjs";
 import { readInventory } from "./managed-ovnfs.mjs";
-import { adoptedGitIdentity, adoptionBase, commitOid, linkedWorktrees, verifyAdoptionBase, verifyLegacyGitOrigin } from "./working-copy.mjs";
+import { adoptedGitIdentity, adoptionBase, commitOid, linkedWorktrees, verifyAdoptionBase } from "./working-copy.mjs";
 
 export const isLegacy = (t) => !t.working_copy && ["worktree", "ovnfs"].includes(t.kind);
+export const branchIdentityBlocker = (t) => t.kind === "worktree" && t.branch && (isLegacy(t) || t.working_copy?.adoption)
+  ? "PP has no recorded branch identity; the branch and its reflog are not eligible for removal" : "";
 const real = (p) => { try { return realpathSync(p); } catch { return p; } };
 
 function ownership(project) {
@@ -48,7 +50,7 @@ export function verifyLegacyGit(project, t) {
   if (t.thread_dir !== join(t.cwd, ".paseo-project", `${project.slug}-${t.id}`) || realpathSync(t.thread_dir) !== dir || realpathSync(dir) !== dir) throw new Error("original PP thread directory could not be verified");
   const meta = lstatSync(dir, { bigint: true });
   const born = BigInt(identity.registration.split(":")[2]);
-  if (!meta.isDirectory() || meta.birthtimeNs < born || !verifyLegacyGitOrigin(identity, t.branch, rows[0].head, t.branch_start.oid)) throw new Error("legacy checkout no longer matches its PP records");
+  if (!meta.isDirectory() || meta.birthtimeNs < born || adoptionBase({ identity, branch: t.branch }, rows[0].head) !== t.branch_start.oid) throw new Error("legacy checkout no longer matches its PP records");
   return identity;
 }
 
@@ -63,6 +65,8 @@ export function legacyResource(project, t, proof) {
     ? "legacy OVNFS namespace, checkout identity and original Git baseline cannot be verified"
     : proof?.blocker || "historical Git registration is missing, changed, or unverified";
   const blockers = ["legacy resource not adopted", ...(!proof?.candidate ? [blocker] : [])];
+  const branch = branchIdentityBlocker(t);
+  if (branch) blockers.push(branch);
   if (Object.hasOwn(t, "kept_worktree") && t.kept_worktree !== false) blockers.push(t.kept_worktree === true ? "explicit legacy keep" : "legacy keep is unknown");
   return pending(project, { owner: t.id, backend: t.kind === "ovnfs" ? "ovnfs" : "git-worktree", path: t.cwd ?? "", source: t.repo ?? "", machine: t.machine ?? "", ...(proof?.baseline ? { baseline: proof.baseline } : {}) }, blockers, proof?.candidate);
 }
