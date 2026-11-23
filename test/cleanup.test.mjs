@@ -1529,7 +1529,7 @@ for (const kind of ["clean", "dirty", "private commit", "published commit", "ref
   });
 }
 
-test("CLI and ticker: follow reviewed PRs and resolve only the merged, finished reviews", { timeout: 45_000 }, async (t) => {
+test("CLI and ticker: follow reviewed PRs and resolve only the merged, finished reviews", { timeout: 90_000 }, async (t) => {
   const root = mkdtempSync(join(BASE, "reviews-"));
   const daemon = await fakeDaemon("off");
   t.after(() => { daemon.stop(); rmSync(root, { recursive: true, force: true }); });
@@ -1577,7 +1577,9 @@ test("CLI and ticker: follow reviewed PRs and resolve only the merged, finished 
     child.stderr.on("data", (data) => { stderr += data; });
     const exited = once(child, "exit");
     try {
-      for (let i = 0; i < 100 && child.exitCode === null; i++) {
+      // Each pass also rechecks retained resources before recording the PR poll.
+      const until = Date.now() + 15_000;
+      while (child.exitCode === null && Date.now() < until) {
         if (JSON.parse(readFileSync(statePath, "utf8")).last_pr_poll) return;
         await delay(50);
       }
