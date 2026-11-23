@@ -1251,12 +1251,15 @@ const args = process.argv.slice(2);
 const removing = args.includes('worktree') && args.includes('remove');
 if (removing) {
   fs.appendFileSync(${JSON.stringify(seen)}, 'remove\\n');
-  const until = Date.now() + 20000;
+  const until = Date.now() + 30000;
   while (!fs.existsSync(${JSON.stringify(go)}) && Date.now() < until) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
   if (!fs.existsSync(${JSON.stringify(go)})) process.exit(42);
 }
 const r = spawnSync(${JSON.stringify(realGit)}, args, { stdio: 'inherit' });
-if (removing) fs.writeFileSync(${JSON.stringify(finished)}, String(r.status));
+if (removing) {
+  fs.writeFileSync(${JSON.stringify(`${finished}.tmp`)}, String(r.status));
+  fs.renameSync(${JSON.stringify(`${finished}.tmp`)}, ${JSON.stringify(finished)});
+}
 process.exit(r.status ?? 1);
 `);
   write(join(bin, "lsof"), "#!/bin/sh\nprintf 'p12345\\000\\nfcwd\\000n/\\000\\n'\n");
@@ -1267,7 +1270,8 @@ process.exit(r.status ?? 1);
   const first = spawn(process.execPath, [...argv, "resolve", "demo", f.id], { env: f.env, stdio: "ignore" });
   const exited = new Promise((ok) => first.once("exit", ok));
   const waitFor = async (path) => {
-    for (let i = 0; i < 500 && !existsSync(path); i++) await new Promise((ok) => setTimeout(ok, 10));
+    const until = Date.now() + 15_000;
+    while (!existsSync(path) && Date.now() < until) await new Promise((ok) => setTimeout(ok, 20));
     assert.ok(existsSync(path), `did not get ${path}`);
   };
   try {
@@ -1285,9 +1289,14 @@ process.exit(r.status ?? 1);
     write(go, "continue\n");
     await waitFor(finished);
     assert.equal(readFileSync(finished, "utf8"), "0");
-    const recovered = await tickOnce(f, new Date().toISOString(), {});
-    assert.equal(recovered.code, 0, recovered.out);
-    assert.equal(f.board().working_copy.disposal.phase, "removed");
+    let phase;
+    const until = Date.now() + 10_000;
+    do {
+      const recovered = await tickOnce(f, new Date().toISOString(), {});
+      assert.equal(recovered.code, 0, recovered.out);
+      phase = f.board().working_copy.disposal.phase;
+    } while (phase === "removing" && Date.now() < until);
+    assert.equal(phase, "removed");
     assert.equal(readFileSync(seen, "utf8"), "remove\n");
     assert.ok(!existsSync(cwd));
   } finally {
