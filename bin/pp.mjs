@@ -221,7 +221,8 @@ async function threadCommand([sub, slug, id], f, root, proj) {
         for (const blocker of w.blockers) console.log(`working copy blocker: ${blocker}`);
         for (const action of w.actions) console.log(`working copy action: ${action}`);
       }
-      for (const w of copies.reconciliation) console.log(`reconciliation: ${w.backend} (${w.phase}) ${w.path}\n${[...w.blockers, ...w.actions].join("\n")}`);
+      for (const w of copies.reconciliation) console.log([`reconciliation: ${w.backend} (${w.phase}) ${w.path}`,
+        ...(w.disposal ? [`disposal: ${w.disposal.phase}`] : []), ...w.blockers, ...w.actions].join("\n"));
       threads.allNext(p, t.id).forEach((l, i) => console.log(`next ${i + 1}: ${l}`));
       return;
     }

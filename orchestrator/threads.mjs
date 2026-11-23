@@ -966,10 +966,24 @@ function holdBlocker(project, t, w) {
   return "hold is unknown; only a person can release it";
 }
 
-export const reconciliation = (project) => discover(project, list(project)).items;
+export const legacyCleanupBlocker = (project, t) => isLegacy(t) && t.kind === "worktree" && t.status === "resolved"
+  ? cleanup.blockedLegacyWorktree(project, t)?.reason ?? "" : "";
+
+function reconciliationRows(project, listed) {
+  const blocked = new Map(listed.map((t) => [t.id, legacyCleanupBlocker(project, t)]));
+  return discover(project, listed).items.map((w) => {
+    const blocker = blocked.get(w.owner);
+    if (!blocker) return w;
+    const retry = `thread cleanup ${project.slug} ${w.owner}`;
+    return { ...w, disposal: { phase: "blocked", blocker }, blockers: [...w.blockers, blocker],
+      actions: [...w.actions, `preview: ${retry} --dry-run`, `explicit retry: ${retry}`] };
+  });
+}
+
+export const reconciliation = (project) => reconciliationRows(project, list(project));
 
 export function boardResources(project) {
-  const listed = list(project), pending = discover(project, listed).items;
+  const listed = list(project), pending = reconciliationRows(project, listed);
   for (const t of listed) {
     if (pendingDisposal(t)) {
       const { working_copy, working_copies } = resourceView(project, t, pending);

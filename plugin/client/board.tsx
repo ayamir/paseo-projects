@@ -191,7 +191,7 @@ export function BoardScreen({ theme, layout }: PluginScreenProps) {
 function ResourceSummaries({ rows, styles }: { rows: ResourceSummary[]; styles: any }) {
   return <>{rows.map((r, i) => (
     <View key={`${r.project}:${r.owner}:${r.path}:${r.resource ?? ""}:${i}`} style={styles.card}>
-      <Text style={styles.meta}>{r.project}{r.owner ? ` · ${r.owner}` : ""} · {r.backend} · {r.phase}{r.machine ? ` · ${r.machine}` : ""}</Text>
+      <Text style={styles.meta}>{r.project}{r.owner ? ` · ${r.owner}` : ""} · {r.backend} · {r.phase}{r.disposal ? ` · cleanup ${r.disposal.phase}` : ""}{r.machine ? ` · ${r.machine}` : ""}</Text>
       {r.path || r.resource ? <Text style={styles.mono}>{r.path || r.resource}</Text> : null}
       {r.branch ? <Text style={styles.mono}>分支：{r.branch} ({r.source})</Text> : null}
       {r.baseline ? <Text style={styles.mono}>基线：{r.baseline}</Text> : null}

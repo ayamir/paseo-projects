@@ -151,9 +151,13 @@ export async function tick(project, started = now()) {
     }
   }
 
-  for (const t of threads.list(project).filter(threads.pendingDisposal)) {
-    try { await threads.cleanupAgain(project, t.id, { scheduled: true }); }
-    catch (e) { if (!(e instanceof LifecycleBusy)) console.error(`${now()} ${project.slug} ${t.id}: ${e.message}`); }
+  for (const t of threads.list(project)) {
+    try {
+      if (threads.pendingDisposal(t)) await threads.cleanupAgain(project, t.id, { scheduled: true });
+      const blocker = threads.legacyCleanupBlocker(project, t);
+      if (blocker) inbox.write(project, "cleanup", t.id, "resource blocked",
+        `${t.id} legacy Git cleanup blocked: ${blocker}; thread cleanup ${project.slug} ${t.id} --dry-run previews`, "", `legacy:${blocker}`);
+    } catch (e) { if (!(e instanceof LifecycleBusy)) console.error(`${now()} ${project.slug} ${t.id}: ${e.message}`); }
   }
   if (pollPrs) {
     await followPrs(project, settings, state, agents, at);

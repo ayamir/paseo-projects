@@ -1424,16 +1424,56 @@ test("reconciliation legacy cleanup keeps commits reachable only from the linked
   assert.ok(f.pp("sweep", "demo", "--yes").ok);
   assert.ok(existsSync(f.wt));
 
+  const file = f.p.path("threads", `${f.id}.cleanup.json`);
+  const previous = existsSync(file) ? readFileSync(file, "utf8") : null;
   const dryRun = f.pp("thread", "cleanup", "demo", f.id, "--dry-run");
   assert.ok(dryRun.ok, dryRun.out);
-  assert.match(dryRun.out, /worktree kept: .*worktree HEAD reflog/);
+  assert.equal(existsSync(file) ? readFileSync(file, "utf8") : null, previous);
   assert.doesNotMatch(dryRun.out, /worktree would be removed/);
   const cleanup = f.pp("thread", "cleanup", "demo", f.id);
   assert.ok(cleanup.ok, cleanup.out);
-  assert.match(cleanup.out, /worktree kept: .*worktree HEAD reflog/);
   assert.ok(existsSync(f.wt));
   assert.ok(git(f.repo, "rev-list", "--all", "--reflog").includes(detached));
-  assert.equal(f.item("worktree").status, "kept");
+  const record = f.cleanup(), item = f.item("worktree");
+  assert.equal(record.state, "blocked");
+  assert.equal(item.status, "blocked");
+  assert.equal(record.archive, "complete");
+  assert.equal(record.archive_scope, "report-and-library");
+  assert.equal(record.git_history_archive, "unknown");
+  assert.equal(record.removed_kib, 0);
+  const markdown = readFileSync(f.p.path("threads", `${f.id}.cleanup.md`), "utf8");
+  assert.match(markdown, /report\/library archive \*\*complete\*\*; Git history archive \*\*unknown\*\*/);
+  assert.match(item.reason, /worktree HEAD reflog/);
+  assert.ok(dryRun.out.includes(`worktree blocked: ${item.reason}`), dryRun.out);
+  assert.ok(cleanup.out.includes(`worktree blocked: ${item.reason}`), cleanup.out);
+  const detail = JSON.parse(f.pp("board", "thread", "demo", f.id).out).reconciliation.find((row) => row.path === f.wt);
+  const board = JSON.parse(f.pp("board", "resources").out).find((row) => row.owner === f.id && row.path === f.wt);
+  assert.equal(detail.phase, "pending-confirmation");
+  assert.equal(detail.disposal.phase, "blocked");
+  assert.ok(detail.blockers.includes(item.reason));
+  assert.deepEqual(board, detail);
+  const show = f.pp("thread", "show", "demo", f.id).out;
+  assert.match(show, /disposal: blocked/);
+  assert.ok(show.includes(item.reason));
+
+  for (let run = 0; run < 2; run++) {
+    const tick = await tickOnce(f, new Date().toISOString(), {});
+    assert.equal(tick.code, 0, tick.out);
+  }
+  assert.deepEqual(f.cleanup(), record, "the ticker must not retry unadopted cleanup");
+  const inbox = f.pp("inbox", "list", "demo").out.split("\n");
+  assert.equal(inbox.filter((line) => line.includes(`legacy Git cleanup blocked: ${item.reason}`)).length, 1);
+  assert.ok(f.pp("thread", "cleanup", "demo", f.id, "--dry-run").out.includes(item.reason));
+  assert.deepEqual(f.cleanup(), record, "preview must not replace an existing blocker record");
+
+  git(f.repo, "branch", "preserved-detached-work", detached);
+  const retry = f.pp("thread", "cleanup", "demo", f.id);
+  assert.ok(retry.ok, retry.out);
+  assert.equal(f.cleanup().state, "complete");
+  assert.equal(f.item("worktree").status, "removed");
+  assert.equal(git(f.repo, "rev-parse", "preserved-detached-work"), detached);
+  const retried = JSON.parse(f.pp("board", "thread", "demo", f.id).out).reconciliation.find((row) => row.path === f.wt);
+  assert.ok(!retried?.disposal);
 });
 
 test("reconciliation cleanup retains a same-tip replacement branch and its reflog-only commit", (t) => {
