@@ -262,10 +262,18 @@ function evidence(project, w, manifest) {
   } finally { rmSync(stage, { recursive: true, force: true }); }
 }
 
-export function dispose(project, t, h, w, { keepWorktree, agentArchived, dryRun, save }) {
+export function dispose(project, t, h, w, options) {
+  const { keepWorktree, agentArchived, dryRun, save, holdBlocker } = options;
   const path = w.path;
+  const hold = holdBlocker || ((keepWorktree || w.kept_worktree) ? "explicit --keep-worktree hold" : "");
   let proof = w.disposal?.evidence, pathKeep = w.disposal?.path_keep;
   let phase = ["removing", "unknown", "removed"].includes(w.disposal?.phase) ? "unknown" : "retained";
+  const retained = (check) => {
+    const blocker = hold || check;
+    const detail = [...new Set([hold, check].filter(Boolean))].join("; ");
+    if (!dryRun) save({ phase, blocker, ...(hold ? { hold_blocker: hold, check_blocker: check } : {}), ...(pathKeep ? { path_keep: true } : {}), ...(proof ? { evidence: proof } : {}) });
+    return { gone: false, note: `worktree kept: ${path}: ${detail}; thread cleanup retries` };
+  };
   const withoutHold = () => {
     const d = declaration(project, t, w);
     pathKeep = d.keep;
@@ -273,7 +281,6 @@ export function dispose(project, t, h, w, { keepWorktree, agentArchived, dryRun,
     return d;
   };
   try {
-    if (keepWorktree || w.kept_worktree) fail("explicit --keep-worktree hold");
     if (!agentArchived) fail("agent archive unconfirmed");
     if (h.remote || w.machine !== t.machine) fail("independent evidence verification for remote worktrees is not supported");
     if (w.owner !== t.id || w.backend !== "git-worktree" || !w.identity || !/^[a-f0-9-]{36}$/.test(w.nonce)) fail("unsupported or unconfirmed resource identity");
@@ -284,6 +291,7 @@ export function dispose(project, t, h, w, { keepWorktree, agentArchived, dryRun,
     if (phase === "unknown" && !stat(path)) {
       const manifest = storedManifest(proof, evidencePath(project, w), w.nonce);
       if (!backendGone(w, manifest)) fail("backend removal could not be verified");
+      if (hold) return retained("");
       if (!dryRun && w.disposal.phase !== "removed") save({ phase: "removed", blocker: "", evidence: proof });
       return { gone: true, note: `worktree removal verified: ${path}` };
     }
@@ -293,6 +301,7 @@ export function dispose(project, t, h, w, { keepWorktree, agentArchived, dryRun,
     checkOccupancy(path);
     const manifest = inspect(t, w, declared);
     if (proof) verifyEvidence(proof, evidencePath(project, w), manifest);
+    if (hold) return retained("");
     if (dryRun) return { gone: false, note: `worktree would be archived and removed if evidence verifies: ${path}` };
     proof ??= evidence(project, w, manifest);
     save({ phase: "archived", blocker: "", evidence: proof });
@@ -307,8 +316,5 @@ export function dispose(project, t, h, w, { keepWorktree, agentArchived, dryRun,
     if (!backendGone(w, manifest)) fail("backend removal could not be verified");
     save({ phase: "removed", blocker: "", evidence: proof });
     return { gone: true, note: `worktree removed: ${path}` };
-  } catch (e) {
-    if (!dryRun) save({ phase, blocker: e.message, ...(pathKeep ? { path_keep: true } : {}), ...(proof ? { evidence: proof } : {}) });
-    return { gone: false, note: `worktree kept: ${path}: ${e.message}; thread cleanup retries` };
-  }
+  } catch (e) { return retained(e.message); }
 }

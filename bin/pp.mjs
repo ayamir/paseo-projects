@@ -150,7 +150,7 @@ async function main() {
         const p = proj(a2, "board thread <slug> <id>");
         const t = threads.load(p, need(a3, "board thread <slug> <id>"));
         const report = readText(threads.homeReportPath(p, t.id));
-        console.log(JSON.stringify({ report: report || "(no report yet)", next: threads.allNext(p, t.id), cwd: t.cwd ?? "", status: t.status ?? "", error: t.error ?? "", working_copy: t.working_copy ?? null, working_copies: t.working_copies ?? [] }));
+        console.log(JSON.stringify({ report: report || "(no report yet)", next: threads.allNext(p, t.id), cwd: t.cwd ?? "", status: t.status ?? "", error: t.error ?? "", ...threads.resourceView(p, t) }));
         return;
       }
       if (a1 === "settings") { const choices = await boardChoices(root); console.log(JSON.stringify({ ...boardData(root, a1, choices.kinds), choices })); return; }
@@ -196,13 +196,15 @@ async function threadCommand([sub, slug, id], f, root, proj) {
       console.log(threads.rowLine(r));
       console.log(`state: ${threads.stateLine(r.live)}`);
       for (const [k, v] of [["kind", t.kind], ["branch", t.branch], ["cwd", t.cwd], ["agent", t.agent_id], ["created", t.created], ["pr", t.pr && `${t.pr} (${t.pr_state}${t.pr_review ? `, ${t.pr_review}` : ""})`], ["error", t.error], ["report", threads.homeReportPath(p, t.id)]]) if (v) console.log(`${k}: ${v}`);
-      for (const w of [t.working_copy, ...(t.working_copies ?? [])].filter(Boolean)) {
-        console.log(`working copy: ${w.backend} (${w.phase}) ${w.path}\nbaseline: ${w.baseline}`);
-        if (w.blocker) console.log(`working copy blocker: ${w.blocker}`);
+      const copies = threads.resourceView(p, t);
+      for (const w of [copies.working_copy, ...copies.working_copies].filter(Boolean)) {
+        console.log(`working copy: ${w.backend} (${w.phase}) ${w.path}\nbaseline: ${w.baseline}\nresource: ${w.nonce}`);
         if (w.disposal) {
-          console.log(`disposal: ${w.disposal.phase}${w.disposal.blocker ? ` — ${w.disposal.blocker}` : ""}`);
+          console.log(`disposal: ${w.disposal.phase}`);
           if (w.disposal.evidence) console.log(`disposal evidence: ${w.disposal.evidence.path}`);
         }
+        for (const blocker of w.blockers) console.log(`working copy blocker: ${blocker}`);
+        for (const action of w.actions) console.log(`working copy action: ${action}`);
       }
       threads.allNext(p, t.id).forEach((l, i) => console.log(`next ${i + 1}: ${l}`));
       return;
@@ -229,7 +231,17 @@ async function threadCommand([sub, slug, id], f, root, proj) {
     }
     case "cleanup": {
       const notes = await threads.cleanupAgain(p, tid(), { dryRun: Boolean(f["dry-run"]) });
-      console.log(`${id}${f["dry-run"] ? " cleanup preview" : " cleaned up"}: ${notes.join("; ") || "nothing to clean"}`);
+      console.log(`${id}${f["dry-run"] ? " cleanup preview" : " cleanup checked"}: ${notes.join("; ") || "nothing to clean"}`);
+      return;
+    }
+    case "hold": {
+      threads.hold(p, tid(), { resource: f.resource, reason: f.reason, until: f.until, untilResolved: f["until-resolved"], indefinite: f.indefinite });
+      console.log(`${id}: hold recorded`);
+      return;
+    }
+    case "release": {
+      threads.release(p, tid(), f.resource);
+      console.log(`${id}: hold released; cleanup still checks all prerequisites`);
       return;
     }
     case "permissions": {

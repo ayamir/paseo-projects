@@ -8,6 +8,8 @@ import * as threads from "./threads.mjs";
 import * as cleanup from "./cleanup.mjs";
 import * as inbox from "./inbox.mjs";
 import * as ticker from "./ticker.mjs";
+import { withLifecycleLock } from "./lifecycle-lock.mjs";
+export { withLifecycleLock };
 
 /** Every agent Paseo has for a project (thread and coordinator), not archived. */
 async function liveAgents(project) {
@@ -39,6 +41,10 @@ export function unarchive(project) { project.setState({ status: "active" }); }
 
 /** Moves the folder to <root>/.trash/<slug>-<stamp>. */
 export async function remove(project, force) {
+  return withLifecycleLock(project, () => removeLocked(project, force));
+}
+
+async function removeLocked(project, force) {
   const agents = await liveAgents(project);
   if (agents.length && !force) throw new Error(`${agents.length} agent(s) of \`${project.slug}\` are alive; \`delete --force\` archives them first`);
   await archiveAgents(project);
@@ -50,7 +56,11 @@ export async function remove(project, force) {
 }
 
 /** New slug: folder, former slugs, approvals, safety table. The coordinator is archived. */
-export async function rename(project, newSlug, { name, dryRun = false } = {}) {
+export async function rename(project, newSlug, options) {
+  return withLifecycleLock(project, () => renameLocked(project, newSlug, options));
+}
+
+async function renameLocked(project, newSlug, { name, dryRun = false } = {}) {
   const target = new Project(project.root, newSlug);
   if (existsSync(target.dir)) throw new Error(`${target.dir} already exists`);
   const unresolved = threads.list(project).filter(threads.isOpen);

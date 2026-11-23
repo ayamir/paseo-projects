@@ -40,6 +40,8 @@ const SECTIONS = [
     ["thread restart <slug> <id> [--profile P] [--fresh | --session ID|latest]", "picks up the old session unless --fresh; latest: the newest Claude session in its folder"],
     ["thread resolve <slug> <id> [--reopen] [--keep-worktree] [--skip-copy] [--force]", "report and library home, then the cleanup (docs/cleanup.md); `thread cleanup --dry-run` previews the cleanup"],
     ["thread cleanup <slug> <id> [--dry-run]", "the same cleanup again for a resolved thread; --dry-run previews it for any thread"],
+    ["thread hold <slug> <id> [--resource NONCE] --reason R (--until UTC | --until-resolved ID | --indefinite)", "hold the primary working copy by default; --until is an ISO UTC deadline; --indefinite is human-only"],
+    ["thread release <slug> <id> [--resource NONCE]", "human-only; without --resource releases the primary and any legacy thread-wide hold"],
     ["thread permissions <slug> <id>"],
     ["thread allow <slug> <id> [--request R] [--action A] [--answers JSON]"],
     ["thread deny <slug> <id> [--request R] [--action A] [--message M]"],

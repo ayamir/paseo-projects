@@ -795,6 +795,14 @@ test("pp archive leaves the project active when the daemon does not answer, not 
   assert.equal(f.p.status, "active");
 });
 
+function ppAtTerminal(f, ...args) {
+  const command = [process.execPath, PP, "--root", f.root, ...args];
+  const r = spawnSync("python3", ["-I", "-c", "import pty, subprocess, sys\nmaster, terminal = pty.openpty()\nsys.exit(subprocess.call(sys.argv[1:], stdin=terminal))", ...command], {
+    encoding: "utf8", env: f.env, timeout: 45_000,
+  });
+  assert.equal(r.status, 0, `${r.stdout}${r.stderr}${r.error?.message ?? ""}`);
+}
+
 async function managedFixture(t, mode = "off", withProject = false) {
   const projectFile = withProject ? join(BASE, `managed-project-${n}`) : "";
   const d = await fakeDaemon(mode, projectFile);
@@ -816,6 +824,30 @@ async function managedFixture(t, mode = "off", withProject = false) {
   return { ...f, id, start, show: (tid = id) => query("thread", "show", "demo", tid, "--json"),
     board: (tid = id) => query("board", "thread", "demo", tid), legacy: f.id };
 }
+
+test("managed holds: an agent needs a reason and a valid bound, and cannot release a hold", async (t) => {
+  const f = await managedFixture(t);
+  assert.ok(f.start().ok);
+  const pp = (sub, ...args) => f.pp("thread", sub, "demo", f.id, ...args);
+  assert.match(pp("hold", "--reason", "debugging").out, /deadline or condition/);
+  assert.match(pp("hold", "--until", "2099-01-01T00:00:00Z").out, /reason/);
+  assert.match(pp("hold", "--reason", "debugging", "--until", "2099-02-30T00:00:00Z").out, /valid future UTC deadline/);
+  assert.match(pp("hold", "--reason", "debugging", "--until", "2020-01-01T00:00:00Z").out, /valid future UTC deadline/);
+  assert.match(pp("hold", "--reason", "debugging", "--indefinite").out, /must be run by a person/);
+  assert.match(pp("resolve", "--keep-worktree").out, /must be run by a person/);
+  const held = pp("hold", "--reason", "debugging", "--until", "2099-01-01T00:00:00Z");
+  assert.ok(held.ok, held.out);
+  assert.match(pp("release").out, /must be run by a person/);
+  assert.match(pp("hold", "--reason", "shorter", "--until", "2098-01-01T00:00:00Z").out, /active hold/);
+  const resolved = pp("resolve");
+  assert.ok(resolved.ok, resolved.out);
+  const row = f.show();
+  assert.equal(row.status, "resolved");
+  assert.deepEqual(row.working_copy.hold, { reason: "debugging", until: "2099-01-01T00:00:00.000Z" });
+  assert.equal(row.working_copy.disposal.phase, "retained");
+  assert.match(row.working_copy.disposal.blocker, /hold: debugging/);
+  assert.ok(existsSync(row.cwd));
+});
 
 test("managed disposal: private commits need an explicit declaration, then restore with report and product after removal", async (t) => {
   const f = await managedFixture(t);
@@ -914,7 +946,7 @@ test("managed disposal: recorded path keeps and --keep-worktree survive cleanup 
   assert.ok(existsSync(cwd));
   write(declaration, "{}");
   assert.ok(f.pp("thread", "resolve", "demo", f.id, "--reopen").ok);
-  assert.ok(f.pp("thread", "resolve", "demo", f.id, "--keep-worktree", "--force", "--skip-copy").ok);
+  ppAtTerminal(f, "thread", "resolve", "demo", f.id, "--keep-worktree", "--force", "--skip-copy");
   const sweep = f.pp("sweep", "demo", "--yes");
   assert.ok(sweep.ok, sweep.out);
   assert.ok(existsSync(cwd));
@@ -1106,16 +1138,199 @@ const ORCH = join(dirname(fileURLToPath(import.meta.url)), "..", "orchestrator")
 const TICK = join(BASE, "tick.mjs");
 writeFileSync(TICK, `const { tick } = await import(${JSON.stringify(pathToFileURL(join(ORCH, "ticker.mjs")).href)});
 const { Project } = await import(${JSON.stringify(pathToFileURL(join(ORCH, "project.mjs")).href)});
+if (process.argv[4]) Date.now = () => Date.parse(process.argv[4]);
 await tick(new Project(process.argv[2], "demo"), process.argv[3]);
 process.exit(0);
 `);
-const tickOnce = (f, started, view) => new Promise((ok) => {
+const tickOnce = (f, started, view, clock = "") => new Promise((ok) => {
   const env = { ...f.env, PATH: `${FAKE_GH_DIR}:${f.env.PATH}`, FAKE_GH_VIEW: JSON.stringify(view) };
-  const c = spawn(process.execPath, [TICK, f.root, started], { env, stdio: ["ignore", "pipe", "pipe"] });
+  const c = spawn(process.execPath, [TICK, f.root, started, clock], { env, stdio: ["ignore", "pipe", "pipe"] });
   let out = "";
   c.stdout.on("data", (d) => (out += d)); c.stderr.on("data", (d) => (out += d));
   const timer = setTimeout(() => c.kill(), 120_000);
   c.on("exit", (code) => { clearTimeout(timer); ok({ code, out }); });
+});
+
+test("managed holds: terminal-authorized indefinite hold and release; unknown legacy hold stays closed", async (t) => {
+  const f = await managedFixture(t);
+  assert.ok(f.start().ok);
+  const args = (sub, ...flags) => ["thread", sub, "demo", f.id, ...flags];
+  ppAtTerminal(f, ...args("hold", "--reason", "keep for audit", "--indefinite"));
+  assert.ok(f.pp(...args("resolve")).ok);
+  const tick = async () => assert.equal((await tickOnce(f, new Date().toISOString(), {})).code, 0);
+  await tick();
+  const { cwd, working_copy: { blockers, nonce } } = f.board();
+  assert.ok(blockers.includes("indefinite hold: keep for audit"));
+  assert.ok(existsSync(cwd));
+  ppAtTerminal(f, ...args("release", "--resource", nonce));
+  assert.ok(!f.board().working_copy.blockers.some((b) => b.includes("hold")));
+  const file = f.p.path("threads", `${f.id}.json`);
+  const old = JSON.parse(readFileSync(file, "utf8"));
+  old.kept_worktree = null;
+  write(file, JSON.stringify(old));
+  await tick();
+  assert.ok(f.board().working_copy.blockers.includes("legacy hold is unknown; only a person can release it"));
+  assert.ok(existsSync(cwd));
+  assert.ok(f.pp(...args("resolve", "--reopen")).ok);
+  assert.ok(f.pp(...args("resolve")).ok);
+  assert.ok(f.board().working_copy.blockers.includes("legacy hold is unknown; only a person can release it"));
+  assert.ok(existsSync(cwd));
+  ppAtTerminal(f, ...args("release"));
+  await tick();
+  assert.equal(f.board().working_copy.phase, "removed");
+  assert.ok(!existsSync(cwd));
+});
+
+test("managed holds: an expired deadline does not authorize removal of unknown files", async (t) => {
+  const f = await managedFixture(t);
+  assert.ok(f.start().ok);
+  const { cwd } = f.board();
+  const until = new Date(Date.now() + 60_000).toISOString();
+  const future = new Date(Date.parse(until) + 1).toISOString();
+  const pp = (sub, ...flags) => f.pp("thread", sub, "demo", f.id, ...flags);
+  assert.ok(pp("hold", "--reason", "investigating", "--until", until).ok);
+  assert.ok(pp("resolve").ok);
+  assert.match(f.board().working_copy.disposal.blocker, /hold: investigating/);
+  const mystery = join(cwd, "new-data");
+  write(mystery, "not cleared for removal\n");
+  const tick = async () => assert.equal((await tickOnce(f, future, {}, future)).code, 0);
+  await tick();
+  assert.match(f.board().working_copy.disposal.blocker, /new-data/);
+  assert.equal(readFileSync(mystery, "utf8"), "not cleared for removal\n");
+  rmSync(mystery);
+  await tick();
+  assert.equal(f.board().working_copy.phase, "removed");
+  assert.ok(!existsSync(cwd));
+});
+
+test("managed cleanup visibility: concurrent blockers and durable, deduplicated exceptions", async (t) => {
+  const f = await managedFixture(t);
+  assert.ok(f.start().ok);
+  const { cwd, working_copy: { nonce } } = f.board();
+  const bin = join(f.root, "bin"), probe = join(bin, "lsof");
+  write(probe, "#!/bin/sh\nexit 2\n");
+  chmodSync(probe, 0o755);
+  f.env.PATH = `${bin}:${f.env.PATH}`;
+  const pp = (sub, ...args) => f.pp("thread", sub, "demo", f.id, ...args);
+  assert.ok(pp("hold", "--reason", "diagnosing", "--until", "2099-01-01T00:00:00Z").ok);
+  assert.ok(pp("resolve").ok);
+  assert.equal(f.board().status, "resolved");
+  const { blockers, actions } = f.board().working_copy;
+  assert.deepEqual(blockers, ["hold: diagnosing (until 2099-01-01T00:00:00.000Z)", "occupancy probe failed"]);
+  assert.ok(actions.some((a) => a.includes(`thread release demo ${f.id} --resource ${nonce}`)));
+  assert.deepEqual(f.show().working_copy.blockers, blockers);
+  assert.match(pp("show").out, /occupancy probe failed/);
+  const exceptions = () => f.pp("inbox", "list", "demo").out.split("\n").filter((line) => line.includes("[cleanup]"));
+  const tick = async () => assert.equal((await tickOnce(f, new Date().toISOString(), {})).code, 0);
+  await tick();
+  const [original] = exceptions();
+  assert.match(original, /occupancy probe failed/);
+  assert.equal(exceptions().length, 1);
+  assert.ok(f.pp("inbox", "done", "demo", original.split("\t")[0]).ok);
+  await tick();
+  assert.equal(exceptions().length, 0);
+  write(probe, `#!/bin/sh\nprintf 'p12345\\000\\nfcwd\\000n%s\\000\\n' '${cwd}'\n`);
+  await tick();
+  assert.match(exceptions()[0], /occupied by process 12345/);
+  write(probe, `#!/bin/sh\nprintf 'p12346\\000\\nfcwd\\000n%s\\000\\n' '${cwd}'\n`);
+  await tick();
+  assert.equal(exceptions().length, 1);
+  assert.match(f.board().working_copy.blockers.join(" "), /occupied by process 12346/);
+  assert.ok(existsSync(cwd));
+});
+
+test("managed retries: CLI and ticker cannot overlap removal, even if the initiating CLI dies", async (t) => {
+  const f = await managedFixture(t);
+  assert.ok(f.start().ok);
+  const { cwd } = f.board();
+  const bin = join(f.root, "bin"), seen = join(f.root, "removing"), go = join(f.root, "go"), finished = join(f.root, "finished");
+  const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+  write(join(bin, "git"), `#!/usr/bin/env node
+const fs = require('node:fs'), { spawnSync } = require('node:child_process');
+const args = process.argv.slice(2);
+const removing = args.includes('worktree') && args.includes('remove');
+if (removing) {
+  fs.appendFileSync(${JSON.stringify(seen)}, 'remove\\n');
+  const until = Date.now() + 20000;
+  while (!fs.existsSync(${JSON.stringify(go)}) && Date.now() < until) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+  if (!fs.existsSync(${JSON.stringify(go)})) process.exit(42);
+}
+const r = spawnSync(${JSON.stringify(realGit)}, args, { stdio: 'inherit' });
+if (removing) fs.writeFileSync(${JSON.stringify(finished)}, String(r.status));
+process.exit(r.status ?? 1);
+`);
+  write(join(bin, "lsof"), "#!/bin/sh\nprintf 'p12345\\000\\nfcwd\\000n/\\000\\n'\n");
+  chmodSync(join(bin, "git"), 0o755);
+  chmodSync(join(bin, "lsof"), 0o755);
+  f.env.PATH = `${bin}:${f.env.PATH}`;
+  const argv = [PP, "--root", f.root, "thread"];
+  const first = spawn(process.execPath, [...argv, "resolve", "demo", f.id], { env: f.env, stdio: "ignore" });
+  const exited = new Promise((ok) => first.once("exit", ok));
+  const waitFor = async (path) => {
+    for (let i = 0; i < 500 && !existsSync(path); i++) await new Promise((ok) => setTimeout(ok, 10));
+    assert.ok(existsSync(path), `did not get ${path}`);
+  };
+  try {
+    await waitFor(seen);
+    assert.equal(f.board().working_copy.disposal.phase, "removing");
+    const second = f.pp("thread", "cleanup", "demo", f.id);
+    assert.match(second.out, /working-copy lifecycle is busy/);
+    first.kill("SIGKILL");
+    await exited;
+    const tick = await tickOnce(f, new Date().toISOString(), {});
+    assert.equal(tick.code, 0, tick.out);
+    assert.equal(readFileSync(seen, "utf8"), "remove\n");
+    assert.ok(existsSync(cwd));
+    assert.equal(f.board().working_copy.disposal.phase, "removing");
+    write(go, "continue\n");
+    await waitFor(finished);
+    assert.equal(readFileSync(finished, "utf8"), "0");
+    const recovered = await tickOnce(f, new Date().toISOString(), {});
+    assert.equal(recovered.code, 0, recovered.out);
+    assert.equal(f.board().working_copy.disposal.phase, "removed");
+    assert.equal(readFileSync(seen, "utf8"), "remove\n");
+    assert.ok(!existsSync(cwd));
+  } finally {
+    write(go, "continue\n");
+    first.kill("SIGKILL");
+    await exited;
+    if (existsSync(seen)) await waitFor(finished);
+  }
+});
+
+test("managed retries: fresh tickers recheck a condition, occupancy, and evidence after a thread resolves", async (t) => {
+  const f = await managedFixture(t);
+  assert.ok(f.start().ok);
+  const other = `t-${Number(f.id.slice(2)) + 1}`;
+  assert.ok(f.start().ok);
+  const pp = (id, sub, ...args) => f.pp("thread", sub, "demo", id, ...args);
+  assert.match(pp(f.id, "hold", "--reason", "waiting", "--until-resolved", f.id).out, /another unresolved thread/);
+  assert.ok(pp(f.id, "hold", "--reason", "waiting", "--until-resolved", other).ok);
+  const { cwd } = f.board();
+  const probe = join(f.root, "bin", "lsof");
+  const probeWith = (path) => write(probe, `#!/bin/sh\nprintf 'p12345\\000\\nfcwd\\000n%s\\000\\n' '${path}'\n`);
+  probeWith(cwd);
+  chmodSync(probe, 0o755);
+  f.env.PATH = `${dirname(probe)}:${f.env.PATH}`;
+  assert.ok(pp(f.id, "resolve").ok);
+  const tick = async () => {
+    const r = await tickOnce(f, new Date().toISOString(), {});
+    assert.equal(r.code, 0, r.out);
+    return f.board();
+  };
+  assert.match((await tick()).working_copy.disposal.blocker, /hold: waiting/);
+  assert.ok(pp(other, "resolve").ok);
+  assert.match((await tick()).working_copy.disposal.blocker, /occupied by process 12345/);
+  assert.ok(existsSync(cwd));
+  write(join(cwd, "unique-data"), "not yet preserved\n");
+  probeWith(f.root);
+  assert.match((await tick()).working_copy.disposal.blocker, /unique-data/);
+  assert.ok(existsSync(cwd));
+  rmSync(join(cwd, "unique-data"));
+  const removed = await tick();
+  assert.equal(removed.status, "resolved");
+  assert.equal(removed.working_copy.disposal.phase, "removed");
+  assert.ok(!existsSync(cwd));
 });
 
 test("managed disposal: ticker finishes the thread and removes only unoccupied, dependency-free copies", async (t) => {
