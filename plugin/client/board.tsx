@@ -193,6 +193,7 @@ function ResourceSummaries({ rows, styles }: { rows: ResourceSummary[]; styles: 
     <View key={`${r.project}:${r.owner}:${r.path}:${r.resource ?? ""}:${i}`} style={styles.card}>
       <Text style={styles.meta}>{r.project}{r.owner ? ` · ${r.owner}` : ""} · {r.backend} · {r.phase}{r.machine ? ` · ${r.machine}` : ""}</Text>
       {r.path || r.resource ? <Text style={styles.mono}>{r.path || r.resource}</Text> : null}
+      {r.branch ? <Text style={styles.mono}>分支：{r.branch} ({r.source})</Text> : null}
       {r.baseline ? <Text style={styles.mono}>基线：{r.baseline}</Text> : null}
       {r.blockers.map((b) => <Text key={b} style={styles.note}>{b}</Text>)}
       {r.actions.map((a) => <Text key={a} style={styles.mono}>{a}</Text>)}

@@ -101,7 +101,9 @@ worktree 删除前要满足这些条件，任何一条不满足就保留并写�
 - `--dry-run` 会预览 worktree、声明路径和索引，列出 would-remove，不删东西，也不写记录。它不会重新拷贝，所以 library 里的成品可能还没归档。只有 worktree 已经移除时才检查本地分支并归档 workspace。这两项的结果写在命令输出或 resolve 的 inbox 里。
 - `pp sweep` 只重试已登记工作副本的回收，并清理过期的已处理 inbox 项；不会按线程状态、目录名或分支名清扫未接管的历史资源。
 - `pp thread discover <slug>` 列出已配置仓库的 Git worktree、历史线程记录及已配置并正在运行的本机 OVNFS 注册表中能与项目关联的条目，不会启动 OVNFS daemon。`pp board resources` 和线程详情显示待确认资源、实际后端、阶段、阻碍和操作。
-- 人确认候选项及实际创建基线后，才可运行 `pp thread adopt <slug> <id> --candidate TOKEN --base OID`。已核对的历史 Git worktree 登记到原线程；无归属的 Git worktree 只能登记到同源的托管线程。接管只写 PP 记录，保留原后端、文件、提交和保留约束；身份或起点证据不足时不提供可用候选项。未接管的 OVNFS 和远程资源仅报告阻碍。
+- 人确认候选项及实际创建基线后，才可运行 `pp thread adopt <slug> <id> --candidate TOKEN --base OID`。已核对的历史 Git worktree 登记到原线程；无归属的 Git worktree 只能登记到同源的托管线程。接管只写 PP 记录，保留原后端、文件、提交和保留约束；身份或起点证据不足时，先独立保存工作，不要将这个 Git 资源交给 PP 托管。未接管的 OVNFS 和远程资源仅报告阻碍。
+- 对已核对但未接管的历史 Git worktree，显式清理也会检查该工作树自己的 HEAD reflog。任何无法从保留引用到达的提交都会阻止删除，`--dry-run` 同样显示原因。清理记录的报告和 library 拷贝完整，不代表 Git 历史已有独立备份。没有已登记分支身份时，PP 保留分支和 reflog；接管后的工作树即使已经回收，资源看板仍会显示保留的分支及原因。
+- 接管起点通过工作树 HEAD reflog 和分支 reflog 的创建记录互相核对。这适用于本机单用户模型：reflog 不是认证凭证，同一用户若同时改写两份 reflog 的开头，可能伪造起点。怀疑记录被人为改写时，独立保存工作并保持不托管。
 
 ## OVNFS checkout
 

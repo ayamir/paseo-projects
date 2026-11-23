@@ -1402,6 +1402,40 @@ test("reconciliation legacy cleanup does not remove a replacement with the same 
   assert.ok(existsSync(join(moved, ".paseo-project", `demo-${f.id}`, "report.md")));
 });
 
+test("reconciliation legacy cleanup keeps commits reachable only from the linked worktree HEAD reflog", async (t) => {
+  const daemon = await fakeDaemon("off");
+  const f = fixture();
+  f.env.PASEO_URL = daemon.url;
+  t.after(() => { daemon.stop(); rmSync(f.root, { recursive: true, force: true }); });
+  git(f.wt, "switch", "--detach", "HEAD");
+  git(f.wt, "commit", "-q", "--allow-empty", "-m", "detached work to keep");
+  const detached = git(f.wt, "rev-parse", "HEAD");
+  git(f.wt, "switch", f.branch);
+  assert.equal(git(f.repo, "for-each-ref", "--contains", detached), "");
+  assert.ok(git(f.repo, "rev-list", "--all", "--reflog").includes(detached));
+
+  writeSettings(f.p, { ...f.p.settings(), mute: true, nudge: false });
+  write(join(f.td, "report.md"), `Reviewed-PR: ${REVIEW_URL}\n\n## Report\nDone\n`);
+  const progress = f.pp("report", "--thread", `demo/${f.id}`, "--percent", "100");
+  assert.ok(progress.ok, progress.out);
+  const resolved = await tickOnce(f, new Date().toISOString(), { [REVIEW_URL]: { state: "MERGED" } });
+  assert.equal(resolved.code, 0, resolved.out);
+  assert.equal(JSON.parse(readFileSync(f.p.path("threads", `${f.id}.json`))).resolved_reason, "reviewed PR merged");
+  assert.ok(f.pp("sweep", "demo", "--yes").ok);
+  assert.ok(existsSync(f.wt));
+
+  const dryRun = f.pp("thread", "cleanup", "demo", f.id, "--dry-run");
+  assert.ok(dryRun.ok, dryRun.out);
+  assert.match(dryRun.out, /worktree kept: .*worktree HEAD reflog/);
+  assert.doesNotMatch(dryRun.out, /worktree would be removed/);
+  const cleanup = f.pp("thread", "cleanup", "demo", f.id);
+  assert.ok(cleanup.ok, cleanup.out);
+  assert.match(cleanup.out, /worktree kept: .*worktree HEAD reflog/);
+  assert.ok(existsSync(f.wt));
+  assert.ok(git(f.repo, "rev-list", "--all", "--reflog").includes(detached));
+  assert.equal(f.item("worktree").status, "kept");
+});
+
 test("reconciliation cleanup retains a same-tip replacement branch and its reflog-only commit", (t) => {
   const f = fixture();
   t.after(() => rmSync(f.root, { recursive: true, force: true }));
@@ -1427,6 +1461,39 @@ test("reconciliation cleanup retains a same-tip replacement branch and its reflo
   assert.equal(git(f.repo, "reflog", "show", "--format=%H", f.branch), reflog);
   const detail = JSON.parse(f.pp("board", "thread", "demo", f.id).out);
   assert.match(detail.reconciliation[0].blockers.join("; "), /branch identity/);
+});
+
+test("reconciliation lists the retained branch after an adopted worktree is reclaimed", async (t) => {
+  const daemon = await fakeDaemon("off");
+  const f = fixture();
+  f.env.PASEO_URL = daemon.url;
+  t.after(() => { daemon.stop(); rmSync(f.root, { recursive: true, force: true }); });
+  const discovery = f.pp("thread", "discover", "demo");
+  assert.ok(discovery.ok, discovery.out);
+  const { candidate, baseline } = JSON.parse(discovery.out).find((row) => row.owner === f.id);
+  ppAtTerminal(f, "thread", "adopt", "demo", f.id, "--candidate", candidate, "--base", baseline);
+  const reflog = git(f.repo, "reflog", "show", "--format=%H", f.branch);
+  assert.ok(reflog);
+  writeSettings(f.p, { ...f.p.settings(), mute: true, nudge: false });
+  write(join(f.td, "report.md"), `Reviewed-PR: ${REVIEW_URL}\n\n## Report\nDone\n`);
+  assert.ok(f.pp("report", "--thread", `demo/${f.id}`, "--percent", "100").ok);
+  const resolved = await tickOnce(f, new Date().toISOString(), { [REVIEW_URL]: { state: "MERGED" } });
+  assert.equal(resolved.code, 0, resolved.out);
+  const sweep = f.pp("sweep", "demo", "--yes");
+  assert.ok(sweep.ok, sweep.out);
+  assert.ok(!existsSync(f.wt), sweep.out);
+  assert.equal(git(f.repo, "reflog", "show", "--format=%H", f.branch), reflog);
+
+  const detail = JSON.parse(f.pp("board", "thread", "demo", f.id).out).working_copy;
+  const blocker = detail.blockers.find((reason) => reason.includes("branch identity"));
+  assert.ok(blocker);
+  const cli = f.pp("thread", "show", "demo", f.id);
+  assert.ok(cli.out.includes(blocker), cli.out);
+  const board = f.pp("board", "resources");
+  assert.ok(board.ok, board.out);
+  const retained = JSON.parse(board.out).find((row) => row.owner === f.id && row.branch === f.branch);
+  assert.equal(retained?.phase, "retained", board.out);
+  assert.ok(retained.blockers.includes(blocker));
 });
 
 test("reconciliation refuses an adoption origin rewritten by git reflog delete", async (t) => {
@@ -1458,10 +1525,11 @@ test("reconciliation refuses an adoption origin rewritten by git reflog delete",
   const row = find();
   const adopted = terminalResult(f, "thread", "adopt", "demo", f.id, "--candidate", row.candidate || token, "--base", later);
   assert.notEqual(adopted.status, 0, adopted.out);
-  assert.match(adopted.out, /no longer verified/);
+  assert.match(adopted.out, /no longer verified.*preserve the work independently and leave this Git resource unmanaged/);
   assert.equal(row.candidate, "");
   assert.ok(!row.baseline);
   assert.match(row.blockers.join("; "), /original checkout commit cannot be verified/);
+  assert.ok(row.actions.includes("preserve the work independently and leave this Git resource unmanaged"));
   assert.deepEqual(f.board().working_copies, []);
 });
 

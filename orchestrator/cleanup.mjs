@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve as resolvePath } from "node:path";
 import { sh, now, readJson, writeJson, writeAtomic, sha256 } from "./lib.mjs";
 import * as ovnfs from "./ovnfs.mjs";
+import { linkedHeadReflogBlocker, preserveUnmanagedGit } from "./working-copy.mjs";
 
 const q = (s) => `'${String(s).replace(/'/g, "'\\''")}'`;
 const inside = (path, root) => path === root || path.startsWith(root.replace(/\/+$/, "") + "/");
@@ -188,7 +189,13 @@ export async function removeWorktree(h, t, { threadDir = "", discards = [], dryR
   const reason = reasons.length ? listed(reasons) : await waitForIdle(h, top, dryRun);
   if (reason) return { ...item, status: "kept", reason };
   const kib = du(h, top);
-  if (legacyGit && JSON.stringify(legacyGit()) !== JSON.stringify(identity)) return { ...item, status: "kept", reason: "the historical Git registration changed during cleanup" };
+  if (legacyGit) {
+    try {
+      if (JSON.stringify(legacyGit()) !== JSON.stringify(identity)) throw new Error();
+    } catch { return { ...item, status: "kept", reason: `the historical Git registration could not be reverified; ${preserveUnmanagedGit}` }; }
+  }
+  const reflog = identity && linkedHeadReflogBlocker(top, identity);
+  if (reflog) return { ...item, status: "kept", reason: reflog };
   if (dryRun) return { ...item, status: "would-remove", kib };
   const r = h.shell(`git worktree remove -- ${q(top)}`, t.repo, undefined, LONG_MS);
   if (!r.ok) return { ...item, status: h.isDir(top) && !r.timedOut ? "kept" : "failed", reason: r.timedOut ? "git worktree remove timed out part way" : r.out };
@@ -323,12 +330,14 @@ export async function run(project, t, h, { keepWorktree = false, copyComplete = 
   const isolated = t.kind === "worktree" || ovn;
   const kind = ovn ? "ovnfs" : "worktree";
   const checkout = { kind, target: t.cwd };
-  let occupied = "";
+  let occupied = "", reflog = "";
   const archiveNotes = [];
   if (legacyGit) {
-    try { legacyGit(); }
-    catch {
-      const items = [{ ...checkout, status: h.isDir(t.cwd) ? "kept" : "failed", reason: "the linked worktree top level or historical PP Git registration could not be verified; nothing removed" }];
+    try {
+      const identity = legacyGit();
+      if (identity) reflog = linkedHeadReflogBlocker(canon(t.cwd), identity);
+    } catch {
+      const items = [{ ...checkout, status: h.isDir(t.cwd) ? "kept" : "failed", reason: `the linked worktree top level or historical PP Git registration could not be verified; nothing removed; ${preserveUnmanagedGit}` }];
       if (!dryRun) record(project, t, items, readJson(recordPath(project, t.id))?.declaration ?? { discard: [], keep: [] }, archive);
       return { notes: items.map(note), worktreeGone: false, items };
     }
@@ -356,13 +365,13 @@ export async function run(project, t, h, { keepWorktree = false, copyComplete = 
   const removedBefore = new Set(before.filter((i) => i.kind === "discard" && i.status === "removed").map((i) => i.target));
   const retry = before.filter((i) => i.kind === "index" && i.status === "failed" && i.root);
   const own = t.kind !== "checkout" && t.cwd ? canon(t.cwd) : null;
-  const keepReason = keepWorktree ? "kept as asked (--keep-worktree)"
+  const keepReason = reflog || (keepWorktree ? "kept as asked (--keep-worktree)"
     : decl.error ? `${decl.error}; its keep list is unknown`
     : decl.keep.length ? `declared kept: ${decl.keep.map((k) => k.why || k.path).join("; ")}`
     : ovn && !agentArchived ? "Paseo did not confirm that its agent was archived"
     : occupied ? occupied
     : ovn && (!copyComplete || archive.outcome !== "complete") ? "the final copy was not confirmed complete"
-    : !copyComplete ? "the final copy was partial (`thread resolve --force` removes it)" : "";
+    : !copyComplete ? "the final copy was partial (`thread resolve --force` removes it)" : "");
   // A keep is about the folder. An already removed checkout is recorded as gone.
   const checkoutKept = isolated && Boolean(keepReason) && Boolean(t.cwd) && h.isDir(t.cwd);
   const lib = t.thread_dir ? join(canon(t.thread_dir), "library") : "";

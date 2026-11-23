@@ -36,7 +36,7 @@ const workingCopy = z.object({
 
 const resourceSummary = z.object({
   project: z.string(), owner: z.string(), backend: z.string(), phase: z.string(), path: z.string(),
-  machine: z.string(), source: z.string(), resource: z.string().optional(), baseline: z.string().optional(),
+  machine: z.string(), source: z.string(), resource: z.string().optional(), baseline: z.string().optional(), branch: z.string().optional(),
   blockers: z.array(z.string()), actions: z.array(z.string()), candidate: z.string(),
 });
 export type ResourceSummary = z.infer<typeof resourceSummary>;

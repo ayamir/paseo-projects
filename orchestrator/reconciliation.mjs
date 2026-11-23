@@ -3,11 +3,11 @@ import { lstatSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { sha256 } from "./lib.mjs";
 import { readInventory } from "./managed-ovnfs.mjs";
-import { adoptedGitIdentity, adoptionBase, commitOid, linkedWorktrees, verifyAdoptionBase } from "./working-copy.mjs";
+import { adoptedGitIdentity, adoptionBase, commitOid, linkedWorktrees, preserveUnmanagedGit, verifyAdoptionBase } from "./working-copy.mjs";
 
 export const isLegacy = (t) => !t.working_copy && ["worktree", "ovnfs"].includes(t.kind);
 export const branchIdentityBlocker = (t) => t.kind === "worktree" && t.branch && (isLegacy(t) || t.working_copy?.adoption)
-  ? "PP has no recorded branch identity; the branch and its reflog are not eligible for removal" : "";
+  ? `PP has no recorded branch identity; the branch and its reflog are not eligible for removal; ${preserveUnmanagedGit}` : "";
 const real = (p) => { try { return realpathSync(p); } catch { return p; } };
 
 function ownership(project) {
@@ -55,7 +55,8 @@ export function verifyLegacyGit(project, t) {
 }
 
 function pending(project, fields, blockers, candidate = "") {
-  const action = candidate ? `person: thread adopt ${project.slug} ${fields.owner || "<thread-id>"} --candidate ${candidate} --base ${fields.baseline}` : "verify the resource and its origin; pp will not take ownership without proof";
+  const action = candidate ? `person: thread adopt ${project.slug} ${fields.owner || "<thread-id>"} --candidate ${candidate} --base ${fields.baseline}`
+    : fields.backend === "git-worktree" ? preserveUnmanagedGit : "verify the resource and its origin; pp will not take ownership without proof";
   return { project: project.slug, phase: "pending-confirmation", owner: "", machine: "", path: "", source: "", ...fields,
     candidate, blockers, actions: [action] };
 }

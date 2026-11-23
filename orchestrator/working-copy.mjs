@@ -1,18 +1,25 @@
 // The Git backend owns the linked worktree before Paseo is asked to run an agent in it.
 import { randomUUID } from "node:crypto";
 import { dirname, isAbsolute, join } from "node:path";
-import { closeSync, constants, lstatSync, openSync, readFileSync, readSync, realpathSync } from "node:fs";
+import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, readSync, realpathSync } from "node:fs";
 import { sh } from "./lib.mjs";
 
 export const commitOid = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
+export const preserveUnmanagedGit = "preserve the work independently and leave this Git resource unmanaged";
 
-function readGit(path, ...args) {
+const readGit = (path, ...args) => readGitWithInput(path, args);
+function readGitWithInput(path, args, input) {
   const env = Object.fromEntries(Object.keys(process.env).filter((k) => k.startsWith("GIT_")).map((k) => [k, undefined]));
-  const r = sh(["git", "--no-replace-objects", "-C", path, ...args], undefined, undefined, {
+  const r = sh(["git", "--no-replace-objects", "-C", path, ...args], undefined, input, {
     env: { ...env, GIT_OPTIONAL_LOCKS: "0", GIT_NO_LAZY_FETCH: "1", GIT_ALLOW_PROTOCOL: "" }, timeout: 5000,
   });
   if (!r.ok || r.stderr || r.stdout.includes("�")) throw new Error("could not read Git registration or origin");
   return r.stdout.replace(/\n$/, "");
+}
+
+export function hasGitBranch(source, branch) {
+  const ref = `refs/heads/${branch}`;
+  return readGit(source, "for-each-ref", "--count=1", "--format=%(refname)", "--", ref) === ref;
 }
 
 export function linkedWorktrees(source) {
@@ -50,6 +57,43 @@ export function adoptedGitIdentity({ path, source, branch }) {
     if (lstatSync(join(git_dir, file), { throwIfNoEntry: false })) throw new Error("Git registration is locked or has a PP creation marker");
   }
   return { git_dir, directory, registration, link, repository };
+}
+
+// Plain `git worktree remove` drops this registration's HEAD log. Check both sides of
+// every entry (including the oldest predecessor), and discount only shared, retained refs.
+export function linkedHeadReflogBlocker(path, identity) {
+  try {
+    const log = join(identity.git_dir, "logs", "HEAD"), id = birthId(log, false);
+    const fd = openSync(log, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    let input;
+    try {
+      const before = fstatSync(fd, { bigint: true });
+      if (!before.isFile() || `${before.dev}:${before.ino}:${before.birthtimeNs}` !== id || before.size <= 0n || before.size > 1024n * 1024n) throw new Error();
+      const bytes = Buffer.alloc(Number(before.size));
+      let read = 0;
+      while (read < bytes.length) {
+        const n = readSync(fd, bytes, read, bytes.length - read, read);
+        if (!n) throw new Error();
+        read += n;
+      }
+      const after = fstatSync(fd, { bigint: true });
+      if (after.size !== before.size || after.mtimeNs !== before.mtimeNs || after.ctimeNs !== before.ctimeNs || birthId(log, false) !== id || bytes.at(-1) !== 10) throw new Error();
+      const tips = new Set();
+      const size = readGit(path, "rev-parse", "--show-object-format") === "sha256" ? 64 : 40;
+      for (const line of bytes.toString("utf8").slice(0, -1).split("\n")) {
+        const [old, next] = line.split(" ", 2);
+        for (const oid of [old, next]) {
+          if (!commitOid.test(oid) || oid.length !== size) throw new Error();
+          if (!/^0+$/.test(oid)) tips.add(oid);
+        }
+      }
+      if (!tips.size) throw new Error();
+      input = [...tips].join("\n") + "\n";
+    } finally { closeSync(fd); }
+    const privateCommit = readGitWithInput(path, ["rev-list", "--max-count=1", "--single-worktree", "--not",
+      "--exclude=refs/bisect/*", "--exclude=refs/rewritten/*", "--exclude=refs/worktree/*", "--glob=refs/*", "--not", "--stdin"], input);
+    return privateCommit ? "the linked worktree HEAD reflog contains commits not reachable from any retained ref; preserve the work independently before retrying" : "";
+  } catch { return `the linked worktree HEAD reflog could not be verified; ${preserveUnmanagedGit}`; }
 }
 
 function reflogPrefix(log, count) {
@@ -162,11 +206,16 @@ export function recover(h, w) {
 }
 
 export function verify(h, w) {
-  const missing = () => new Error(`worktree identity missing or unconfirmed at ${w.path}`);
+  const guidance = w.adoption ? `; ${preserveUnmanagedGit}` : "";
+  const missing = () => new Error(`worktree identity missing or unconfirmed at ${w.path}${guidance}`);
   if (w.phase !== "ready" || !w.identity) throw missing();
   if (w.adoption && (h.remote || w.adoption.origin?.commit !== w.baseline || w.adoption.origin?.source !== w.source)) throw missing();
-  const found = w.adoption ? adoptedGitIdentity(w) : inspect(h, w, false);
-  if (Object.keys(found).some((k) => found[k] !== w.identity[k])) throw new Error(`worktree identity does not match at ${w.path}`);
+  let found;
+  if (w.adoption) {
+    try { found = adoptedGitIdentity(w); }
+    catch { throw missing(); }
+  } else found = inspect(h, w, false);
+  if (Object.keys(found).some((k) => found[k] !== w.identity[k])) throw new Error(`worktree identity does not match at ${w.path}${guidance}`);
   return w.path;
 }
 

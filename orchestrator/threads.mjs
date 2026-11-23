@@ -970,13 +970,23 @@ export const reconciliation = (project) => discover(project, list(project)).item
 
 export function boardResources(project) {
   const listed = list(project), pending = discover(project, listed).items;
-  for (const t of listed.filter(pendingDisposal)) {
-    const { working_copy, working_copies } = resourceView(project, t, pending);
-    for (const w of [working_copy, ...working_copies].filter((w) => w && !removedResource(w))) {
-      const { owner, backend, path, source, machine, baseline, blockers, actions } = w;
-      pending.push({ project: project.slug, owner, backend, path, source, machine, baseline, blockers, actions,
-        candidate: "", resource: w.resource ?? w.nonce, phase: w.disposal?.phase ?? w.phase });
+  for (const t of listed) {
+    if (pendingDisposal(t)) {
+      const { working_copy, working_copies } = resourceView(project, t, pending);
+      for (const w of [working_copy, ...working_copies].filter((w) => w && !removedResource(w))) {
+        const { owner, backend, path, source, machine, baseline, blockers, actions } = w;
+        pending.push({ project: project.slug, owner, backend, path, source, machine, baseline, blockers, actions,
+          candidate: "", resource: w.resource ?? w.nonce, phase: w.disposal?.phase ?? w.phase });
+      }
     }
+    const w = t.working_copy, blocker = w?.adoption && removedResource(w) && branchIdentityBlocker(t);
+    if (!blocker) continue;
+    const blockers = [blocker];
+    let phase = "retained";
+    try { if (!workingCopy.hasGitBranch(w.source, t.branch)) continue; }
+    catch { phase = "unknown"; blockers.push("the recorded branch could not be read"); }
+    pending.push({ project: project.slug, owner: t.id, backend: w.backend, path: "", source: w.source, machine: w.machine,
+      branch: t.branch, blockers, actions: [], candidate: "", phase });
   }
   return pending;
 }
@@ -987,8 +997,8 @@ export function adopt(project, id, candidate, base) {
   return withLifecycleLock(project, () => {
     const t = load(project, id);
     const selected = discover(project, list(project)).candidates.get(candidate);
-    if (!selected) throw new Error("resource candidate is no longer verified; rerun thread discover and review its blockers");
-    if (selected.baseline !== base) throw new Error("--base does not match the Git registration's original checkout commit");
+    if (!selected) throw new Error(`resource candidate is no longer verified; ${workingCopy.preserveUnmanagedGit}; rerun thread discover to review its blockers`);
+    if (selected.baseline !== base) throw new Error(`--base does not match the Git registration's original checkout commit; ${workingCopy.preserveUnmanagedGit}`);
     if (t.id !== id || t.machine || t.repo !== selected.source || !["open", "resolved"].includes(t.status) ||
         (selected.owner ? selected.owner !== id : !t.working_copy)) {
       throw new Error("resource cannot be assigned to this thread; choose its historical owner or a managed thread for the same local source");
@@ -1217,7 +1227,7 @@ async function resolveLocked(project, id, { keepWorktree = false, force = false,
 function finalCopy(project, t) {
   if (isLegacy(t) && t.kind === "worktree") {
     try { verifyLegacyGit(project, t); }
-    catch { return { outcome: "unknown", notes: ["legacy worktree copy skipped: the historical PP registration could not be verified"], unknown: ["report", "library"] }; }
+    catch { return { outcome: "unknown", notes: [`legacy worktree copy skipped: the historical PP registration could not be verified; ${workingCopy.preserveUnmanagedGit}`], unknown: ["report", "library"] }; }
   }
   if (t.kind === "ovnfs" && !t.working_copy && t.cwd) {
     try { ovnfs.mounted(t); }
