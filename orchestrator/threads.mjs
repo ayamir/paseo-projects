@@ -376,6 +376,8 @@ function verifyWorkingCopy(h, t) {
 }
 
 function stageCache(project, h, w, identity, save) {
+  // An OVNFS checkout already carries the source folder's ignored build state.
+  if (w.backend === "ovnfs" && !w.ovnfs.capture) return undefined;
   if (w.cache?.state === "staging") throw new Error("cache staging is incomplete; retain the original checkout and verify its cache before use");
   const plan = planCache(project, h, w, identity);
   if (plan.items) {
@@ -440,14 +442,13 @@ export function ovnfsResource(project, id, type, name, { base, resource = "main"
         (snapshot && w.depends_on[0] !== source.nonce) || (base !== undefined && w.ovnfs.ref !== base))) throw new Error(`OVNFS resource ${name} already has a different immutable intent`);
     if (!w) {
       managedOvnfs.verify(h, snapshot ? source : main);
-      admitWorkingCopy(project, h, { additions: snapshot ? 1 : 2, namespace: main.ovnfs.namespace, inputs: !snapshot });
+      admitWorkingCopy(project, h, { additions: 1, namespace: main.ovnfs.namespace, inputs: false });
       if (snapshot) w = managedOvnfs.snapshotPlan(source, name);
       else {
         const branch = `${main.branch}-${name}`;
         w = managedOvnfs.plan({ ...t, branch }, workingCopy.gitBaseline(h, t.repo, base ?? (t.base || "HEAD")), main.ovnfs.namespace);
         w.resource = name;
         w.ovnfs.ref = base;
-        w.ovnfs.capture = capturePlan(project, w);
       }
       update(project, id, (r) => { (r.working_copies ??= []).push(w); });
     }
@@ -475,12 +476,8 @@ function reconcileOvnfsResource(project, t, h, w, { start = false } = {}) {
   let failed;
   try {
     if (w.phase === "planned" && start) {
-      admitWorkingCopy(project, h, { namespace: w.ovnfs.namespace, inputs: !snapshot });
+      admitWorkingCopy(project, h, { namespace: w.ovnfs.namespace, inputs: false });
       if (snapshot) verifySource();
-      else if (!w.ovnfs.capture?.oid) {
-        const capture = createCapture(project, w, w.ovnfs.capture);
-        save({ ovnfs: { ...w.ovnfs, capture } });
-      }
       const parents = managedOvnfs.ensureAvailable(h, w);
       save({ phase: "creating", ovnfs: { ...w.ovnfs, started_at: now(), ...(snapshot ? { parents } : {}) } });
       try { managedOvnfs.create(h, w); } catch (e) { failed = e.message; }
@@ -534,12 +531,9 @@ function snapshotCheckout(project, w) {
 
 function prepareInputs(project, t, { recoverSeed = false } = {}) {
   const w = workingCopyRecord(t);
-  if ((w.seed && !w.seed.oid) || (w.backend === "ovnfs" && !w.ovnfs.from && !w.ovnfs.capture?.oid)) {
-    const capture = createCapture(project, w, w.seed ?? w.ovnfs.capture, Boolean(w.seed), { recoverOnly: Boolean(w.seed && recoverSeed) });
-    return update(project, t.id, (r) => {
-      if (w.seed) r.working_copy.seed = capture;
-      if (w.backend === "ovnfs") r.working_copy.ovnfs.capture = capture;
-    });
+  if (w.seed && !w.seed.oid) {
+    const capture = createCapture(project, w, w.seed, true, { recoverOnly: recoverSeed });
+    return update(project, t.id, (r) => { r.working_copy.seed = capture; });
   }
   return t;
 }
@@ -554,7 +548,7 @@ function prepareCheckout(project, t, h) {
         if (s.nonce !== t.working_copy.depends_on[0] || s.ovnfs.from.base !== from.base || s.source !== t.repo) throw new Error("OVNFS snapshot dependency changed");
       }
       const w = t.working_copy;
-      admitWorkingCopy(project, h, { repo: w.backend === "git-worktree" ? w.source : undefined, namespace: w.ovnfs?.namespace, inputs: Boolean(w.seed || w.ovnfs?.capture) });
+      admitWorkingCopy(project, h, { repo: w.backend === "git-worktree" ? w.source : undefined, namespace: w.ovnfs?.namespace, inputs: Boolean(w.seed) });
       t = prepareInputs(project, t, { recoverSeed: true });
       if (t.working_copy.seed) {
         if (w.backend === "git-worktree") importSeed(t.working_copy);
@@ -717,24 +711,30 @@ async function startLocked(project, a) {
   const machine = a.machine ?? "";
   if (machine && !a.repo) throw new Error("a remote thread needs --repo: a task with no repository runs as a folder thread in the project, which is local");
   const derive = a.from_snapshot !== undefined;
-  const policy = settings.working_copy_policy ?? "git-worktree";
-  if (!["git-worktree", "ovnfs-preferred"].includes(policy)) throw new Error("invalid working_copy_policy");
+  // A local repo entry's own policy (pp set <slug> repos.policy PATH=…) outranks the project's.
+  const entry = machine || !a.repo ? undefined : settings.repos.find((r) => !r.machine && r.path.replace(/\/+$/, "") === a.repo.replace(/\/+$/, ""));
+  const policy = entry?.working_copy_policy ?? settings.working_copy_policy ?? "git-worktree";
+  if (!["git-worktree", "ovnfs-preferred"].includes(policy)) throw new Error(entry?.working_copy_policy ? `${entry.path}: repos.policy takes git-worktree or ovnfs-preferred` : "invalid working_copy_policy");
   const preferred = !a.kind && !derive && Boolean(a.repo) && policy === "ovnfs-preferred";
   let kind = a.kind ?? (derive || preferred ? "ovnfs" : a.repo ? "worktree" : "tab");
   if (!["worktree", "ovnfs", "tab", "checkout"].includes(kind)) throw new Error(`\`${kind}\` is not a thread kind (worktree, ovnfs, tab or checkout)`);
   if (derive && (kind !== "ovnfs" || a.base !== undefined)) throw new Error("--from-snapshot selects OVNFS and does not accept --base");
-  if (a.inherit_dirty && (derive || a.base !== undefined || machine || !hasBranchCheckout({ kind }))) {
-    throw new Error("--inherit-dirty requires a local worktree or OVNFS checkout at HEAD without --base or --from-snapshot");
+  // An OVNFS checkout opens the committed baseline; the native forms that could carry dirty work do not pin it.
+  const dirtyWorktree = Boolean(a.inherit_dirty && preferred);
+  if (dirtyWorktree) kind = "worktree";
+  if (a.inherit_dirty && (derive || a.base !== undefined || machine || kind !== "worktree")) {
+    throw new Error("--inherit-dirty requires a local git-worktree checkout at HEAD without --base or --from-snapshot");
   }
   if (kind !== "tab" && !a.repo && !derive) throw new Error(`a ${kind} thread needs --repo`);
   if (!preferred && kind !== "worktree" && machine) throw new Error(`a ${kind} thread runs locally; a remote repo needs a worktree thread`);
   const profile = resolveProfile(config, safety, settings, "thread", a.profile, project.slug);
   const h = host(machine, config), warnings = [];
+  if (dirtyWorktree) warnings.push("--inherit-dirty uses a git-worktree checkout; an OVNFS checkout opens the committed baseline");
   let ns, selection;
   if (kind === "ovnfs") {
     try {
       requireLocalPaseo();
-      ns = managedOvnfs.preflight(h);
+      ns = managedOvnfs.preflight(h, project.root);
     } catch (e) {
       if (!preferred) throw e;
       kind = "worktree";
@@ -761,17 +761,14 @@ async function startLocked(project, a) {
     const baseline = parent?.baseline ?? (hasBranchCheckout({ kind }) ? workingCopy.gitBaseline(h, repo, a.base ?? "HEAD") : "");
     if (baseline) {
       if (kind === "worktree" && a.inherit_dirty) workingCopy.requireCleanCheckout(h, repo, baseline);
-      const inputs = Boolean(a.inherit_dirty || (ns && !parent));
+      const inputs = Boolean(a.inherit_dirty);
       admitWorkingCopy(project, h, { additions: inputs ? 2 : 1, repo: kind === "worktree" ? repo : undefined, namespace: ns, inputs });
     }
     return allocate(project, a.task, (t) => {
       Object.assign(t, { title: a.title.trim(), kind, repo, origin, machine, base: a.base ?? "", profile: profile.name, provider: profile.provider, ...(a.reviews ? { reviews: a.reviews } : {}) });
       if (hasBranchCheckout(t)) t.branch = branchName(project.slug, t.id, t.title);
       if (kind === "worktree") t.working_copy = workingCopy.plan(t, baseline);
-      if (kind === "ovnfs") {
-        t.working_copy = managedOvnfs.plan(t, baseline, ns, parent);
-        if (!parent) t.working_copy.ovnfs.capture = capturePlan(project, t.working_copy);
-      }
+      if (kind === "ovnfs") t.working_copy = managedOvnfs.plan(t, baseline, ns, parent);
       if (a.inherit_dirty) t.working_copy.seed = capturePlan(project, t.working_copy);
       if (selection) t.working_copy.selection = selection;
       if (t.working_copy) t.agent_launch = { state: "unstarted" };

@@ -1,10 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { dirname, isAbsolute, join } from "node:path";
-import { closeSync, constants, fstatSync, linkSync, lstatSync, openSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import { sh } from "./lib.mjs";
+import { closeSync, constants, fstatSync, linkSync, lstatSync, openSync, readFileSync, realpathSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { preservationTarget, verifyCapture } from "./copy-inputs.mjs";
+import { fileURLToPath } from "node:url";
+import { isFile, sh, writeAtomic } from "./lib.mjs";
 import { lifecycleStdio } from "./lifecycle-lock.mjs";
 
 const PIN = "v0.8.0";
@@ -59,41 +59,105 @@ function mountCheck(ns) {
       params.filter((p) => /^(?:mount)?port=/.test(p)).length !== 2) throw new Error(`OVNFS mount ${ns.mount} is not the configured local NFS socket`);
 }
 
-function configuredNamespace() {
-  const resolveDir = (key) => {
-    const path = process.env[key];
-    if (!path || !isAbsolute(path)) throw new Error(`OVNFS ${PIN} requires an explicit absolute ${key} for a running local daemon`);
-    return realpathSync(path);
-  };
-  return namespace(resolveDir("OVNFS_STATE"), resolveDir("OVNFS_MOUNT"));
+// The namespace is OVNFS_STATE and OVNFS_MOUNT (either one makes the pair explicit), else what `pp working-copy ovnfs`
+// saved for this root. Tests and fixtures always pass their own root, so they cannot reach a user's namespace.
+const NAMESPACE_FILE = ".ovnfs.json";
+const namespaceFile = (root) => join(root, NAMESPACE_FILE);
+const fromEnv = (...keys) => keys.some((key) => process.env[key] !== undefined);
+const explicitDir = (key) => {
+  const path = process.env[key];
+  if (!path || !isAbsolute(path)) throw new Error(`OVNFS ${PIN} requires an explicit absolute ${key} for a running local daemon`);
+  return realpathSync(path);
+};
+const savedDir = (path) => {
+  try { return realpathSync(path); } catch { throw new Error(`saved OVNFS namespace path is missing: ${path}`); }
+};
+
+/** { state, mount } that this root saved, or null. */
+export function savedNamespace(root) {
+  const path = namespaceFile(root);
+  if (!isFile(path)) return null;
+  let saved;
+  try { saved = JSON.parse(readFileSync(path, "utf8")); } catch (e) { throw new Error(`${path} is not readable: ${e.message}`); }
+  if (typeof saved?.state !== "string" || !isAbsolute(saved.state) || typeof saved?.mount !== "string" || !isAbsolute(saved.mount)) throw new Error(`${path} must hold a JSON object with absolute "state" and "mount"`);
+  return { state: saved.state, mount: saved.mount };
+}
+export const hasSavedNamespace = (root) => isFile(namespaceFile(root));
+
+/** `pp working-copy ovnfs --state DIR --mount DIR`: saves the namespace for this root. null (`--off`) removes it and tells whether one was saved. */
+export function saveNamespace(root, saved) {
+  const path = namespaceFile(root);
+  if (!saved) {
+    try { unlinkSync(path); } catch (e) { if (e.code !== "ENOENT") throw e; return false; }
+    return true;
+  }
+  for (const key of ["state", "mount"]) if (typeof saved[key] !== "string" || !isAbsolute(saved[key])) throw new Error(`--${key} takes an absolute path`);
+  writeAtomic(path, `${JSON.stringify({ state: saved.state, mount: saved.mount }, null, 2)}\n`);
+}
+
+/** Where this root's namespace comes from, and whether its pinned local daemon is verified. Never starts one. */
+export function describeNamespace(root) {
+  // Named before anything is read, so that a failure still says which source it came from.
+  const env = fromEnv("OVNFS_STATE", "OVNFS_MOUNT");
+  const source = env ? `OVNFS_STATE and OVNFS_MOUNT (set in this environment; they outrank a saved ${namespaceFile(root)})` : hasSavedNamespace(root) ? namespaceFile(root) : "";
+  if (!source) return { ok: false, text: `no OVNFS namespace for ${root}: set OVNFS_STATE and OVNFS_MOUNT, or run \`pp working-copy ovnfs --state DIR --mount DIR\` once` };
+  try {
+    const ns = preflight({ remote: false }, root);
+    return { ok: true, text: `OVNFS namespace from ${source}: state ${ns.state}, mount ${ns.mount}; pinned local daemon verified` };
+  } catch (e) { return { ok: false, text: `OVNFS namespace from ${source}: ${e.message}` }; }
+}
+
+function configuredNamespace(root) {
+  if (fromEnv("OVNFS_STATE", "OVNFS_MOUNT")) return namespace(explicitDir("OVNFS_STATE"), explicitDir("OVNFS_MOUNT"));
+  const saved = root && savedNamespace(root);
+  return namespace(saved ? savedDir(saved.state) : explicitDir("OVNFS_STATE"), saved ? savedDir(saved.mount) : explicitDir("OVNFS_MOUNT"));
 }
 
 // Inventory is not mount or ownership proof. Never use the CLI (including ls),
 // which can start a daemon even after an earlier status check succeeded.
-export function readInventory() {
+export function readInventory(root) {
   const h = { remote: false };
   local(h);
-  const ns = configuredNamespace();
+  const ns = configuredNamespace(root);
   return { namespace: ns, ...registry(h, ns) };
 }
 
-export function preflight(h) {
+export function preflight(h, root) {
   local(h);
   const r = sh(["ovnfs", "--json", "version"], undefined, undefined, { timeout: 5000 });
   let version;
   try { if (r.ok) version = JSON.parse(r.stdout); } catch {}
   if (version?.version !== PIN || version.os !== "darwin") throw new Error(`OVNFS ${PIN} for macOS is required; no checkout was allocated`);
-  const ns = configuredNamespace();
+  const ns = configuredNamespace(root);
   admin(h, ns, "status");
   mountCheck(ns);
   return ns;
 }
 
+// OVNFS --rev opens with empty submodules. Reuse the files of an initialized submodule only
+// when it matches the requested revision; other submodules can be initialized with Git as usual.
+function submoduleTakes(repo, baseline) {
+  return git(repo, "ls-tree", "-r", "-z", baseline).split("\0").flatMap((row) => {
+    const match = /^160000 commit ([a-f0-9]+)\t([\s\S]+)$/.exec(row);
+    if (!match) return [];
+    const [, oid, path] = match, cwd = join(repo, path);
+    try {
+      const dotGit = lstatSync(join(cwd, ".git"));
+      if ((!dotGit.isFile() && !dotGit.isDirectory()) || realpathSync(cwd) !== cwd ||
+          git(cwd, "rev-parse", "--show-toplevel") !== cwd || git(cwd, "rev-parse", "HEAD") !== oid ||
+          git(cwd, "--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none")) return [];
+    } catch (e) { if (e.code === "ENOENT" || e.code === "ENOTDIR") return []; throw e; }
+    return [`.:${path}`];
+  });
+}
+
+// The source repository is handed to OVNFS itself: `new` opens the thread's committed baseline on it and keeps
+// the folder's ignored build state, so PP packs nothing of its own.
 export function plan(t, baseline, ns, parent = null) {
   const nonce = randomUUID(), name = `pp-${nonce}`;
   return { owner: t.id, backend: "ovnfs", phase: "planned", baseline, source: t.repo, machine: t.machine,
     branch: t.branch, path: join(ns.mount, name), nonce, identity: null, blocker: "", depends_on: parent ? [parent.nonce] : [],
-    ovnfs: { namespace: ns, name, ...(parent ? { capture: parent.ovnfs.capture, from: { owner: parent.owner, resource: parent.resource, base: parent.ovnfs.from.base, snapshot: parent.identity } } : {}) } };
+    ovnfs: { namespace: ns, name, native: true, ...(parent ? { capture: parent.ovnfs.capture, from: { owner: parent.owner, resource: parent.resource, base: parent.ovnfs.from.base, snapshot: parent.identity } } : {}) } };
 }
 
 export function snapshotPlan(source, resource) {
@@ -134,18 +198,24 @@ export function ensureAvailable(h, w) {
     return [...new Set([from.parent ?? "", ...ls.snapshots.filter((s) => s.checkout === from.checkout && snapshotId(s.id)).map((s) => s.id)])];
   }
   if (from) verifySnapshot(ls.snapshots, from.snapshot);
+  else if (!w.ovnfs.native && !w.ovnfs.capture?.oid) throw new Error("OVNFS record has no verified capture; start a new checkout explicitly");
   if (ls.checkouts.some((c) => c.name === name || c.path === w.path)) throw new Error("OVNFS checkout name/path already exists; not allocating");
   try { lstatSync(w.path); } catch (e) { if (e.code === "ENOENT") return; throw e; }
   throw new Error(`OVNFS checkout path already exists: ${w.path}`);
 }
 
 export function create(h, w) {
-  const { namespace: ns, name, label, from, capture } = w.ovnfs;
+  const { namespace: ns, name, label, from, capture, native } = w.ovnfs;
   if (label) return admin(h, ns, "snap", { checkout: from.checkout, label, wait: true });
   if (from) return admin(h, ns, "new", { snapshot: from.snapshot.id, name });
-  if (!capture?.oid) throw new Error("OVNFS needs a verified clean capture; no checkout was allocated");
-  verifyCapture(capture);
-  return admin(h, ns, "new", { dir: capture.path, name, rev: capture.oid, rules: ["hidden *"] });
+  if (!native) {
+    if (!capture?.oid) throw new Error("OVNFS record has no verified capture; start a new checkout explicitly");
+    verifyCapture(capture);
+    return admin(h, ns, "new", { dir: capture.path, name, rev: capture.oid, rules: ["hidden *"] });
+  }
+  if (!oidPattern.test(w.baseline ?? "")) throw new Error("OVNFS opens the thread's committed baseline; no checkout was allocated");
+  const take = submoduleTakes(w.source, w.baseline);
+  return admin(h, ns, "new", { dir: w.source, name, rev: w.baseline, ...(take.length ? { take } : {}) });
 }
 
 function git(cwd, ...args) {
@@ -236,7 +306,7 @@ export function verify(h, w) {
   return w.path;
 }
 
-function deletionInventory(h, w) {
+function deletionInventory(h, w, root) {
   local(h);
   const { namespace: ns, name, label } = w.ovnfs;
   const gitRoot = join(ns.state, "git");
@@ -244,7 +314,7 @@ function deletionInventory(h, w) {
       dirname(w.identity.git_dir) !== gitRoot || !lstatSync(gitRoot).isDirectory() || realpathSync(gitRoot) !== gitRoot) {
     throw new Error("OVNFS checkout deletion identity is not confirmed");
   }
-  if (!same(ns, configuredNamespace())) throw new Error("OVNFS checkout belongs to a different namespace");
+  if (!same(ns, configuredNamespace(root))) throw new Error("OVNFS checkout belongs to a different namespace");
   mountCheck(ns);
   const ls = registry(h, ns);
   const { checkouts, snapshots } = ls;
@@ -257,8 +327,8 @@ function deletionInventory(h, w) {
   return ls;
 }
 
-export function verifyDeletion(h, w) {
-  const ls = deletionInventory(h, w);
+export function verifyDeletion(h, w, root) {
+  const ls = deletionInventory(h, w, root);
   if (!sameCheckout(w.identity, checkoutIdentity(h, w, { ls }))) throw new Error("OVNFS checkout identity does not match registration");
   const snapshot = ls.snapshots.find((s) => s.checkout === w.identity.name);
   if (snapshot) throw new Error(`OVNFS snapshot ${snapshot.id} depends on this checkout`);
@@ -287,8 +357,8 @@ export function removeCheckout(h, w) {
   return admin(h, w.ovnfs.namespace, "rm", { checkout: w.identity.name, sticky_snapshots: true, keep_commits: true });
 }
 
-export function checkoutGone(h, w) {
-  const { checkouts } = deletionInventory(h, w);
+export function checkoutGone(h, w, root) {
+  const { checkouts } = deletionInventory(h, w, root);
   if (checkouts.some((c) => c.name === w.identity.name || c.path === w.path)) return false;
   mountCheck(w.ovnfs.namespace);
   const gone = [w.path, w.identity.git_dir].every((p) => {

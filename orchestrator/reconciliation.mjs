@@ -2,7 +2,7 @@
 import { lstatSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { sha256 } from "./lib.mjs";
-import { readInventory } from "./managed-ovnfs.mjs";
+import { hasSavedNamespace, readInventory } from "./managed-ovnfs.mjs";
 import { adoptedGitIdentity, adoptionBase, commitOid, linkedWorktrees, preserveUnmanagedGit, verifyAdoptionBase } from "./working-copy.mjs";
 
 export const isLegacy = (t) => !t.working_copy && ["worktree", "ovnfs"].includes(t.kind);
@@ -80,7 +80,7 @@ const sameNamespace = (a, b) => a?.state === b.state && a.mount === b.mount && a
 const displayable = (v) => typeof v === "string" && v.length > 0 && !/[\x00-\x1f\x7f]/.test(v);
 
 function ovnfsInventory(project, records, repos) {
-  const { namespace: ns, checkouts, snapshots } = readInventory();
+  const { namespace: ns, checkouts, snapshots } = readInventory(project.root);
   const saved = records.flatMap(({ t }) => [t.working_copy, ...(t.working_copies ?? [])]).filter((w) => w?.backend === "ovnfs" && sameNamespace(w.ovnfs?.namespace, ns));
   const known = new Map(), items = [];
   for (const c of checkouts) {
@@ -157,7 +157,7 @@ export function discover(project, threads) {
       else items.push(pending(project, { ...fields, ...(proof.baseline ? { baseline: proof.baseline } : {}) }, ["unregistered resource not adopted", ...(proof.blocker ? [proof.blocker] : [])], proof.candidate));
     }
   }
-  if (records && (process.env.OVNFS_STATE || process.env.OVNFS_MOUNT || legacy.some((t) => t.kind === "ovnfs" && !t.machine))) {
+  if (records && (process.env.OVNFS_STATE || process.env.OVNFS_MOUNT || hasSavedNamespace(project.root) || legacy.some((t) => t.kind === "ovnfs" && !t.machine))) {
     try { items.push(...ovnfsInventory(project, records, seen)); }
     catch { problem("ovnfs", "", "OVNFS registry unavailable; requires the explicitly configured, running, pinned local namespace"); }
   }

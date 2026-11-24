@@ -411,7 +411,7 @@ function evidence(project, w, manifest, previous, transfer) {
 }
 
 function inspectOvnfs(project, t, h, w, budget) {
-  ovnfs.verifyDeletion(h, w);
+  ovnfs.verifyDeletion(h, w, project.root);
   checkDependencies(project, t, w, budget);
   checkOccupancy([w.path, w.identity.git_dir], budget);
   const declared = declaration(project, t, w, budget);
@@ -456,19 +456,28 @@ export function deleteOvnfsCheckout(project, t, h, w, save) {
   try {
     if (phase === "unknown") {
       const manifest = storedManifest(proof, path, w.nonce);
-      if (manifest.repository !== w.identity.registration || !ovnfs.checkoutGone(h, w)) fail("previous OVNFS removal is unconfirmed; will not send another rm");
+      if (manifest.repository !== w.identity.registration || !ovnfs.checkoutGone(h, w, project.root)) fail("previous OVNFS removal is unconfirmed; will not send another rm");
     } else {
       const inspectNow = () => inspectOvnfs(project, t, h, w);
       const manifest = inspectNow();
       proof = evidence(project, w, manifest, proof);
       verifyEvidence(proof, proof.path, inspectNow(), { durable: true });
-      ovnfs.preserveCheckout(project, h, w, manifest.head);
-      verifyEvidence(proof, proof.path, inspectNow());
-      ovnfs.removalPreserved(project, w, manifest.head);
+      if (w.ovnfs.capture) {
+        // Older allocations are registered against a PP-owned capture, not the user's repository.
+        ovnfs.preserveCheckout(project, h, w, manifest.head);
+        verifyEvidence(proof, proof.path, inspectNow());
+        ovnfs.removalPreserved(project, w, manifest.head);
+      } else {
+        for (const commit of new Set([manifest.head, ...manifest.commits])) {
+          const refs = git(w.source, ["for-each-ref", `--contains=${commit}`, "--count=1", "--format=%(refname)", "refs/heads", "refs/remotes"],
+            `commit ${commit} is not present in the source repository; push or apply it before deleting the OVNFS checkout`, ovnfsGitEnv);
+          if (!refs.trim()) fail(`commit ${commit} is not on a source branch; push or apply it before deleting the OVNFS checkout`);
+        }
+      }
       record("removing");
       phase = "unknown";
       ovnfs.removeCheckout(h, w);
-      if (!ovnfs.checkoutGone(h, w)) fail("OVNFS removal not confirmed by registry and filesystem");
+      if (!ovnfs.checkoutGone(h, w, project.root)) fail("OVNFS removal not confirmed by registry and filesystem");
     }
     record("removed");
     return `OVNFS checkout removed: ${w.path}`;

@@ -1,6 +1,6 @@
-import { existsSync, readdirSync } from "node:fs";
+import { readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { build, dirty, dispatch, file, initialize, verifyBuild, warm, write } from "./ovnfs-acceptance.mjs";
+import { build, dirty, dispatch, initialize, verifyBuild, warm, write } from "./ovnfs-acceptance.mjs";
 import { requireThat as check } from "./ovnfs-fixture.mjs";
 
 async function retained(f, backend) {
@@ -33,25 +33,9 @@ export async function measure(f, backend, scenario) {
     finally { excluded += performance.now() - start; }
   };
   const usefulElapsed = () => performance.now() - at - excluded;
-  const captureRoot = join(f.root, ".pp-working-copy-inputs");
-  const capturePaths = () => existsSync(captureRoot) ? readdirSync(captureRoot).filter((name) => existsSync(join(captureRoot, name, "repo"))) : [];
   const start = async (name, ...flags) => {
-    const captures = await harness(`${name} preflight`, async () => {
-      if (backend === "ovnfs") await f.proveMount();
-      return new Set(capturePaths());
-    });
-    let ready;
-    const launchAt = performance.now();
-    // The published capture is a local path. Polling bounds timing resolution, not the capture itself.
-    const poll = setInterval(() => {
-      if (capturePaths().some((path) => !captures.has(path))) ready ??= performance.now();
-    }, 10);
-    try {
-      const result = await timed(name, () => dispatch(f, backend, ...flags));
-      const step = run.steps.at(-1);
-      if (ready !== undefined) step.to_capture_ready_ms = ready - launchAt;
-      return result;
-    } finally { clearInterval(poll); }
+    await harness(`${name} preflight`, async () => { if (backend === "ovnfs") await f.proveMount(); });
+    return timed(name, () => dispatch(f, backend, ...flags));
   };
   const useful = async (name, t, options = {}, expectedCache) => {
     const digest = await timed(name, () => build(f, t.agent.cwd, options));
@@ -76,9 +60,9 @@ export async function measure(f, backend, scenario) {
       await useful("cold build", await start("cold launch"));
     } else if (scenario === "hot") {
       await timed("cache seed preparation", () => warm(f, base));
-      for (let i = 1; i <= 2; i++) await useful(`reuse ${i} build`, await start(`reuse ${i} launch`), { hot: true }, "reused");
-      await timed("invalidate seed", () => file(join(f.repo, "node_modules", "allowed"), "synthetic corrupt seed\n"));
-      await useful("invalidated cold build", await start("invalidated launch"), {}, "cold");
+      for (let i = 1; i <= 2; i++) await useful(`reuse ${i} build`, await start(`reuse ${i} launch`), { hot: true }, backend === "git-worktree" ? "reused" : undefined);
+      await timed("invalidate seed", () => rmSync(join(f.repo, "node_modules", "allowed")));
+      await useful("invalidated cold build", await start("invalidated launch"), {}, backend === "git-worktree" ? "cold" : undefined);
     } else {
       const parent = await start("parent launch");
       await timed("identical tracked edit", () => write(f, join(parent.agent.cwd, "input.txt"), dirty));

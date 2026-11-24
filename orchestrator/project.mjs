@@ -56,7 +56,7 @@ export class Project {
     if (!split) throw new Error(`${this.path("PROJECT.md")} has no \`+++\` front matter`);
     const front = parseToml(split.front, "PROJECT.md");
     const settings = { ...DEFAULT_SETTINGS, ...front };
-    settings.repos = (front.repos ?? []).map((r) => (typeof r === "string" ? parseRepoArg(r) : { path: r.path, machine: r.machine || null }));
+    settings.repos = (front.repos ?? []).map((r) => (typeof r === "string" ? parseRepoArg(r) : { path: r.path, machine: r.machine || null, ...(typeof r.working_copy_policy === "string" ? { working_copy_policy: r.working_copy_policy } : {}) }));
     return { settings, instructions: split.body.trim() };
   }
   settings() { return this.read().settings; }
@@ -111,6 +111,7 @@ export function frontMatter(settings) {
   for (const r of settings.repos ?? []) {
     lines.push("", "[[repos]]", tomlLine("path", r.path));
     if (r.machine) lines.push(tomlLine("machine", r.machine));
+    if (typeof r.working_copy_policy === "string") lines.push(tomlLine("working_copy_policy", r.working_copy_policy));
   }
   return lines.join("\n") + "\n";
 }
@@ -153,7 +154,7 @@ export const SET_KEYS = {
   working_copy_max_resources: "project limit for managed copies, snapshots and retained input repositories (whole number or off)",
   working_copy_min_free_bytes: "free-space warning line in bytes on each allocation volume (whole number or off)",
   working_copy_policy: "git-worktree (default) or ovnfs-preferred (preflight fallback only)",
-  "repos.add": "PATH or PATH@MACHINE", "repos.remove": "PATH",
+  "repos.add": "PATH or PATH@MACHINE", "repos.remove": "PATH", "repos.policy": "PATH=git-worktree|ovnfs-preferred|off for one local repo",
 };
 export function applySetting(settings, key, value) {
   const s = { ...settings, repos: [...settings.repos] };
@@ -167,6 +168,16 @@ export function applySetting(settings, key, value) {
         s[key] = num(value);
         if (!Number.isSafeInteger(s[key])) throw new Error(`${key} takes a safe whole number or off`);
       }
+      break;
+    }
+    case "repos.policy": {
+      const at = value.lastIndexOf("=");
+      const path = at > 0 ? value.slice(0, at) : "", policy = value.slice(at + 1);
+      const repo = s.repos.find((x) => x.path === path);
+      if (!repo) throw new Error(`${path || value} is not one of the repos`);
+      if (repo.machine) throw new Error(`${path} is a remote repo; it always uses git-worktree`);
+      if (!["git-worktree", "ovnfs-preferred", "off"].includes(policy)) throw new Error("repos.policy takes PATH=git-worktree, PATH=ovnfs-preferred or PATH=off");
+      s.repos = s.repos.map((x) => (x !== repo ? x : policy === "off" ? Object.fromEntries(Object.entries(x).filter(([k]) => k !== "working_copy_policy")) : { ...x, working_copy_policy: policy }));
       break;
     }
     case "working_copy_policy":

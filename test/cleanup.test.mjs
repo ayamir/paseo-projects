@@ -5,7 +5,7 @@ import { once } from "node:events";
 import { setTimeout as delay } from "node:timers/promises";
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -167,7 +167,7 @@ const server = createServer((client) => {
         const { name, snapshot } = m.new, path = join(mount, name), gd = join(state, "git", name);
         checkIntent("name", name);
         const input = snapshot && contents.get(snapshot);
-        if (snapshot ? (!input || m.new.dir || m.new.rev || m.new.rules) : (!m.new.rev || m.new.rules?.[0] !== "hidden *")) throw new Error("unsafe new");
+        if (snapshot ? (!input || m.new.dir || m.new.rev || m.new.rules || m.new.take) : (!m.new.dir || !m.new.rev)) throw new Error("unsafe new");
         const dir = input?.source ?? m.new.dir, rev = input?.rev ?? m.new.rev;
         mkdirSync(join(state, "git"), { recursive: true });
         git("clone", "--template=", "--no-checkout", "--no-hardlinks", "--", dir, path);
@@ -215,7 +215,7 @@ const server = createServer((client) => {
         if (i < 0 || !m.rm.keep_commits || !m.rm.sticky_snapshots) throw new Error("unsafe rm");
         const c = checkouts[i];
         const tip = git("-C", c.path, "rev-parse", "HEAD"), origin = git("-C", c.source, "rev-parse", "HEAD");
-        if (behavior === "refuse-rm" || (tip !== origin && !git("-C", c.source, "for-each-ref", "--format=%(objectname)", "refs/heads").split("\\n").includes(tip))) {
+        if (behavior === "refuse-rm" || (tip !== origin && !git("-C", c.source, "for-each-ref", "--format=%(objectname)", "refs/heads", "refs/remotes").split("\\n").includes(tip))) {
           send({ id: m.id, error: { code: "invalid", message: "cannot keep unique commits" } }); continue;
         }
         const [row] = checkouts.splice(i, 1);
@@ -230,7 +230,9 @@ const server = createServer((client) => {
 server.listen(socket, () => { chmodSync(socket, 0o600); console.log("ready"); });
 `);
 
-async function managedOvnfsFixture(t, mode = "ambiguous-new", daemon = "before-launch") {
+async function managedOvnfsFixture(t, mode = "ambiguous-new", daemon = "before-launch", namespace = "env") {
+  // `namespace` "file": no OVNFS_* in PP's environment; the fakes know the paths, so PP must find them through the
+  // root's saved namespace, the way an Agent launched by Paseo has to.
   const projectFile = join(BASE, `managed-ovnfs-project-${n}`);
   const d = await fakeDaemon(daemon, projectFile);
   t.after(d.stop);
@@ -243,79 +245,74 @@ async function managedOvnfsFixture(t, mode = "ambiguous-new", daemon = "before-l
   const executable = (name, source) => { const p = join(bin, name); write(p, `#!${process.execPath}\n${source}`); chmodSync(p, 0o755); };
   executable("ovnfs", `if (process.argv.slice(2).join(" ") === "--json version") console.log(JSON.stringify({ version: "v0.8.0", os: "darwin" })); else process.exit(1);`);
   executable("ps", `console.log("ovnfs serve --no-git-remotes");`);
-  executable("lsof", `import { existsSync, readFileSync } from "node:fs"; const file = process.env.OVNFS_STATE + "/occupied"; process.stdout.write("p12345\\0\\nfcwd\\0n" + (existsSync(file) ? readFileSync(file, "utf8") : "/") + "\\0\\n");`);
-  executable("nfsstat", `import { existsSync } from "node:fs"; const { OVNFS_STATE: s, OVNFS_MOUNT: m } = process.env; console.log(JSON.stringify(existsSync(s + "/unmounted") ? {} : { nfs: { "Mount Point": m, "Current mount parameters": { "NFS parameters": ["vers=3", "ticotsord", "port=" + s + "/nfs.sock", "mountport=" + s + "/nfs.sock"] } } }));`);
+  const paths = namespace === "file" ? `{ OVNFS_STATE: ${JSON.stringify(state)}, OVNFS_MOUNT: ${JSON.stringify(mount)} }` : "process.env";
+  executable("lsof", `import { existsSync, readFileSync } from "node:fs"; const { OVNFS_STATE } = ${paths}; const file = OVNFS_STATE + "/occupied"; process.stdout.write("p12345\\0\\nfcwd\\0n" + (existsSync(file) ? readFileSync(file, "utf8") : "/") + "\\0\\n");`);
+  executable("nfsstat", `import { existsSync } from "node:fs"; const { OVNFS_STATE: s, OVNFS_MOUNT: m } = ${paths}; console.log(JSON.stringify(existsSync(s + "/unmounted") ? {} : { nfs: { "Mount Point": m, "Current mount parameters": { "NFS parameters": ["vers=3", "ticotsord", "port=" + s + "/nfs.sock", "mountport=" + s + "/nfs.sock"] } } }));`);
   const admin = spawn(process.execPath, [FAKE_OVN_ADMIN, state, mount, mode], { stdio: ["ignore", "pipe", "inherit"] });
   t.after(() => admin.kill());
   await Promise.race([once(admin.stdout, "data"), once(admin, "exit").then(() => { throw new Error("fake OVNFS admin exited"); })]);
   const config = join(f.root, "config.json");
   write(config, JSON.stringify({ profiles: { fake: { provider: "claude/fake-model" } } }));
-  Object.assign(f.env, { PP_CONFIG: config, OVNFS_STATE: state, OVNFS_MOUNT: mount, PATH: `${bin}:${f.env.PATH}` });
+  Object.assign(f.env, { PP_CONFIG: config, PATH: `${bin}:${f.env.PATH}` });
+  for (const key of ["OVNFS_STATE", "OVNFS_MOUNT"]) {
+    if (namespace === "env") f.env[key] = { OVNFS_STATE: state, OVNFS_MOUNT: mount }[key];
+    else delete f.env[key]; // not even an inherited one
+  }
   return { ...f, state, mount, next: `t-${Number(f.id.slice(2)) + 1}`,
     start: (...args) => f.pp("thread", "start", "demo", "--title", "Managed OVNFS", "--task", "test", "--kind", "ovnfs", "--repo", f.repo, "--profile", "fake", ...args),
     show: (id) => JSON.parse(f.pp("--json", "thread", "show", "demo", id).out),
     calls: () => readFileSync(join(state, "calls"), "utf8").trim().split("\n").map(JSON.parse) };
 }
 
-test("managed OVNFS submits a committed clean capture without source files or private Git metadata", { skip: process.platform !== "darwin" }, async (t) => {
+test("managed OVNFS submits the original repository and exact committed revision without a PP capture", { skip: process.platform !== "darwin" }, async (t) => {
   const f = await managedOvnfsFixture(t, "off", "off");
   const baseline = git(f.repo, "rev-parse", "HEAD");
   write(join(f.repo, "package.json"), "dirty dummy content\n");
-  write(join(f.repo, "node_modules", ".env"), "dummy credential\n");
-  write(join(f.repo, "out", "local-state"), "dummy local state\n");
-  git(f.repo, "config", "--local", "pp.fixture-secret", "dummy config credential");
+  write(join(f.repo, "untracked.txt"), "nonignored untracked file\n");
   const started = f.start(); assert.ok(started.ok, started.out);
   const w = f.show(f.next).working_copy;
   const rpc = f.calls().find((x) => x.new).new;
   assert.equal(w.baseline, baseline);
   assert.equal(w.source, f.repo);
-  assert.notEqual(rpc.dir, f.repo);
-  assert.equal(w.ovnfs.capture.path, rpc.dir);
-  for (const path of [rpc.dir, w.path]) {
-    assert.equal(readFileSync(join(path, "package.json"), "utf8"), "{}\n");
-    assert.equal(existsSync(join(path, "node_modules")), false);
-    assert.equal(existsSync(join(path, "out")), false);
-    assert.throws(() => git(path, "config", "--local", "--get", "pp.fixture-secret"));
-  }
-  assert.ok(existsSync(join(f.repo, "node_modules", ".env")));
+  assert.deepEqual(rpc, { dir: f.repo, name: w.ovnfs.name, rev: baseline });
+  assert.equal(w.ovnfs.capture, undefined);
+  assert.equal(w.cache, undefined);
+  assert.equal(existsSync(join(f.root, ".pp-working-copy-inputs")), false);
+  assert.equal(readFileSync(join(w.path, "package.json"), "utf8"), "{}\n");
+  assert.equal(existsSync(join(w.path, "untracked.txt")), false);
   assert.equal(readFileSync(join(f.repo, "package.json"), "utf8"), "dirty dummy content\n");
 });
 
-test("managed OVNFS refuses a committed source link without submitting any checkout", { skip: process.platform !== "darwin" }, async (t) => {
+test("managed OVNFS passes tracked links and clean matching submodules to the native checkout", { skip: process.platform !== "darwin" }, async (t) => {
   const f = await managedOvnfsFixture(t, "off", "off");
-  const dummy = join(f.repo, "out", "dummy-private");
-  write(dummy, "DUMMY PRIVATE");
-  symlinkSync(dummy, join(f.repo, "tracked-link"));
-  git(f.repo, "add", "tracked-link"); git(f.repo, "commit", "-qm", "unsupported input");
-  assert.ok(f.pp("set", "demo", "working_copy_policy", "ovnfs-preferred").ok);
-  const failed = f.pp("thread", "start", "demo", "--title", "Unverified input", "--task", "test", "--repo", f.repo, "--profile", "fake");
-  assert.equal(failed.ok, false, failed.out);
-  assert.match(failed.out, /does not support tracked links/);
-  assert.doesNotMatch(failed.out, /DUMMY PRIVATE|fell back/);
+  const sub = join(f.root, "submodule");
+  git(f.root, "clone", "--", f.repo, sub);
+  git(f.repo, "-c", "protocol.file.allow=always", "submodule", "add", "--", sub, "vendor/child");
+  symlinkSync("package.json", join(f.repo, "tracked-link"));
+  git(f.repo, "add", "tracked-link"); git(f.repo, "commit", "-qm", "link and submodule");
+  const started = f.start(); assert.ok(started.ok, started.out);
   const w = f.show(f.next).working_copy;
-  assert.equal(w.backend, "ovnfs"); assert.equal(w.phase, "planned");
-  assert.equal(f.calls().some((m) => m.new), false);
-  assert.equal(readFileSync(dummy, "utf8"), "DUMMY PRIVATE");
+  assert.equal(readlinkSync(join(w.path, "tracked-link")), "package.json");
+  assert.deepEqual(f.calls().find((m) => m.new).new.take, [".:vendor/child"]);
+  write(join(f.repo, "vendor/child/package.json"), "dirty\n");
+  const dirty = f.start(); assert.ok(dirty.ok, dirty.out);
+  assert.equal(f.calls().filter((m) => m.new).at(-1).new.take, undefined);
 });
 
-test("managed OVNFS blocks a pre-capture planned record without allocating a checkout", { skip: process.platform !== "darwin" }, async (t) => {
+test("managed OVNFS preference uses Git for explicit dirty seeds without allocating OVNFS", { skip: process.platform !== "darwin" }, async (t) => {
   const f = await managedOvnfsFixture(t, "off", "off");
-  symlinkSync("package.json", join(f.repo, "tracked-link"));
-  git(f.repo, "add", "tracked-link"); git(f.repo, "commit", "-qm", "unsupported input");
-  assert.match(f.start().out, /does not support tracked links/);
-  const recordPath = f.p.path("threads", `${f.next}.json`);
-  const record = JSON.parse(readFileSync(recordPath, "utf8"));
-  assert.equal(record.working_copy.phase, "planned");
-  delete record.working_copy.ovnfs.capture; // Shape of a planned record written before clean capture was required.
-  write(recordPath, JSON.stringify(record));
-  const failed = f.pp("thread", "restart", "demo", f.next, "--fresh");
-  assert.equal(failed.ok, false, failed.out);
-  assert.match(failed.out, /OVNFS record has no verified capture; start a new checkout explicitly/);
+  assert.ok(f.pp("set", "demo", "repos.policy", `${f.repo}=ovnfs-preferred`).ok);
+  write(join(f.repo, "package.json"), '{"dirty":true}\n');
+  const refused = f.start("--inherit-dirty");
+  assert.equal(refused.ok, false, refused.out);
+  assert.match(refused.out, /requires a local git-worktree/);
+  const started = f.pp("thread", "start", "demo", "--title", "Dirty seed", "--task", "test", "--repo", f.repo, "--profile", "fake", "--inherit-dirty");
+  assert.ok(started.ok, started.out);
+  assert.match(started.out, /--inherit-dirty uses a git-worktree/);
   const w = f.show(f.next).working_copy;
-  assert.equal(w.phase, "planned"); assert.equal(w.nonce, record.working_copy.nonce);
-  assert.equal(w.ovnfs.capture, undefined); assert.equal(existsSync(w.path), false);
-  assert.match(w.blocker, /no verified capture/);
-  assert.equal(f.calls().some((m) => m.new), false);
+  assert.equal(w.backend, "git-worktree");
+  assert.equal(readFileSync(join(w.path, "package.json"), "utf8"), '{"dirty":true}\n');
+  assert.equal(existsSync(join(f.state, "calls")), false);
 });
 
 test("managed OVNFS reconciles an ambiguous allocation before Agent start and never reallocates", { skip: process.platform !== "darwin" }, async (t) => {
@@ -391,13 +388,122 @@ test("managed OVNFS restarts and explicitly deletes a checkout after only its sa
   assert.equal(f.calls().filter((m) => m.rm).length, 1);
 });
 
+test("repos.policy scopes ovnfs-preferred to one local repo and survives later settings writes", { skip: process.platform !== "darwin" }, async (t) => {
+  const f = await managedOvnfsFixture(t, "off", "off");
+  const other = join(f.root, "other-repo");
+  mkdirSync(other); git(other, "init", "-q"); git(other, "commit", "-q", "--allow-empty", "-m", "init");
+  assert.ok(f.pp("set", "demo", "repos.add", other).ok);
+  const entry = (path) => f.p.settings().repos.find((r) => r.path === path);
+  const scoped = f.pp("set", "demo", "repos.policy", `${f.repo}=ovnfs-preferred`);
+  assert.ok(scoped.ok, scoped.out);
+  assert.equal(entry(f.repo).working_copy_policy, "ovnfs-preferred");
+  assert.equal("working_copy_policy" in entry(other), false);
+  assert.ok(f.pp("set", "demo", "nudge", "false").ok);
+  assert.equal(entry(f.repo).working_copy_policy, "ovnfs-preferred");
+  const start = (repo, title) => f.pp("thread", "start", "demo", "--title", title, "--task", "test", "--repo", repo, "--profile", "fake");
+  const first = f.next, second = `t-${Number(first.slice(2)) + 1}`;
+  const plain = start(other, "Other repo");
+  assert.ok(plain.ok, plain.out); assert.doesNotMatch(plain.out, /fell back/);
+  assert.equal(f.show(first).working_copy.backend, "git-worktree");
+  assert.equal(f.show(first).working_copy.selection, undefined);
+  const preferred = start(f.repo, "Scoped OVNFS");
+  assert.ok(preferred.ok, preferred.out); assert.doesNotMatch(preferred.out, /fell back/);
+  assert.equal(f.show(second).working_copy.backend, "ovnfs");
+  assert.equal(f.show(second).working_copy.phase, "ready");
+  // A project-wide policy does not leak into a repo pinned back to Git.
+  assert.ok(f.pp("set", "demo", "repos.policy", `${f.repo}=git-worktree`).ok);
+  assert.ok(f.pp("set", "demo", "working_copy_policy", "ovnfs-preferred").ok);
+  const third = `t-${Number(second.slice(2)) + 1}`;
+  const pinned = start(f.repo, "Pinned to Git");
+  assert.ok(pinned.ok, pinned.out); assert.doesNotMatch(pinned.out, /fell back/);
+  assert.equal(f.show(third).working_copy.backend, "git-worktree");
+  assert.equal(f.show(third).working_copy.selection, undefined);
+  assert.ok(f.pp("set", "demo", "repos.policy", `${f.repo}=off`).ok);
+  assert.equal("working_copy_policy" in entry(f.repo), false);
+  assert.doesNotMatch(readFileSync(f.p.path("PROJECT.md"), "utf8"), /\[\[repos\]\]\npath = [^\n]+\nworking_copy_policy/); // the project-level line set above is unrelated
+  for (const [value, reason] of [[`${join(f.root, "nowhere")}=ovnfs-preferred`, /is not one of the repos/], [`${f.repo}=always`, /repos\.policy takes/]]) {
+    const refused = f.pp("set", "demo", "repos.policy", value);
+    assert.equal(refused.ok, false, refused.out); assert.match(refused.out, reason);
+  }
+  const far = join(f.root, "far");
+  assert.ok(f.pp("set", "demo", "repos.add", `${far}@elsewhere`).ok);
+  const remote = f.pp("set", "demo", "repos.policy", `${far}=ovnfs-preferred`);
+  assert.equal(remote.ok, false, remote.out); assert.match(remote.out, /remote repo; it always uses git-worktree/);
+  // A hand-written invalid value is reported with its repo and never silently falls back.
+  const file = f.p.path("PROJECT.md"), lines = readFileSync(file, "utf8").split("\n");
+  lines.splice(lines.indexOf("[[repos]]") + 2, 0, 'working_copy_policy = "always"');
+  write(file, lines.join("\n"));
+  const invalid = start(f.repo, "Invalid repo policy");
+  assert.equal(invalid.ok, false, invalid.out);
+  assert.match(invalid.out, /repos\.policy takes git-worktree or ovnfs-preferred/); assert.doesNotMatch(invalid.out, /fell back/);
+});
+
+test("a root's saved namespace lets an Agent without OVNFS_* use OVNFS; env still outranks the file", { skip: process.platform !== "darwin" }, async (t) => {
+  const f = await managedOvnfsFixture(t, "off", "before-launch", "file");
+  const saved = join(f.root, ".ovnfs.json");
+  const start = (title) => f.pp("thread", "start", "demo", "--title", title, "--task", "test", "--repo", f.repo, "--profile", "fake");
+  const next = (id) => `t-${Number(id.slice(2)) + 1}`;
+  assert.ok(f.pp("set", "demo", "working_copy_policy", "ovnfs-preferred").ok);
+  const none = f.pp("working-copy", "ovnfs");
+  assert.equal(none.ok, false, none.out); assert.match(none.out, /no OVNFS namespace for/);
+  let id = f.next;
+  const fell = start("No namespace yet");
+  assert.equal(fell.ok, false, fell.out);
+  assert.match(fell.out, /fell back to git-worktree/); assert.match(fell.out, /requires an explicit absolute OVNFS_STATE/);
+  assert.equal(f.show(id).working_copy.backend, "git-worktree");
+  for (const args of [["--state", f.state], ["--mount", f.mount], ["--state", f.state, "--mount", f.mount, "--off"], ["--state", "relative", "--mount", f.mount]]) {
+    const refused = f.pp("working-copy", "ovnfs", ...args);
+    assert.equal(refused.ok, false, refused.out); assert.equal(existsSync(saved), false, args.join(" "));
+  }
+  const stored = f.pp("working-copy", "ovnfs", "--state", f.state, "--mount", f.mount);
+  assert.ok(stored.ok, stored.out);
+  assert.match(stored.out, /saved the OVNFS namespace; OVNFS namespace from .*\.ovnfs\.json: state .*; pinned local daemon verified/);
+  assert.deepEqual(JSON.parse(readFileSync(saved, "utf8")), { state: f.state, mount: f.mount });
+  assert.match(f.pp("working-copy", "ovnfs").out, /OVNFS namespace from .*\.ovnfs\.json: state .*; pinned local daemon verified/);
+  // Reconciliation reads the registry for a root that only saved the namespace.
+  assert.deepEqual(f.calls().filter((m) => m.ls), []); // the admin status calls came from working-copy ovnfs
+  const query = f.pp("thread", "discover", "demo");
+  assert.ok(query.ok, query.out); assert.doesNotMatch(query.out, /OVNFS registry unavailable/);
+  assert.ok(f.calls().some((m) => m.ls));
+  id = next(id);
+  const used = start("Saved namespace");
+  assert.equal(used.ok, true, used.out); assert.doesNotMatch(used.out, /fell back/);
+  const w = f.show(id).working_copy;
+  assert.equal(w.backend, "ovnfs"); assert.equal(w.phase, "ready");
+  assert.equal(w.ovnfs.namespace.state, realpathSync(f.state));
+  assert.ok(f.pp("thread", "resolve", "demo", id, "--skip-copy").ok, "resolve");
+  const deleted = f.pp("thread", "delete-checkout", "demo", id);
+  assert.ok(deleted.ok, deleted.out);
+  assert.equal(f.show(id).working_copy.disposal.phase, "removed");
+  assert.equal(f.calls().filter((m) => m.rm).length, 1);
+  // A set env pair is used as-is, even when it does not work; the file is not consulted.
+  Object.assign(f.env, { OVNFS_STATE: join(f.root, "absent"), OVNFS_MOUNT: f.mount });
+  const shadowed = f.pp("working-copy", "ovnfs");
+  assert.equal(shadowed.ok, false, shadowed.out);
+  assert.match(shadowed.out, /OVNFS_STATE and OVNFS_MOUNT \(set in this environment; they outrank .*\.ovnfs\.json\)/);
+  delete f.env.OVNFS_STATE; delete f.env.OVNFS_MOUNT;
+  write(saved, JSON.stringify({ state: f.state }));
+  const broken = f.pp("working-copy", "ovnfs");
+  assert.equal(broken.ok, false, broken.out); assert.match(broken.out, /must hold a JSON object with absolute "state" and "mount"/);
+  const removed = f.pp("working-copy", "ovnfs", "--off");
+  assert.equal(removed.ok, true, removed.out); // removing is the success; what is left is in the text
+  assert.match(removed.out, /removed the saved OVNFS namespace; no OVNFS namespace for/);
+  assert.equal(existsSync(saved), false);
+  const twice = f.pp("working-copy", "ovnfs", "--off");
+  assert.equal(twice.ok, true, twice.out); assert.match(twice.out, /no saved OVNFS namespace to remove; no OVNFS namespace for/); // nothing to remove is not a removal
+  id = next(id);
+  const again = start("After --off");
+  assert.match(again.out, /fell back to git-worktree/);
+  assert.equal(f.show(id).working_copy.backend, "git-worktree");
+});
+
 test("managed preflight: resource and space pressure refuse additions without disturbing a held OVNFS checkout", { skip: process.platform !== "darwin" }, async (t) => {
   const f = await managedOvnfsFixture(t, "off", "off");
   assert.ok(f.start().ok);
   const record = f.show(f.next).working_copy;
   const hold = f.pp("thread", "hold", "demo", f.next, "--reason", "still active", "--until", "2099-01-01T00:00:00Z");
   assert.ok(hold.ok, hold.out);
-  for (const [key, limit, why] of [["working_copy_max_resources", "2", /resource budget/], ["working_copy_min_free_bytes", "9007199254740991", /space warning/]]) {
+  for (const [key, limit, why] of [["working_copy_max_resources", "1", /resource budget/], ["working_copy_min_free_bytes", "9007199254740991", /space warning/]]) {
     const setting = f.pp("set", "demo", key, limit); assert.ok(setting.ok, setting.out);
     const before = readdirSync(f.p.path("threads"));
     for (const action of [() => f.start(), () => f.pp("thread", "experiment", "demo", f.next, "--name", "extra"), () => f.pp("thread", "snapshot", "demo", f.next, "--name", "save")]) {
@@ -410,8 +516,7 @@ test("managed preflight: resource and space pressure refuse additions without di
   }
   const view = JSON.parse(f.pp("board", "thread", "demo", f.next).out);
   assert.equal(view.working_copy.nonce, record.nonce);
-  assert.equal(view.working_copy.retained_input.path, record.ovnfs.capture.path);
-  assert.match(view.working_copy.retained_input.reason, /OVNFS Git object dependency/);
+  assert.equal(view.working_copy.retained_input, undefined);
   assert.ok(view.working_copy.blockers.some((s) => /still active/.test(s)));
   assert.ok(existsSync(record.path));
   assert.deepEqual(f.calls().filter((m) => m.new || m.snap || m.rm || m.drop).map((m) => Object.keys(m).filter((k) => k !== "id")), [["new"]]);
@@ -626,7 +731,8 @@ test("an Agent can explicitly delete one resolved managed OVNFS checkout with ve
   git(w.path, "commit", "--allow-empty", "-qm", "private result");
   const tip = git(w.path, "rev-parse", "HEAD");
   write(join(f.show(f.next).thread_dir, "cleanup.json"), JSON.stringify({ commits: [tip] }));
-  const sourceRefs = git(f.repo, "show-ref"), captureHead = git(w.ovnfs.capture.path, "rev-parse", "HEAD");
+  git(f.repo, "fetch", "--no-tags", w.path, `HEAD:refs/remotes/origin/${w.branch}`);
+  const sourceRefs = git(f.repo, "show-ref");
   const resolved = f.pp("thread", "resolve", "demo", f.next);
   assert.ok(resolved.ok, resolved.out);
   assert.ok(existsSync(w.path));
@@ -639,48 +745,46 @@ test("an Agent can explicitly delete one resolved managed OVNFS checkout with ve
   assert.ok(existsSync(scratch.path));
   assert.ok(!existsSync(w.path));
   assert.ok(!existsSync(w.identity.git_dir));
-  assert.ok(existsSync(w.ovnfs.capture.path));
   const evidence = gone.disposal.evidence.path;
   assert.equal(readFileSync(join(evidence, "files", relative(w.path, output)), "utf8"), "result\n");
   const restored = join(f.root, "restored.git");
   git(f.root, "clone", "--mirror", join(evidence, "commits.bundle"), restored);
   assert.equal(git(restored, "rev-parse", `refs/heads/saved/${tip}`), tip);
-  const branch = `pp-preserved-${w.nonce}-${tip}`;
   assert.equal(git(f.repo, "show-ref"), sourceRefs);
-  assert.equal(git(w.ovnfs.capture.path, "rev-parse", "HEAD"), captureHead);
-  assert.equal(git(w.ovnfs.capture.path, "status", "--porcelain"), "");
-  assert.equal(git(w.ovnfs.capture.path, "rev-parse", `refs/heads/${branch}`), tip);
   assert.deepEqual(f.calls().filter((m) => m.apply || m.rm).map(({ apply, rm }) => apply ?? rm), [
-    { checkout: w.identity.name, branch },
     { checkout: w.identity.name, keep_commits: true, sticky_snapshots: true },
   ]);
 });
 
-test("OVNFS explicit deletion retains the checkout when native apply reports success without the preservation ref", { skip: process.platform !== "darwin" }, async (t) => {
-  const f = await managedOvnfsFixture(t, "missing-applied-ref", "off");
+test("OVNFS explicit deletion retains declared commits that are not reachable from the source", { skip: process.platform !== "darwin" }, async (t) => {
+  const f = await managedOvnfsFixture(t, "off", "off");
   const started = f.start(); assert.ok(started.ok, started.out);
-  const { working_copy: w } = f.show(f.next);
+  const { working_copy: w, thread_dir: td } = f.show(f.next);
+  git(w.path, "commit", "--allow-empty", "-qm", "private result");
+  const tip = git(w.path, "rev-parse", "HEAD"), refs = git(f.repo, "show-ref");
+  write(join(td, "cleanup.json"), JSON.stringify({ commits: [tip] }));
   const resolved = f.pp("thread", "resolve", "demo", f.next); assert.ok(resolved.ok, resolved.out);
   const deleted = f.pp("thread", "delete-checkout", "demo", f.next);
   assert.equal(deleted.ok, false, deleted.out);
-  assert.match(deleted.out, /retained: OVNFS native preservation branch was not confirmed/);
+  assert.match(deleted.out, /retained: .*not present in the source repository/);
   assert.ok(existsSync(w.path));
   assert.equal(f.show(f.next).working_copy.disposal.phase, "retained");
-  assert.deepEqual(f.calls().filter((m) => m.apply || m.rm).map((m) => m.apply?.checkout ?? "rm"), [w.identity.name]);
+  assert.equal(git(f.repo, "show-ref"), refs);
+  assert.deepEqual(f.calls().filter((m) => m.apply || m.rm), []);
 });
 
-test("OVNFS explicit deletion does not write through linked capture metadata", { skip: process.platform !== "darwin" }, async (t) => {
+test("OVNFS explicit deletion refuses linked private Git metadata", { skip: process.platform !== "darwin" }, async (t) => {
   const f = await managedOvnfsFixture(t, "off", "off");
   assert.ok(f.start().ok);
   const { working_copy: w } = f.show(f.next);
   const resolved = f.pp("thread", "resolve", "demo", f.next); assert.ok(resolved.ok, resolved.out);
-  const heads = join(w.ovnfs.capture.path, ".git", "refs", "heads"), outside = join(f.root, "external-refs");
+  const heads = join(w.identity.git_dir, "refs", "heads"), outside = join(f.root, "external-refs");
   renameSync(heads, outside);
   const refs = readdirSync(outside);
   symlinkSync(outside, heads, "dir");
   const deleted = f.pp("thread", "delete-checkout", "demo", f.next);
   assert.equal(deleted.ok, false, deleted.out);
-  assert.match(deleted.out, /retained: OVNFS capture Git metadata is not private/);
+  assert.match(deleted.out, /retained: unclassified OVNFS private Git entry: refs\/heads/);
   assert.ok(existsSync(w.path));
   assert.deepEqual(readdirSync(outside), refs);
   assert.deepEqual(f.calls().filter((m) => m.apply || m.rm), []);
@@ -1399,8 +1503,8 @@ test("managed preflight: Git stays default, policy fallback is visible, and actu
   assert.match(f.start("--kind", "worktree").out, /space warning/);
 });
 
-for (const backend of ["git-worktree", "ovnfs"]) test(`managed cache: ${backend} revalidates exact declared data and never shares writes`, { skip: backend === "ovnfs" && process.platform !== "darwin" }, async (t) => {
-  const f = backend === "ovnfs" ? await managedOvnfsFixture(t, "off", "off") : await managedFixture(t);
+test("managed cache: git-worktree revalidates exact declared data and never shares writes", async (t) => {
+  const f = await managedFixture(t);
   const start = () => { const r = f.start(); assert.ok(r.ok, r.out); };
   const i = Number((f.next ?? f.id).slice(2));
   const view = (offset) => JSON.parse(f.pp("board", "thread", "demo", `t-${i + offset}`).out).working_copy;
@@ -1439,8 +1543,8 @@ for (const backend of ["git-worktree", "ovnfs"]) test(`managed cache: ${backend}
   assert.equal(existsSync(join(view(4).path, "node_modules")), false);
 });
 
-for (const backend of ["git-worktree", "ovnfs"]) test(`managed inputs: ${backend} retains an independently restorable explicit dirty seed`, { skip: backend === "ovnfs" && process.platform !== "darwin" }, async (t) => {
-  const f = backend === "ovnfs" ? await managedOvnfsFixture(t, "off", "off") : await managedFixture(t);
+test("managed inputs: git-worktree retains an independently restorable explicit dirty seed", async (t) => {
+  const f = await managedFixture(t);
   const base = git(f.repo, "rev-parse", "HEAD");
   write(join(f.repo, "package.json"), '{"staged": true}\n');
   git(f.repo, "add", "package.json");
@@ -1469,8 +1573,8 @@ for (const backend of ["git-worktree", "ovnfs"]) test(`managed inputs: ${backend
   assert.equal(existsSync(join(restored, "package-lock.json")), false);
 });
 
-for (const backend of ["git-worktree", "ovnfs"]) test(`managed inputs: ${backend} restores exact UTF-16LE dirty seed bytes`, { skip: backend === "ovnfs" && process.platform !== "darwin" }, async (t) => {
-  const f = backend === "ovnfs" ? await managedOvnfsFixture(t, "off", "off") : await managedFixture(t);
+test("managed inputs: git-worktree restores exact UTF-16LE dirty seed bytes", async (t) => {
+  const f = await managedFixture(t);
   const file = "package.json", source = join(f.repo, file);
   write(join(f.repo, ".gitattributes"), `${file} working-tree-encoding=UTF-16LE\n`);
   write(source, Buffer.from('{"base": "a"}\n', "utf16le"));
@@ -1488,8 +1592,8 @@ for (const backend of ["git-worktree", "ovnfs"]) test(`managed inputs: ${backend
   assert.ok(readFileSync(join(restored, file)).equals(edited), "independent Git restore must preserve the working bytes");
 });
 
-for (const backend of ["git-worktree", "ovnfs"]) test(`managed inputs: ${backend} restores CRLF and refuses non-round-tripping LF under eol=crlf`, { skip: backend === "ovnfs" && process.platform !== "darwin" }, async (t) => {
-  const f = backend === "ovnfs" ? await managedOvnfsFixture(t, "off", "off") : await managedFixture(t);
+test("managed inputs: git-worktree restores CRLF and refuses non-round-tripping LF under eol=crlf", async (t) => {
+  const f = await managedFixture(t);
   const file = "package.json", source = join(f.repo, file);
   write(join(f.repo, ".gitattributes"), `${file} text eol=crlf\n`);
   write(source, '{"base": true}\r\n');
@@ -1509,19 +1613,15 @@ for (const backend of ["git-worktree", "ovnfs"]) test(`managed inputs: ${backend
   assert.match(failed.out, /dirty seed does not round-trip to the source working-tree bytes/);
   const next = f.show(`t-${Number(id.slice(2)) + 1}`).working_copy;
   assert.equal(next.phase, "planned"); assert.equal(existsSync(next.path), false);
-  if (backend === "ovnfs") assert.equal(f.calls().filter((m) => m.new).length, 1);
   assert.ok(readFileSync(source).equals(lf), "refusal preserves the source bytes");
 });
 
-for (const backend of ["git-worktree", "ovnfs"]) test(`managed inputs: ${backend} blocks an allocated checkout with changed seed bytes`, { skip: backend === "ovnfs" && process.platform !== "darwin" }, async (t) => {
-  const f = backend === "ovnfs" ? await managedOvnfsFixture(t, "seed-byte-mismatch", "off") : await managedFixture(t);
+test("managed inputs: git-worktree blocks an allocated checkout with changed seed bytes", async (t) => {
+  const f = await managedFixture(t);
   const file = "package.json", source = join(f.repo, file), expected = Buffer.from('{"dirty": true}\n');
   write(source, expected);
-  if (backend === "git-worktree") {
-    // A normal linked Git worktree uses local .git/info/attributes, which were
-    // not (and must not be) carried into the independently recoverable seed.
-    write(join(f.repo, ".git/info/attributes"), `${file} text eol=crlf\n`);
-  }
+  // A linked worktree uses local attributes, which must not enter the independent seed.
+  write(join(f.repo, ".git/info/attributes"), `${file} text eol=crlf\n`);
   const failed = f.start("--inherit-dirty"); assert.equal(failed.ok, false);
   assert.match(failed.out, /dirty seed does not round-trip.*in the allocated checkout/);
   const id = f.next ?? f.id;
@@ -1532,7 +1632,6 @@ for (const backend of ["git-worktree", "ovnfs"]) test(`managed inputs: ${backend
   const retry = f.pp("thread", "restart", "demo", id, "--fresh");
   assert.equal(retry.ok, false); assert.match(retry.out, /dirty seed does not round-trip.*in the allocated checkout/);
   assert.equal(f.show(id).working_copy.nonce, w.nonce);
-  if (backend === "ovnfs") assert.equal(f.calls().filter((m) => m.new).length, 1);
 });
 
 test("managed inputs: ordinary Git filters still work without a verified cache claim", async (t) => {

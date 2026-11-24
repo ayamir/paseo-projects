@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { realCases } from "../orchestrator/promotion.mjs";
 import { requireThat as check, sha256 } from "./ovnfs-fixture.mjs";
@@ -83,24 +83,20 @@ export async function accept(f) {
   })) {
     await run("capture-and-cache", async () => {
       warm(f, baseline);
-      file(join(f.repo, "node_modules", ".env"), "synthetic unknown secret\n");
+      file(join(f.repo, "untracked.txt"), "nonignored untracked input\n");
       file(join(f.repo, "input.txt"), dirty);
-      await f.git(f.repo, "config", "--local", "fixture.private", "synthetic local config");
       const { id, agent } = await launch(f, "ovnfs", "--reviews", review);
       main = await f.show(id);
       const w = main.working_copy;
       const registry = await checkoutIdentity(f, w);
-      const capture = w.ovnfs.capture;
-      check(agent.cwd === w.path && w.baseline === baseline && registry.source === capture.path && capture.path !== f.repo && capture.path.startsWith(`${f.root}/`), "launch or capture source identity mismatch");
-      check(await f.git(capture.path, "rev-parse", "HEAD") === capture.oid && capture.oid === baseline, "capture baseline differs from committed source");
-      check(await read(f, join(capture.path, "input.txt")) === clean.trim() && await read(f, join(w.path, "input.txt")) === clean.trim(), "committed capture inherited dirty changes");
-      check(w.cache.state === "reused" && sha256(readFileSync(join(f.repo, "node_modules", "allowed"))) === sha256(cache) &&
-        await read(f, join(w.path, "node_modules", "allowed")) === cache.trim(), "declared immutable cache was not copied");
-      check(await absent(f, join(w.path, "node_modules", ".env")) && await absent(f, join(capture.path, "node_modules")), "undeclared ignored data entered the capture or checkout");
-      check(await f.git(w.path, "config", "--local", "--list").then((s) => !s.includes("fixture.private")), "private Git config leaked");
+      check(agent.cwd === w.path && w.baseline === baseline && registry.source === f.repo, "native checkout source identity mismatch");
+      check(!w.ovnfs.capture && !w.cache && await absent(f, join(f.root, ".pp-working-copy-inputs")), "PP staged an intermediate input for native OVNFS");
+      check(await f.git(w.path, "rev-parse", "HEAD") === baseline, "checkout baseline differs from committed source");
+      check(await read(f, join(w.path, "input.txt")) === clean.trim() && await absent(f, join(w.path, "untracked.txt")), "native revision inherited tracked edits or nonignored untracked files");
+      check(await read(f, join(w.path, "node_modules", "allowed")) === cache.trim(), "native checkout did not reuse ignored build state");
       await write(f, join(w.path, "node_modules", "allowed"), "isolated cache edit\n");
       check(readFileSync(join(f.repo, "node_modules", "allowed"), "utf8") === cache && readFileSync(join(f.repo, "input.txt"), "utf8") === dirty, "checkout wrote back to the source");
-      return { baseline, capture: await f.size(capture.path), registry_source_is_capture: true };
+      return { baseline, registry_source_is_original: true };
     });
     if (main?.working_copy?.phase === "ready") {
       await run("experiment-and-derived", async () => {
@@ -197,7 +193,8 @@ export async function accept(f) {
     }
     if (f.mounted) await run("explicit-delete", async () => {
       // The test victim must have no undeclared cache files to discard.
-      rmSync(join(f.project, "working-copy-cache.json"), { force: true });
+      rmSync(join(f.repo, "node_modules", "allowed"), { force: true });
+      rmdirSync(join(f.repo, "node_modules"));
       const { id: offlineVictim } = await launch(f, "ovnfs");
       await f.cli("thread", "resolve", "fixture", offlineVictim);
       const beforeOutage = await f.registry(), offline = (await f.show(offlineVictim)).working_copy;
@@ -227,24 +224,23 @@ export async function accept(f) {
       beforeDelete = await f.registry();
       await f.occupy(w.path, (pid) => fails(f, new RegExp(`occupied by process ${pid}`), ...deleteArgs(victim)));
       await f.proveMount();
-      const deletion = await f.attempt(...deleteArgs(victim));
+      const refs = await f.git(f.repo, "show-ref");
+      await fails(f, /commit .* is not (present in|on a source branch)/, ...deleteArgs(victim));
+      check((await f.show(victim)).working_copy.disposal.phase === "retained" && !await absent(f, w.path) &&
+        sameRegistry(beforeDelete, await f.registry()) && await f.git(f.repo, "show-ref") === refs, "private-commit refusal did not preserve checkout and source refs");
+      await f.git(f.repo, "fetch", "--no-tags", w.path, "HEAD:refs/remotes/origin/fixture-result");
+      const published = await f.git(f.repo, "show-ref");
+      await f.cli(...deleteArgs(victim));
       const { disposal } = (await f.show(victim)).working_copy;
       const afterDelete = await f.registry();
-      const outputLine = f.scrub(`${deletion.stdout}\n${deletion.stderr}`).trim().split("\n").at(-1);
-      const conflict = !deletion.ok && /OVNFS checkout removal unconfirmed: OVNFS v0\.8\.0 rm: conflict:.*holds 1 commit/.test(outputLine);
-      if (conflict) {
-        check(disposal.phase === "unknown" && sameRegistry(beforeDelete, afterDelete) && !await absent(f, w.path), `${outputLine}; checkout retention not confirmed`);
-      } else {
-        check(deletion.ok && /OVNFS checkout removed/.test(outputLine), `PP did not confirm explicit deletion: ${outputLine || deletion.error}`);
-        check(disposal.phase === "removed" && await absent(f, w.path) && await absent(f, w.identity.git_dir) &&
-          sameRegistry({ ...beforeDelete, checkouts: beforeDelete.checkouts.filter((c) => c.name !== w.identity.name) }, afterDelete), "deletion did not remove exactly one checkout from the registry and healthy filesystem");
-      }
+      check(disposal.phase === "removed" && await absent(f, w.path) && await absent(f, w.identity.git_dir) &&
+        sameRegistry({ ...beforeDelete, checkouts: beforeDelete.checkouts.filter((c) => c.name !== w.identity.name) }, afterDelete) &&
+        await f.git(f.repo, "show-ref") === published, "deletion did not remove exactly one checkout or changed the source refs");
       const evidence = disposal.evidence.path;
       check(evidence.startsWith(`${f.root}/`) && readFileSync(join(evidence, "files", relative(w.path, output)), "utf8") === "recoverable synthetic result\n", "archived file is not independently readable");
       const restored = join(f.dir, "restore.git");
       await f.git(f.dir, "clone", "--mirror", join(evidence, "commits.bundle"), restored);
       check(await f.git(restored, "rev-parse", `refs/heads/saved/${tip}`) === tip, "archived commit is not independently recoverable");
-      if (conflict) throw new Error(`${outputLine.split(": \`ovnfs land")[0]}; checkout retained, PP recorded unknown, file and commit independently restored`);
       await f.cli(...deleteArgs(victim));
       check(sameRegistry(afterDelete, await f.registry()), "rechecking explicit deletion changed the registry");
     });

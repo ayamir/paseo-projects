@@ -30,6 +30,20 @@ async function main() {
   const { pos, flags: f, given, inlined } = parse(process.argv.slice(2));
   check(pos, given, inlined); // before anything runs: an option the command does not declare is an error, not ignored
   const [cmd, a1, a2, a3] = pos;
+  if (cmd === "working-copy" && a1 === "ovnfs") {
+    const managed = await import("../orchestrator/managed-ovnfs.mjs");
+    const root = rootOf({ root: f.root });
+    const { state, mount, off } = f;
+    const saving = state !== undefined || mount !== undefined;
+    if ((off && saving) || (saving && !(state && mount))) throw new Error("usage: pp working-copy ovnfs [--state DIR --mount DIR | --off]");
+    const removed = off || saving ? managed.saveNamespace(root, off ? null : { state, mount }) : undefined;
+    const { ok, text } = managed.describeNamespace(root);
+    const lead = off ? (removed ? "removed the saved OVNFS namespace; " : "no saved OVNFS namespace to remove; ") : saving ? "saved the OVNFS namespace; " : "";
+    console.log(`${lead}${text}`);
+    // --off succeeded once the file is gone; what this root falls back to (an env pair, or nothing) is in the text.
+    if (!off && !ok) process.exitCode = 1;
+    return;
+  }
   if (cmd === "working-copy") {
     const { promotion } = await import("../orchestrator/promotion.mjs");
     const result = promotion(f.evidence, f.thresholds);
