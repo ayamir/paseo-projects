@@ -4,7 +4,7 @@ import { dirname, isAbsolute, join } from "node:path";
 import { lstatSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { sh } from "./lib.mjs";
-import { verifyCapture } from "./copy-inputs.mjs";
+import { preservationTarget, verifyCapture } from "./copy-inputs.mjs";
 import { lifecycleStdio } from "./lifecycle-lock.mjs";
 
 const PIN = "v0.8.0";
@@ -32,9 +32,10 @@ function namespace(state, mount) {
 function admin(h, ns, op, args = {}) {
   local(h);
   if (!same(ns, namespace(ns.state, ns.mount))) throw new Error("OVNFS state directory identity changed");
-  const ms = ["new", "snap", "rm"].includes(op) ? 30_000 : 5000;
+  const writes = op === "apply" || op === "rm";
+  const ms = writes || op === "new" || op === "snap" ? 30_000 : 5000;
   const r = spawnSync(process.execPath, [ADMIN, ns.state, ns.mount, op, JSON.stringify(args), String(ms)], {
-    encoding: "utf8", timeout: ms + 1000, maxBuffer: 17 << 20, ...(op === "rm" && { stdio: lifecycleStdio() }),
+    encoding: "utf8", timeout: ms + 1000, maxBuffer: 17 << 20, ...(writes && { stdio: lifecycleStdio() }),
   });
   if (r.status !== 0) throw new Error(`OVNFS ${PIN} ${op}: ${r.error?.message ?? (r.stderr.trim() || "unknown admin outcome")}`);
   if (!same(ns, namespace(ns.state, ns.mount))) throw new Error("OVNFS state directory identity changed");
@@ -225,6 +226,19 @@ export function verifyDeletion(h, w) {
   // Checked before PP records "removing", so an unsupported daemon leaves the checkout retained rather than unknown.
   const { features } = admin(h, w.ovnfs.namespace, "status");
   if (!RM_FEATURES.every((f) => Array.isArray(features) && features.includes(f))) throw new Error("daemon does not support non-force, snapshot-preserving OVNFS removal");
+}
+
+export function preserveCheckout(project, h, w, head) {
+  const target = preservationTarget(project, w, head);
+  if (target.exists) return;
+  const result = admin(h, w.ovnfs.namespace, "apply", { checkout: w.identity.name, branch: target.branch });
+  if (result.source !== target.path || result.branch !== target.branch || result.commit !== head ||
+      [result.applied, result.merged, result.conflicts].some((items) => items != null && (!Array.isArray(items) || items.length)) ||
+      !preservationTarget(project, w, head).exists) throw new Error("OVNFS native preservation branch was not confirmed");
+}
+
+export function removalPreserved(project, w, head) {
+  if (!preservationTarget(project, w, head).exists) throw new Error("OVNFS native preservation branch is missing");
 }
 
 export function removeCheckout(h, w) {

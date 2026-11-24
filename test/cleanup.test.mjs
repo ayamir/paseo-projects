@@ -153,7 +153,7 @@ const server = createServer((client) => {
     while (buf.length >= 4 && buf.length >= 4 + buf.readUInt32LE()) {
       const end = 4 + buf.readUInt32LE(), m = JSON.parse(buf.subarray(4, end)); buf = buf.subarray(end);
       const ok = (data) => send({ id: m.id, ok: data });
-      if (m.hello) { send({ welcome: { ...meta, ops: ["status", "ls", "new", "snap", "rm"], features: behavior === "no-rm-guarantees" ? [] : ["rm.sticky_snapshots", "rm.keep_commits"] } }); continue; }
+      if (m.hello) { send({ welcome: { ...meta, ops: ["status", "ls", "new", "snap", "apply", "rm"], features: behavior === "no-rm-guarantees" ? [] : ["rm.sticky_snapshots", "rm.keep_commits"] } }); continue; }
       appendFileSync(join(state, "calls"), JSON.stringify(m) + "\\n");
       if (m.status) ok({ ...meta, socket, pid: process.pid, build_version: "v0.8.0" });
       else if (m.ls) {
@@ -168,7 +168,7 @@ const server = createServer((client) => {
         if (snapshot ? (!input || m.new.dir || m.new.rev || m.new.rules) : (!m.new.rev || m.new.rules?.[0] !== "hidden *")) throw new Error("unsafe new");
         const dir = input?.source ?? m.new.dir, rev = input?.rev ?? m.new.rev;
         mkdirSync(join(state, "git"), { recursive: true });
-        git("clone", "--template=", "--no-checkout", "--", dir, path);
+        git("clone", "--template=", "--no-checkout", "--no-hardlinks", "--", dir, path);
         git("-C", path, "remote", "remove", "origin");
         git("-C", path, "checkout", "--detach", rev);
         if (behavior === "seed-byte-mismatch") {
@@ -199,10 +199,20 @@ const server = createServer((client) => {
         if (behavior !== "pending-snap") row.tree = "tree-" + id;
         else setTimeout(() => { row.tree = "tree-" + id; }, 1500);
         if (behavior.includes("-snap")) client.destroy(); else ok({ snapshot: row });
+      } else if (m.apply) {
+        const { checkout, branch } = m.apply, c = checkouts.find((c) => c.name === checkout);
+        if (!c || !/^pp-preserved-[0-9a-f-]+$/.test(branch) || Object.keys(m.apply).length !== 2) throw new Error("unsafe apply");
+        const commit = git("-C", c.path, "rev-parse", "HEAD");
+        if (behavior !== "missing-applied-ref") git("-C", c.source, "fetch", "--no-tags", "--quiet", c.path, "HEAD:refs/heads/" + branch);
+        ok({ source: c.source, applied: [], merged: [], conflicts: [], branch, commit });
       } else if (m.rm) {
         const i = checkouts.findIndex((c) => c.name === m.rm.checkout);
         if (i < 0 || !m.rm.keep_commits || !m.rm.sticky_snapshots) throw new Error("unsafe rm");
-        if (behavior === "refuse-rm") { send({ id: m.id, error: { code: "invalid", message: "cannot keep unique commits" } }); continue; }
+        const c = checkouts[i];
+        const tip = git("-C", c.path, "rev-parse", "HEAD"), origin = git("-C", c.source, "rev-parse", "HEAD");
+        if (behavior === "refuse-rm" || (tip !== origin && !git("-C", c.source, "for-each-ref", "--format=%(objectname)", "refs/heads").split("\\n").includes(tip))) {
+          send({ id: m.id, error: { code: "invalid", message: "cannot keep unique commits" } }); continue;
+        }
         const [row] = checkouts.splice(i, 1);
         if (behavior !== "partial-rm") rmSync(row.path, { recursive: true });
         rmSync(join(state, "git", row.name), { recursive: true });
@@ -516,9 +526,11 @@ test("an Agent can explicitly delete one resolved managed OVNFS checkout with ve
   git(w.path, "commit", "--allow-empty", "-qm", "private result");
   const tip = git(w.path, "rev-parse", "HEAD");
   write(join(f.show(f.next).thread_dir, "cleanup.json"), JSON.stringify({ commits: [tip] }));
+  const sourceRefs = git(f.repo, "show-ref"), captureHead = git(w.ovnfs.capture.path, "rev-parse", "HEAD");
   const resolved = f.pp("thread", "resolve", "demo", f.next);
   assert.ok(resolved.ok, resolved.out);
   assert.ok(existsSync(w.path));
+  assert.deepEqual(f.calls().filter((m) => m.apply || m.rm), []);
   const deleted = f.pp("thread", "delete-checkout", "demo", f.next);
   assert.ok(deleted.ok, deleted.out);
   assert.match(deleted.out, /OVNFS checkout removed/);
@@ -533,9 +545,45 @@ test("an Agent can explicitly delete one resolved managed OVNFS checkout with ve
   const restored = join(f.root, "restored.git");
   git(f.root, "clone", "--mirror", join(evidence, "commits.bundle"), restored);
   assert.equal(git(restored, "rev-parse", `refs/heads/saved/${tip}`), tip);
-  assert.deepEqual(f.calls().filter((m) => m.rm).map((m) => m.rm), [
+  const branch = `pp-preserved-${w.nonce}-${tip}`;
+  assert.equal(git(f.repo, "show-ref"), sourceRefs);
+  assert.equal(git(w.ovnfs.capture.path, "rev-parse", "HEAD"), captureHead);
+  assert.equal(git(w.ovnfs.capture.path, "status", "--porcelain"), "");
+  assert.equal(git(w.ovnfs.capture.path, "rev-parse", `refs/heads/${branch}`), tip);
+  assert.deepEqual(f.calls().filter((m) => m.apply || m.rm).map(({ apply, rm }) => apply ?? rm), [
+    { checkout: w.identity.name, branch },
     { checkout: w.identity.name, keep_commits: true, sticky_snapshots: true },
   ]);
+});
+
+test("OVNFS explicit deletion retains the checkout when native apply reports success without the preservation ref", { skip: process.platform !== "darwin" }, async (t) => {
+  const f = await managedOvnfsFixture(t, "missing-applied-ref", "off");
+  const started = f.start(); assert.ok(started.ok, started.out);
+  const { working_copy: w } = f.show(f.next);
+  const resolved = f.pp("thread", "resolve", "demo", f.next); assert.ok(resolved.ok, resolved.out);
+  const deleted = f.pp("thread", "delete-checkout", "demo", f.next);
+  assert.equal(deleted.ok, false, deleted.out);
+  assert.match(deleted.out, /retained: OVNFS native preservation branch was not confirmed/);
+  assert.ok(existsSync(w.path));
+  assert.equal(f.show(f.next).working_copy.disposal.phase, "retained");
+  assert.deepEqual(f.calls().filter((m) => m.apply || m.rm).map((m) => m.apply?.checkout ?? "rm"), [w.identity.name]);
+});
+
+test("OVNFS explicit deletion does not write through linked capture metadata", { skip: process.platform !== "darwin" }, async (t) => {
+  const f = await managedOvnfsFixture(t, "off", "off");
+  assert.ok(f.start().ok);
+  const { working_copy: w } = f.show(f.next);
+  const resolved = f.pp("thread", "resolve", "demo", f.next); assert.ok(resolved.ok, resolved.out);
+  const heads = join(w.ovnfs.capture.path, ".git", "refs", "heads"), outside = join(f.root, "external-refs");
+  renameSync(heads, outside);
+  const refs = readdirSync(outside);
+  symlinkSync(outside, heads, "dir");
+  const deleted = f.pp("thread", "delete-checkout", "demo", f.next);
+  assert.equal(deleted.ok, false, deleted.out);
+  assert.match(deleted.out, /retained: OVNFS capture Git metadata is not private/);
+  assert.ok(existsSync(w.path));
+  assert.deepEqual(readdirSync(outside), refs);
+  assert.deepEqual(f.calls().filter((m) => m.apply || m.rm), []);
 });
 
 for (const [mode, reason] of [["refuse-rm", /cannot keep unique commits/], ["partial-rm", /not confirmed by registry and filesystem/], ["lost-rm-reply", / closed| EOF|empty response/i]]) {

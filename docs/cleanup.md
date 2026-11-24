@@ -107,13 +107,13 @@ worktree 删除前要满足这些条件，任何一条不满足就保留并写�
 
 ## OVNFS checkout
 
-`--kind ovnfs` 使用本机 OVNFS v0.8.0 管理 checkout。Paseo 将其作为普通目录 workspace 打开，`pp thread restart` 复用原挂载。OVNFS 进程和挂载需要在启动、重启与清理期间可用。PP 启动 OVNFS daemon 时设置 `OVNFS_GIT_REMOTES=0`，已有 daemon 使用自己的配置。
+`--kind ovnfs` 使用本机 OVNFS v0.8.0 管理 checkout。Paseo 将其作为普通目录 workspace 打开，`pp thread restart` 复用原挂载。OVNFS 进程和挂载需要在启动、重启与清理期间可用。对于 PP 托管的 checkout，先用 `ovnfs serve --no-git-remotes` 启动对应的本机 daemon，并为 PP 指定同一命名空间的 `OVNFS_STATE` 和 `OVNFS_MOUNT`；托管命令不会自动启动 daemon。
 
 `resolve`、`thread cleanup`、ticker 和 `pp sweep` 可以跟进归档，但不会删除 OVNFS checkout。未接管的历史 OVNFS checkout、工作区及其声明丢弃项也会保留。
 
 接到清理指示的 Agent 可非交互运行 `pp thread delete-checkout <slug> <id> [--resource NAME]`，每次只处理一项。省略 `--resource` 选中主 checkout；实验用其名称。命令要求线程已完成、Agent 已归档、没有有效保留，且本机命名空间、挂载和登记身份一致。它检查 checkout 和私有 Git 目录的占用、依赖、未知内容和可恢复的私有提交，并在副本外验证并保存所需成果。`--keep-worktree` 也阻止这条命令。快照不能删除，依赖关系不明确时也保留。
 
-依赖包括引用该 checkout 的快照，以及 source 位于该 checkout 或其私有 Git 目录内的其他 checkout。命令仅向已运行、并声明支持保留快照和保留提交的非强制删除的后端发出请求；不支持时在记录删除意图前就保留并报错。后端仍可能拒绝仍含未共享提交的 checkout，此时 PP 不改用强制删除。固定版本的按名 `rm` 无法锁住检查后的外部写入或替换。请让目标保持静止。只有注册表、挂载内路径和私有 Git 路径均确认目标已不存在才记为已删除；未挂载或无法查询不是已删除。失败或不确定时查看命令输出和 `pp thread show <slug> <id> --json`，不会后台重试；再次显式运行可核对此前已删除的目标，但不会重发不确定的 `rm`。PP 不删除 base、快照或底层目录；OVNFS 可回收无引用的内部存储。
+依赖包括引用该 checkout 的快照，以及 source 位于该 checkout 或其私有 Git 目录内的其他 checkout。独立归档校验后，PP 用 OVNFS 原生 `apply --branch` 将当前提交保存在经核对的 PP 私有输入仓库，再确认分支指向确切提交并请求保留快照和提交的普通 `rm`。这不会切换分支、改原仓库、推送或合并。原生 `apply` 只保留当前 HEAD 及其历史；其他分支上仍未共享的提交可能使 OVNFS 拒绝删除。PP 不改用强制删除。固定版本的按名 `rm` 无法锁住检查后的外部写入或替换。请让目标保持静止。只有注册表、挂载内路径和私有 Git 路径均确认目标已不存在才记为已删除；未挂载或无法查询不是已删除。失败或不确定时查看命令输出和 `pp thread show <slug> <id> --json`，不会后台重试；再次显式运行可核对此前已删除的目标，但不会重发不确定的 `rm`。PP 不删除 base、快照或底层目录；OVNFS 可回收无引用的内部存储。
 
 OVNFS 线程仍支持 `--reviews` 和报告中的 `Reviewed-PR:`。被审 PR 合并可以触发 resolve，但不会触发 checkout 删除；线程有尚未合并的自有 PR 时，也不会因此 resolve。
 

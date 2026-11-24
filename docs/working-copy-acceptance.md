@@ -39,4 +39,10 @@ Schema 2 的验收、匹配测量和全量回归引用同一组 `provenance`。�
 | 声明热复用＋失效 | 597–637 / 2238–2298 | 1094–1142 / 3761–3805 | 4,546,560 / 6,086,656 |
 | 脏现场派生两份 | 1108–1174 / 1653–1710 | 无成功构建；1887–1985 时首份报错 | 3,117,056 / 3,190,784（失败后） |
 
-冷场景 OVNFS daemon 就绪用时 128–129 ms，派工内首次观察到 capture 路径用时 348–368 ms。真实普通 teardown 在各 OVNFS 试验用时 106–131 ms；清除了全部本次独立实测 fixture。这不是 PP checkout 回收成功。历史 Node v26.13.1 定向回归 15/15，全量串行回归 120/120。新门槛拒绝 schema 1 历史数据并返回 1（`reliability: invalid`、`measured_benefit: invalid`、`thresholds: missing`）。三个真实后端阻塞未修复，默认仍为 Git worktree。
+冷场景 OVNFS daemon 就绪用时 128–129 ms，派工内首次观察到 capture 路径用时 348–368 ms。真实普通 teardown 在各 OVNFS 试验用时 106–131 ms；清除了全部本次独立实测 fixture。这不是 PP checkout 回收成功。历史 Node v26.13.1 定向回归 15/15，全量串行回归 120/120。新门槛拒绝 schema 1 历史数据并返回 1（`reliability: invalid`、`measured_benefit: invalid`、`thresholds: missing`）。默认仍为 Git worktree。
+
+## AC29 原生删除复测（2026-11-24）
+
+在隔离的 PP、Paseo v0.16.2 和 OVNFS v0.8.0 上，用合成 Git 仓库重新验证。Coordinator 派发 OVNFS Worker，Worker 修复测试并创建本地提交；普通 `resolve` 归档 Agent、报告及产物，保留 checkout。随后 `pp thread delete-checkout` 用原生 `apply --branch` 将该提交保存在 PP 的私有输入仓库，再用普通 `rm` 删除。确认注册表和两个目录均无该副本、原仓库未变，独立 Git bundle 恢复后两项断言通过。未启用强制删除、推送或远程合并。
+
+这是对历史独有提交阻塞的定向复测，不替代整套可靠性验收和 v2 性能测量。未复测 AC27 的脏派生及重挂问题；不切换默认后端。

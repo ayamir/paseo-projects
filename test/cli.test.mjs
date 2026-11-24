@@ -80,7 +80,7 @@ test("promotion checks reliability and every matched comparison independently wi
   const git = spawnSync("git", ["rev-parse", "HEAD"], { cwd, env, encoding: "utf8" });
   assert.equal(git.status, 0, git.stderr);
   const provenance = { revision: git.stdout.trim(), baseline: "1".repeat(40), candidate: `ovnfs/v0.8.0/${"a".repeat(64)}`, workload: "c".repeat(64) };
-  const inventory = { "test/cleanup.test.mjs": 101, "test/cli.test.mjs": 11, "test/logic.test.mjs": 19, "test/ovnfs-tooling.test.mjs": 4 };
+  const inventory = { "test/cleanup.test.mjs": 103, "test/cli.test.mjs": 11, "test/logic.test.mjs": 19, "test/ovnfs-tooling.test.mjs": 4 };
   const files = Object.fromEntries(Object.entries(suiteManifest()).map(([name, sha256]) => [name, { sha256, pass: inventory[name] }]));
   const count = Object.values(inventory).reduce((sum, n) => sum + n, 0);
   const cases = Object.fromEntries(["mount", "capture-and-cache", "experiment-and-derived", "restart", "retention", "explicit-delete", "teardown"].map((key) => [key, { status: "passed" }]));

@@ -1,7 +1,7 @@
 // Keep the source supplied to OVNFS separate from the user's working tree and Git metadata.
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { constants, closeSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, statfsSync, writeFileSync } from "node:fs";
+import { constants, closeSync, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, statfsSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { requireCleanCheckout } from "./working-copy.mjs";
 
@@ -232,11 +232,16 @@ export function importSeed(w) {
   fetchOid(w.source, w.seed.path, w.seed.oid);
 }
 
-export function verifyCapture(capture) {
+const noncePattern = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+const oidPattern = "(?:[0-9a-f]{40}|[0-9a-f]{64})";
+const preservedRef = new RegExp(`^(${oidPattern}) refs/heads/pp-preserved-${noncePattern}-\\1 $`);
+
+export function verifyCapture(capture, { preserved = false } = {}) {
   const { path, oid, directory } = capture;
   const gitDir = join(path, ".git"), config = join(gitDir, "config");
   const invalid = () => new Error("working-copy capture could not be verified as clean and independent");
   if (!directory || privateDir(path) !== directory || !lstatSync(gitDir).isDirectory() || !readRegular(gitDir, "config")) throw invalid();
+  if (preserved) verifyCaptureMetadata(gitDir);
   for (const file of ["objects/info/alternates", "objects/info/http-alternates", "commondir"]) {
     try { lstatSync(join(gitDir, file)); } catch (e) { if (e.code === "ENOENT") continue; throw invalid(); }
     throw invalid();
@@ -245,8 +250,49 @@ export function verifyCapture(capture) {
   if (keys.some((row) => !/^(?:core\.(?:repositoryformatversion|filemode|bare|logallrefupdates|ignorecase|precomposeunicode)|extensions\.objectformat)\n/.test(row))) throw invalid();
   if (git(path, "rev-parse", "--absolute-git-dir").trim() !== gitDir ||
       git(path, "rev-parse", "--verify", "HEAD").trim() !== oid ||
-      git(path, "for-each-ref", "--format=%(objectname) %(refname)").trim().split("\n").some((ref) => ref && ref !== `${oid} refs/heads/pp-seed`) ||
+      readRegular(gitDir, "HEAD")?.bytes.toString().trim() !== oid ||
+      git(path, "for-each-ref", "--format=%(objectname) %(refname) %(symref)").split("\n").some((ref) =>
+        ref && ref !== `${oid} refs/heads/pp-seed ` && !(preserved && preservedRef.test(ref))) ||
       git(path, "diff", "--no-ext-diff", "--quiet", "HEAD", "--") || git(path, "ls-files", "--others", "-z")) throw invalid();
+}
+
+function verifyCaptureMetadata(gitDir) {
+  const uid = process.getuid(), device = lstatSync(gitDir).dev;
+  const visit = (path) => {
+    const s = lstatSync(path);
+    if (s.uid !== uid || s.dev !== device || (!s.isDirectory() && (!s.isFile() || s.nlink !== 1))) {
+      throw new Error("OVNFS capture Git metadata is not private");
+    }
+    if (s.isDirectory()) for (const name of readdirSync(path)) visit(join(path, name));
+  };
+  visit(gitDir);
+}
+
+// apply --branch writes to the checkout's registered source. Only allow that
+// write to a PP capture, never to the project's original repository.
+export function preservationTarget(project, w, head) {
+  const root = inputRoot(project), capture = w.ovnfs.capture;
+  const owner = dirname(capture?.path ?? "");
+  const nonce = relative(root, owner);
+  const validNonce = new RegExp(`^${noncePattern}$`);
+  if (!validNonce.test(nonce) || !validNonce.test(w.nonce) || (!w.ovnfs.from && nonce !== w.nonce) ||
+      capture?.path !== join(root, nonce, "repo") || !new RegExp(`^${oidPattern}$`).test(head) ||
+      relative(w.source, root).split("/")[0] !== ".." || relative(root, w.source).split("/")[0] !== "..") {
+    throw new Error("OVNFS checkout has no verified private PP capture for native preservation");
+  }
+  privateDir(root);
+  privateDir(owner);
+  const prepared = JSON.parse(readRegular(owner, "prepared.json").bytes.toString("utf8"));
+  if (prepared.nonce !== nonce || prepared.source !== w.source || prepared.directory !== capture.directory || prepared.oid !== capture.oid) {
+    throw new Error("OVNFS capture preparation identity does not match its registration");
+  }
+  verifyCapture(capture, { preserved: true });
+  const branch = `pp-preserved-${w.nonce}-${head}`;
+  const ref = `refs/heads/${branch}`;
+  const actual = git(capture.path, "for-each-ref", "--format=%(objectname) %(refname)", ref).split("\n")
+    .find((row) => row.endsWith(` ${ref}`));
+  if (actual && actual !== `${head} ${ref}`) throw new Error("OVNFS preservation branch identity changed");
+  return { path: capture.path, branch, exists: Boolean(actual) };
 }
 
 const digest = (bytes) => createHash("sha256").update(bytes).digest("hex");

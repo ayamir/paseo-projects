@@ -443,6 +443,9 @@ export function deleteOvnfsCheckout(project, t, h, w, save) {
       const manifest = inspectNow();
       proof = evidence(project, w, manifest, proof);
       verifyEvidence(proof, proof.path, inspectNow(), { durable: true });
+      ovnfs.preserveCheckout(project, h, w, manifest.head);
+      verifyEvidence(proof, proof.path, inspectNow());
+      ovnfs.removalPreserved(project, w, manifest.head);
       record("removing");
       phase = "unknown";
       ovnfs.removeCheckout(h, w);
