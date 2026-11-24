@@ -115,22 +115,16 @@ function worktreeReasons(h, t, top, { threadDir, discards }) {
   return [...reasons, ...fileReasons(sh_, top, threadDir, discards)];
 }
 
-function fileReasons(sh_, top, threadDir, discards, strict = false) {
+function fileReasons(sh_, top, threadDir, discards) {
   const reasons = [];
   if (sh_('[ -d "$(git rev-parse --git-dir)/modules" ]').ok) reasons.push("its git folder holds submodule repositories");
   const index = sh_("git ls-files -s");
-  if (strict && !index.ok) return ["could not read its Git index"];
-  if (strict) {
-    const flags = sh_("git ls-files -v -z");
-    if (!flags.ok || flags.stdout.split("\0").some((x) => /^[Sa-z] /.test(x))) return ["its Git index could hide modified files (skip-worktree or assume-unchanged)"];
-  }
   for (const line of index.stdout.split("\n")) {
     const m = /^160000 \S+ \d\t(.+)$/.exec(line);
     if (m && sh_(`[ -e ${q(`${m[1]}/.git`)} ]`).ok) reasons.push(`submodule ${m[1]} is checked out (its source and objects would go with it)`);
   }
   const gone = (rel) => discards.some((d) => inside(join(top, rel.replace(/\/$/, "")), d));
   const status = sh_("git -c core.fsmonitor=false -c core.untrackedCache=false status --porcelain=v1 -z --ignored --untracked-files=normal --ignore-submodules=none");
-  if (strict && !status.ok) return [...reasons, "could not check for modified, untracked or ignored files"];
   const entries = status.stdout.split("\0");
   for (let i = 0; i < entries.length; i++) {
     const e = entries[i];
@@ -140,7 +134,7 @@ function fileReasons(sh_, top, threadDir, discards, strict = false) {
     if (code === "??") { if (!gone(rel)) reasons.push(`untracked: ${rel}`); continue; }
     if (code !== "!!") { reasons.push(`uncommitted change: ${rel}`); continue; }
     if (gone(rel)) continue;
-    if (rel === ".paseo-project/" && threadDir) { reasons.push(...threadDirReasons(sh_, threadDir, discards, top, strict)); continue; }
+    if (rel === ".paseo-project/" && threadDir) { reasons.push(...threadDirReasons(sh_, threadDir, discards, top)); continue; }
     if (/(^|\/)node_modules\/$/.test(rel) && reinstallable(sh_, rel)) continue;
     reasons.push(`ignored, not known to be disposable: ${rel}`);
   }
@@ -156,10 +150,9 @@ function reinstallable(sh_, rel) {
 }
 
 /** `.paseo-project/` holds only this thread's folder, and that only what the final copy took home. */
-function threadDirReasons(sh_, threadDir, discards, top, strict) {
+function threadDirReasons(sh_, threadDir, discards, top) {
   const parent = sh_("ls -A .paseo-project");
   const own = sh_(`ls -A ${q(`.paseo-project/${basename(threadDir)}`)}`);
-  if (strict && (!parent.ok || !own.ok)) return ["could not inspect the archived thread folder"];
   const names = parent.stdout.split("\n").filter(Boolean);
   const reasons = names.filter((n) => n !== basename(threadDir)).map((n) => `another thread folder: .paseo-project/${n}`);
   const mine = own.stdout.split("\n").filter(Boolean);
@@ -213,26 +206,6 @@ async function waitForIdle(h, top, dryRun) {
     if (!pids?.length || dryRun || i === OCCUPIED_TRIES) return occupancyReason(pids);
     await new Promise((r) => setTimeout(r, 1000));
   }
-}
-
-async function removeOvnfs(h, t, { threadDir, discards, mergedHead, dryRun }) {
-  const item = { kind: "ovnfs", target: t.cwd };
-  const top = ovnfs.mounted(t);
-  if (!top) return { ...item, status: "gone" };
-  item.real = top;
-  const kib = du(h, top);
-  if (!ovnfs.mounted(t)) return { ...item, status: "gone" };
-  const reasons = fileReasons((s) => h.shell(s, top), top, threadDir, discards, true);
-  if (!reasons.length) {
-    const reason = ovnfs.commitReason(t, mergedHead);
-    if (reason) reasons.push(reason);
-  }
-  if (reasons.length) return { ...item, status: "kept", reason: listed(reasons) };
-  const occupied = occupancyReason(occupants(h, top));
-  if (occupied) return { ...item, status: "kept", reason: occupied };
-  if (dryRun) return { ...item, status: "would-remove", kib };
-  await ovnfs.remove(t);
-  return { ...item, status: "removed", kib };
 }
 
 const listed = (rs) => rs.length > MAX_REASONS ? `${rs.slice(0, MAX_REASONS).join("; ")}; and ${rs.length - MAX_REASONS} more` : rs.join("; ");
@@ -325,12 +298,11 @@ function cleanIndexes(snap, roots, retry, dryRun) {
  * Checks everything first, lists the indexes, then deletes: declared discards, the worktree, the indexes
  * rooted in what went. An explicit keep differs from a blocker that leaves disposal pending.
  */
-export async function run(project, t, h, { keepWorktree = false, copyComplete = true, archive = { outcome: "complete" }, refreshArchive, agentArchived = true, mergedHead, dryRun = false, paseoAutoArchive = { on: false }, legacyGit } = {}) {
+export async function run(project, t, h, { keepWorktree = false, copyComplete = true, archive = { outcome: "complete" }, refreshArchive, agentArchived = true, dryRun = false, paseoAutoArchive = { on: false }, legacyGit } = {}) {
   const ovn = t.kind === "ovnfs";
-  const isolated = t.kind === "worktree" || ovn;
-  const kind = ovn ? "ovnfs" : "worktree";
-  const checkout = { kind, target: t.cwd };
-  let occupied = "", reflog = "";
+  const isolated = t.kind === "worktree";
+  const checkout = { kind: ovn ? "ovnfs" : "worktree", target: t.cwd };
+  let reflog = "";
   const archiveNotes = [];
   if (legacyGit) {
     try {
@@ -352,7 +324,7 @@ export async function run(project, t, h, { keepWorktree = false, copyComplete = 
     }
     if (top && !dryRun && agentArchived && archive.outcome === "complete" && refreshArchive) {
       // The agent can leave a process writing to the library while its checkout is still in use.
-      occupied = await waitForIdle(h, top, false);
+      const occupied = await waitForIdle(h, top, false);
       if (occupied) archive = { outcome: "unknown", unknown: ["library"] };
       else {
         archive = refreshArchive();
@@ -361,6 +333,12 @@ export async function run(project, t, h, { keepWorktree = false, copyComplete = 
     }
   }
   const decl = declaration(project, t, h);
+  if (ovn) {
+    const reason = "legacy OVNFS checkout and declared discards retained; not eligible for managed checkout deletion";
+    const items = [{ ...checkout, status: "kept", reason }, ...decl.discard.map(({ path }) => ({ kind: "discard", target: path, status: "kept", reason }))];
+    if (!dryRun) record(project, t, items, decl, archive);
+    return { notes: [...archiveNotes, note(items[0])], worktreeGone: false, items };
+  }
   const before = readJson(recordPath(project, t.id))?.items ?? [];
   const removedBefore = new Set(before.filter((i) => i.kind === "discard" && i.status === "removed").map((i) => i.target));
   const retry = before.filter((i) => i.kind === "index" && i.status === "failed" && i.root);
@@ -368,16 +346,13 @@ export async function run(project, t, h, { keepWorktree = false, copyComplete = 
   const keepReason = reflog || (keepWorktree ? "kept as asked (--keep-worktree)"
     : decl.error ? `${decl.error}; its keep list is unknown`
     : decl.keep.length ? `declared kept: ${decl.keep.map((k) => k.why || k.path).join("; ")}`
-    : ovn && !agentArchived ? "Paseo did not confirm that its agent was archived"
-    : occupied ? occupied
-    : ovn && (!copyComplete || archive.outcome !== "complete") ? "the final copy was not confirmed complete"
     : !copyComplete ? "the final copy was partial (`thread resolve --force` removes it)" : "");
   // A keep is about the folder. An already removed checkout is recorded as gone.
   const checkoutKept = isolated && Boolean(keepReason) && Boolean(t.cwd) && h.isDir(t.cwd);
   const lib = t.thread_dir ? join(canon(t.thread_dir), "library") : "";
   const items = decl.discard.map((e) => {
     const d = checkDiscard(t, e, { keeps: keepsOf(t, decl), removedBefore });
-    if (!d.status && checkoutKept && (ovn || (own && inside(d.target, own)))) Object.assign(d, { status: "kept", reason: ovn ? "its OVNFS checkout is kept" : "its worktree is kept" });
+    if (!d.status && checkoutKept && own && inside(d.target, own)) Object.assign(d, { status: "kept", reason: "its worktree is kept" });
     if (!d.status && d.product) {
       const home = project.path("library", t.id, d.product.rel);
       let same = false;
@@ -404,12 +379,11 @@ export async function run(project, t, h, { keepWorktree = false, copyComplete = 
     if (checkoutKept) items.push({ ...checkout, status: reflog ? "blocked" : "kept", reason: keepReason });
     else if (strandedInLibrary.length) items.push({ ...checkout, status: "kept", reason: `not copied home: ${strandedInLibrary.map((d) => d.target).join(", ")}` });
     else {
-      const remove = ovn ? removeOvnfs : removeWorktree;
-      try { items.push(await remove(h, t, { threadDir: t.thread_dir, discards, mergedHead, dryRun, legacyGit })); }
+      try { items.push(await removeWorktree(h, t, { threadDir: t.thread_dir, discards, dryRun, legacyGit })); }
       catch (e) { items.push({ ...checkout, status: "failed", reason: e.message }); }
     }
   }
-  const wt = items.find((i) => i.kind === kind);
+  const wt = items.find((i) => i.kind === "worktree");
   if (["kept", "blocked"].includes(wt?.status) && paseoAutoArchive.on) wt.reason += "; but Paseo's daemon.autoArchiveAfterMerge is on: once its pull request merges Paseo removes it with --force, without these checks (turned off, pp alone removes worktrees)";
   if (["kept", "blocked"].includes(wt?.status) && paseoAutoArchive.on === null) wt.reason += `; whether Paseo's daemon.autoArchiveAfterMerge removes it once its pull request merges is unknown (${paseoAutoArchive.why})`;
   // Only what this run removed: a path that was already gone proves nothing about what an index pointed at.

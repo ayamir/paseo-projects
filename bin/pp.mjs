@@ -255,6 +255,10 @@ async function threadCommand([sub, slug, id], f, root, proj) {
       console.log(`${id}${f["dry-run"] ? " cleanup preview" : " cleanup checked"}: ${notes.join("; ") || "nothing to clean"}`);
       return;
     }
+    case "delete-checkout": {
+      console.log(await threads.deleteCheckout(p, tid(), f.resource));
+      return;
+    }
     case "hold": {
       threads.hold(p, tid(), { resource: f.resource, reason: f.reason, until: f.until, untilResolved: f["until-resolved"], indefinite: f.indefinite });
       console.log(`${id}: hold recorded`);

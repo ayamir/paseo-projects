@@ -47,7 +47,13 @@ try {
   // Status does not expose GitRemotes. Refuse inferred defaults or client-only configuration.
   const args = execFileSync("ps", ["-ww", "-p", String(status.pid), "-o", "command="], { encoding: "utf8", timeout: 2000 }).trim().split(/\s+/);
   if (!/^(?:.*\/)?ovnfs$/.test(args[0]) || !args.includes("serve") || args.filter((a) => /^--(?:no-)?git-remotes(?:=|$)/.test(a)).join(" ") !== "--no-git-remotes") throw new Error("start the configured OVNFS daemon explicitly with serve --no-git-remotes");
-  console.log(JSON.stringify(op === "status" ? status : await exchange({ id: 2, [op]: JSON.parse(raw) })));
+  if (op === "rm" && !["rm.sticky_snapshots", "rm.keep_commits"].every((feature) => Array.isArray(welcome.features) && welcome.features.includes(feature))) {
+    throw new Error("daemon does not support non-force, snapshot-preserving OVNFS removal");
+  }
+  // Status carries the welcome features so deletion can check rm guarantees before recording intent.
+  const result = op === "status" ? { ...status, features: welcome.features ?? [] } : await exchange({ id: 2, [op]: JSON.parse(raw) });
+  if (op === "rm" && Object.keys(result).length !== 0) throw new Error("unexpected OVNFS removal reply");
+  console.log(JSON.stringify(result));
 } catch (e) {
   console.error(e.message);
   process.exitCode = 1;

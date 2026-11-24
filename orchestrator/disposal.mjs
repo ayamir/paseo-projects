@@ -5,6 +5,7 @@ import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { sh, sha256 } from "./lib.mjs";
 import * as gitCopy from "./working-copy.mjs";
+import * as ovnfs from "./managed-ovnfs.mjs";
 import { checkDiscard } from "./cleanup.mjs";
 
 const oid = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
@@ -14,14 +15,15 @@ function stat(path) {
   try { return lstatSync(path); }
   catch (e) { if (e.code === "ENOENT") return null; throw e; }
 }
-function git(cwd, args, what) {
-  const r = sh(["git", "--no-replace-objects", ...args], cwd, undefined, { timeout: 120_000 });
+function git(cwd, args, what, env) {
+  const r = sh(["git", "--no-replace-objects", ...args], cwd, undefined, { timeout: 120_000, env });
   if (!r.ok || r.stderr) fail(`${what}: ${r.out}`);
   return r.stdout;
 }
 function checkDependencies(project, t, w) {
   const directories = (p) => readdirSync(p, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => join(p, e.name));
-  const overlaps = (p) => typeof p === "string" && isAbsolute(p) && (inside(resolve(p), w.path) || Boolean(stat(p) && inside(realpathSync(p), w.path)));
+  const targets = w.backend === "ovnfs" ? [w.path, w.identity.git_dir] : [w.path];
+  const overlaps = (p) => typeof p === "string" && isAbsolute(p) && targets.some((path) => inside(resolve(p), path) || Boolean(stat(p) && inside(realpathSync(p), path)));
   try {
     const trash = project.path("..", ".trash");
     const projects = [...directories(project.root), ...(stat(trash) ? directories(trash) : [])];
@@ -68,7 +70,7 @@ function backendGone(w, manifest) {
   return !listing.split("\0").includes(`worktree ${w.path}`);
 }
 
-function checkOccupancy(path) {
+function checkOccupancy(...paths) {
   const r = spawnSync("lsof", ["-nP", "-F0pn"], { encoding: "utf8", timeout: 60_000, maxBuffer: 32 * 1024 * 1024 });
   if (r.status !== 0 || r.error || r.stderr || !r.stdout?.endsWith("\0\n")) fail("occupancy probe failed");
   let pid = "", files = 0;
@@ -77,7 +79,7 @@ function checkOccupancy(path) {
     if (/^p[1-9]\d*$/.test(field) && name === undefined) pid = field.slice(1);
     else if (pid && /^f.+/.test(field) && name?.startsWith("n") && extra === undefined) {
       files++;
-      if (inside(name.slice(1).replace(/ \(deleted\)$/, ""), path) && Number(pid) !== process.pid) fail(`occupied by process ${pid}`);
+      if (paths.some((path) => inside(name.slice(1).replace(/ \(deleted\)$/, ""), path)) && Number(pid) !== process.pid) fail(`occupied by process ${pid}`);
     } else fail("occupancy probe returned malformed output");
   }
   if (!files) fail("occupancy probe returned no file records");
@@ -100,27 +102,70 @@ function declaration(project, t, w) {
   return { td, decl, d, keep: Boolean(d.keep?.length) };
 }
 
+const ovnfsGitEnv = {
+  ...Object.fromEntries(Object.keys(process.env).filter((key) => key.startsWith("GIT_")).map((key) => [key, undefined])),
+  GIT_OPTIONAL_LOCKS: "0", GIT_NO_LAZY_FETCH: "1", GIT_ALLOW_PROTOCOL: "file",
+  GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null",
+};
+function checkPrivateGit(w) {
+  const { git_dir: root, initial_oid: initial, base } = w.identity;
+  if (!oid.test(initial) || !/^[a-zA-Z0-9_-]+$/.test(base)) fail("invalid OVNFS commit or base identity");
+  const objects = join(w.ovnfs.namespace.state, "bases", base, "objects");
+  if (!stat(join(root, "objects"))?.isSymbolicLink() || realpathSync(join(root, "objects")) !== objects || !stat(objects)?.isDirectory()) {
+    fail("unconfirmed OVNFS private Git object store");
+  }
+  const regular = new Set(["HEAD", "ORIG_HEAD", "FETCH_HEAD", "COMMIT_EDITMSG", "config", "index", "packed-refs", "pp-working-copy", "info/exclude"]);
+  const ref = new RegExp(`^(?:[a-f0-9]{${initial.length}}|ref: refs/[^\\r\\n]+)\\n?$`);
+  const log = new RegExp(`^[a-f0-9]{${initial.length}} [a-f0-9]{${initial.length}} .+ -?\\d+ [+-]\\d{4}(?:\\t.*)?$`);
+  const dev = lstatSync(root).dev;
+  function walk(dir) {
+    for (const raw of readdirSync(dir, { encoding: "buffer" })) {
+      const name = raw.toString(), full = join(dir, name), rel = relative(root, full);
+      if (!raw.equals(Buffer.from(name))) fail("cannot inspect non-UTF-8 name in OVNFS private Git directory");
+      if (rel === "objects") continue;
+      const st = lstatSync(full);
+      if (st.dev === dev) {
+        if (st.isDirectory() && /^(?:refs(?:\/(?!replace(?:\/|$)).+)?|logs(?:\/refs(?:\/.+)?)?|info)$/.test(rel)) { walk(full); continue; }
+        if (st.isFile() && (regular.has(rel) || (rel.startsWith("refs/") && ref.test(readFileSync(full, "utf8"))) ||
+            ((rel === "logs/HEAD" || rel.startsWith("logs/refs/")) && readFileSync(full, "utf8").trimEnd().split("\n").every((line) => log.test(line))))) continue;
+      }
+      fail(`unclassified OVNFS private Git entry: ${rel}`);
+    }
+  }
+  walk(root);
+  const keys = git(root, ["config", "--file", join(root, "config"), "--no-includes", "--name-only", "--null", "--list"], "cannot inspect OVNFS private Git config", ovnfsGitEnv).split("\0").filter(Boolean);
+  if (keys.some((key) => !/^(?:core\.(?:repositoryformatversion|filemode|bare|logallrefupdates|ignorecase|precomposeunicode|checkstat|trustctime|untrackedcache|fsmonitor)|extensions\.objectformat|ovnfs\.checkout)$/.test(key))) {
+    fail("unsupported OVNFS private Git configuration");
+  }
+}
+
 function inspect(t, w, { td, decl, d }) {
-  const path = w.path;
-  const head = git(path, ["rev-parse", "--verify", "HEAD^{commit}"], "cannot inspect HEAD").trim();
-  if (!oid.test(head) || !oid.test(w.baseline)) fail("cannot verify commit identity");
+  const path = w.path, ovn = w.backend === "ovnfs";
+  if (ovn) checkPrivateGit(w);
+  const run = (args, what) => git(path, args, what, ovn ? ovnfsGitEnv : undefined);
+  const lines = (s) => s.trim().split("\n").filter(Boolean);
+  const head = run(["rev-parse", "--verify", "HEAD^{commit}"], "cannot inspect HEAD").trim();
+  const baseline = ovn ? w.identity.initial_oid : w.baseline;
+  if (!oid.test(head) || !oid.test(baseline)) fail("cannot verify commit identity");
   const commits = d.commits ?? [];
   if (!Array.isArray(commits) || commits.some((c) => typeof c !== "string" || !oid.test(c))) fail("cleanup.json commits must be full commit IDs");
   if (stat(join(w.identity.git_dir, "modules"))) fail("worktree Git metadata contains submodule repositories");
   const branch = `refs/heads/${w.branch}`;
-  const tips = ["HEAD", branch].flatMap((ref) => git(path, ["reflog", "show", "--format=%H", ref], `cannot inspect ${ref} reflog`).trim().split("\n").filter(Boolean));
-  const refs = git(path, ["for-each-ref", "--format=%(objectname)", "refs/bisect", "refs/worktree", "refs/rewritten", branch], "cannot inspect worktree refs").trim().split("\n").filter(Boolean);
+  const tips = ovn ? lines(run(["rev-list", "--all", "--reflog", "--no-walk=unsorted"], "cannot inspect OVNFS private refs and reflogs"))
+    : ["HEAD", branch].flatMap((ref) => lines(run(["reflog", "show", "--format=%H", ref], `cannot inspect ${ref} reflog`)));
+  const refs = ovn ? lines(run(["fsck", "--unreachable", "--no-progress"], "cannot inspect OVNFS unreachable objects")).filter((r) => r.startsWith("unreachable commit ")).map((r) => r.slice(19))
+    : lines(run(["for-each-ref", "--format=%(objectname)", "refs/bisect", "refs/worktree", "refs/rewritten", branch], "cannot inspect worktree refs"));
   const candidates = [...new Set([head, ...tips, ...refs])];
   if (candidates.some((c) => !oid.test(c))) fail("cannot inspect worktree-local commits");
-  const privateCommits = git(path, ["rev-list", ...candidates, `^${w.baseline}`, "--not", ...commits], "cannot inspect private commits").trim();
+  const privateCommits = run(["rev-list", ...candidates, `^${baseline}`, "--not", ...commits], "cannot inspect private commits").trim();
   if (privateCommits) fail(`commit ${privateCommits.split("\n")[0]} not declared for preservation in cleanup.json commits`);
-  const index = git(path, ["ls-files", "-z", "-v", "--stage"], "cannot inspect Git index");
+  const index = run(["ls-files", "-z", "-v", "--stage"], "cannot inspect Git index");
   const tracked = new Map(index.split("\0").filter(Boolean).map((entry) => {
     const match = /^H (100644|100755|120000) ([a-f0-9]+) 0\t([\s\S]+)$/.exec(entry);
     if (!match || match[2].length !== head.length) fail("Git index has hidden, conflicted or unsupported entries");
     return [match[3], { mode: match[1], hash: match[2] }];
   }));
-  if (git(path, ["-c", "core.fsmonitor=false", "status", "--porcelain=v1", "-z", "--untracked-files=no", "--ignore-submodules=none"], "cannot inspect modified files")) fail("unclassified Git modifications");
+  if (run(["-c", "core.fsmonitor=false", "status", "--porcelain=v1", "-z", "--untracked-files=no", "--ignore-submodules=none"], "cannot inspect modified files")) fail("unclassified Git modifications");
   const scope = (p) => p !== path && inside(p, path) && !relative(path, p).split("/").includes(".git")
     && (!relative(path, p).split("/").includes(".paseo-project") || (td && inside(p, td) && p !== td));
   function declared(key) {
@@ -181,7 +226,7 @@ function inspect(t, w, { td, decl, d }) {
   }
   walk(path);
   if (tracked.size) fail(`unclassified Git modifications: missing ${tracked.keys().next().value}`);
-  return { nonce: w.nonce, repository: sourceIdentity(w), head, commits, files, ignored };
+  return { nonce: w.nonce, repository: ovn ? w.identity.registration : sourceIdentity(w), head, commits, files, ignored };
 }
 
 const exclusions = (manifest) => manifest.ignored.map((p) => `/${p.replace(/[\\*?[\] ]/g, "\\$&")}\n`).join("");
@@ -233,16 +278,17 @@ function evidence(project, w, manifest) {
   try {
     const bundle = join(stage, "commits.bundle");
     const source = join(stage, "source.git");
-    git(stage, ["init", "--quiet", "--bare", "--initial-branch=main", `--object-format=${manifest.head.length === 64 ? "sha256" : "sha1"}`, source], "could not prepare bundle");
-    git(source, ["fetch", "--quiet", "--no-tags", "--", w.path, "HEAD:refs/heads/main", ...manifest.commits.map((c) => `${c}:refs/heads/saved/${c}`)], "could not save commits");
-    git(source, ["bundle", "create", bundle, "HEAD", "--all"], "could not create commit bundle");
+    const run = (cwd, args, what) => git(cwd, args, what, w.backend === "ovnfs" ? ovnfsGitEnv : undefined);
+    run(stage, ["init", "--quiet", "--bare", "--initial-branch=main", `--object-format=${manifest.head.length === 64 ? "sha256" : "sha1"}`, source], "could not prepare bundle");
+    run(source, ["fetch", "--quiet", "--no-tags", "--", w.path, "HEAD:refs/heads/main", ...manifest.commits.map((c) => `${c}:refs/heads/saved/${c}`)], "could not save commits");
+    run(source, ["bundle", "create", bundle, "HEAD", "--all"], "could not create commit bundle");
     rmSync(source, { recursive: true });
     const restored = join(stage, "verify.git");
-    git(stage, ["clone", "--quiet", "--mirror", "--", bundle, restored], "could not independently restore commits");
-    if (git(restored, ["rev-parse", "HEAD^{commit}"], "could not verify restored HEAD").trim() !== manifest.head) fail("restored commit does not match worktree HEAD");
-    for (const c of manifest.commits) if (git(restored, ["rev-parse", `refs/heads/saved/${c}^{commit}`], "could not verify restored commit").trim() !== c) fail(`could not verify restored commit ${c}`);
-    if (git(restored, ["rev-parse", "--is-shallow-repository"], "cannot verify restored history").trim() !== "false") fail("restored commits depend on shallow history");
-    git(restored, ["fsck", "--full"], "restored commits are incomplete");
+    run(stage, ["clone", "--quiet", "--mirror", "--", bundle, restored], "could not independently restore commits");
+    if (run(restored, ["rev-parse", "HEAD^{commit}"], "could not verify restored HEAD").trim() !== manifest.head) fail("restored commit does not match worktree HEAD");
+    for (const c of manifest.commits) if (run(restored, ["rev-parse", `refs/heads/saved/${c}^{commit}`], "could not verify restored commit").trim() !== c) fail(`could not verify restored commit ${c}`);
+    if (run(restored, ["rev-parse", "--is-shallow-repository"], "cannot verify restored history").trim() !== "false") fail("restored commits depend on shallow history");
+    run(restored, ["fsck", "--full"], "restored commits are incomplete");
     rmSync(restored, { recursive: true });
     for (const rel of Object.keys(manifest.files)) {
       const dst = join(stage, "files", rel);
@@ -262,17 +308,51 @@ function evidence(project, w, manifest) {
   } finally { rmSync(stage, { recursive: true, force: true }); }
 }
 
-// shortcut: OVNFS v0.8.0 `rm`/`drop` take a bare name or id with no identity, dependent or writer fence, so pp
-// retains managed OVNFS resources instead of guessing; upgrade when upstream ships a conditional removal.
-export const OVNFS_RETAINED = "OVNFS v0.8.0 has no identity- or dependency-fenced rm/drop, so pp cannot prove removal safe and keeps this resource";
-
 function retainOvnfs(w, { keepWorktree, holdBlocker, dryRun, save }) {
+  const resource = w.resource ?? "main";
+  if (w.phase === "removed" && w.disposal?.phase === "removed") return { gone: true, note: `OVNFS ${resource} already removed: ${w.path}` };
   const hold = holdBlocker || (keepWorktree || w.kept_worktree ? "explicit --keep-worktree hold" : "");
-  const blocker = hold || OVNFS_RETAINED;
-  if (!dryRun && (w.disposal?.phase !== "retained" || w.disposal.blocker !== blocker || (w.disposal.hold_blocker ?? "") !== hold)) {
-    save({ phase: "retained", blocker, ...(hold ? { hold_blocker: hold, check_blocker: OVNFS_RETAINED } : {}) });
+  const reason = w.ovnfs.label ? "snapshot retained" : "checkout deletion is explicit-only";
+  const disposal = w.disposal ?? {};
+  if (!dryRun && !disposal.phase) save({ phase: "retained", blocker: hold || reason, ...(hold ? { hold_blocker: hold, check_blocker: reason } : {}) });
+  const detail = [...new Set([hold, disposal.blocker, reason].filter(Boolean))].join("; ");
+  return { gone: false, note: `OVNFS ${resource} kept: ${w.path || w.identity?.id || w.nonce}: ${detail}` };
+}
+
+// Called only by the explicit command under the PP lifecycle lock, never by dispose().
+export function deleteOvnfsCheckout(project, t, h, w, save) {
+  const previous = w.disposal ?? {};
+  const path = evidencePath(project, w);
+  let proof = previous.evidence;
+  let phase = ["removing", "unknown"].includes(previous.phase) ? "unknown" : "retained";
+  const record = (phase, blocker = "") => save({ phase, blocker, ...(proof && { evidence: proof }) });
+  try {
+    if (phase === "unknown") {
+      const manifest = storedManifest(proof, path, w.nonce);
+      if (manifest.repository !== w.identity.registration || !ovnfs.checkoutGone(h, w)) fail("previous OVNFS removal is unconfirmed; will not send another rm");
+    } else {
+      const inspectNow = () => {
+        ovnfs.verifyDeletion(h, w);
+        checkDependencies(project, t, w);
+        checkOccupancy(w.path, w.identity.git_dir);
+        const declared = declaration(project, t, w);
+        if (declared.keep) fail("explicit path keep applies to this checkout");
+        return inspect(t, w, declared);
+      };
+      const manifest = inspectNow();
+      proof ??= evidence(project, w, manifest);
+      verifyEvidence(proof, path, inspectNow());
+      record("removing");
+      phase = "unknown";
+      ovnfs.removeCheckout(h, w);
+      if (!ovnfs.checkoutGone(h, w)) fail("OVNFS removal not confirmed by registry and filesystem");
+    }
+    record("removed");
+    return `OVNFS checkout removed: ${w.path}`;
+  } catch (e) {
+    record(phase, previous.phase === "unknown" && previous.blocker ? previous.blocker : e.message);
+    fail(`OVNFS checkout ${phase === "unknown" ? "removal unconfirmed" : "retained"}: ${e.message}`);
   }
-  return { gone: false, note: `OVNFS ${w.resource} kept: ${w.path || w.identity?.id || w.nonce}: ${[hold, OVNFS_RETAINED].filter(Boolean).join("; ")}` };
 }
 
 export function dispose(project, t, h, w, options) {

@@ -77,7 +77,8 @@ pp thread prompt <slug> <id> --text "…"       # steer a thread
 pp thread permissions|allow|deny <slug> <id>  # answer its permission requests
 pp thread restart <slug> <id> [--fresh]       # bring it back on its old session
 pp thread resolve <slug> <id>                 # report copied home, then cleanup (docs/cleanup.md)
-pp thread cleanup <slug> <id> [--dry-run]     # retry or preview that cleanup
+pp thread cleanup <slug> <id> [--dry-run]     # retry or preview cleanup (never deletes OVNFS)
+pp thread delete-checkout <slug> <id> [--resource NAME] # explicitly delete one eligible managed OVNFS checkout
 pp ticker start|stop|status
 pp doctor [--fix]
 ```

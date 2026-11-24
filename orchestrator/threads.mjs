@@ -10,7 +10,7 @@ import { loadConfig, loadSafety, resolveProfile, agentConfig, kindOf, modelOf, c
 import { prefix } from "./project.mjs";
 import * as inbox from "./inbox.mjs";
 import * as cleanup from "./cleanup.mjs";
-import { dispose } from "./disposal.mjs";
+import { deleteOvnfsCheckout, dispose } from "./disposal.mjs";
 import { LifecycleBusy, withLifecycleLock } from "./lifecycle-lock.mjs";
 import * as ovnfs from "./ovnfs.mjs";
 import * as managedOvnfs from "./managed-ovnfs.mjs";
@@ -369,6 +369,7 @@ function worktreeRecord(t) {
 
 function verifyWorktree(h, t) {
   const w = worktreeRecord(t);
+  if (w.backend === "ovnfs" && ["removing", "unknown"].includes(w.disposal?.phase)) throw new Error("OVNFS checkout removal is unconfirmed");
   const path = copyBackend(w).verify(h, w);
   if (path !== t.cwd) throw new Error(`${t.id}'s worktree record does not match its checkout`);
   return path;
@@ -1123,7 +1124,12 @@ export function resourceView(project, t, discovery) {
     const blockers = [...new Set([hold, w.blocker, check, w === t.working_copy && branchIdentityBlocker(t)].filter(Boolean))];
     const actions = [];
     if (hold) actions.push(`person: thread release ${project.slug} ${t.id}${legacyHold(t) ? "" : ` --resource ${w.nonce}`}`);
-    if (t.status === "resolved" && !removedResource(w)) actions.push(`preview: ${retry} --dry-run`, `retry: ${retry}`);
+    if (t.status === "resolved" && !removedResource(w)) {
+      if (w.backend !== "ovnfs") actions.push(`preview: ${retry} --dry-run`, `retry: ${retry}`);
+      else if (!hold && w.phase === "ready" && w.ovnfs && !w.ovnfs.label) {
+        actions.push(`explicit: pp thread delete-checkout ${project.slug} ${t.id}${w === t.working_copy ? "" : ` --resource ${w.resource}`}`);
+      }
+    }
     const retained_input = w.ovnfs?.capture || w.seed ? {
       path: (w.ovnfs?.capture ?? w.seed).path,
       reason: w.ovnfs?.capture
@@ -1189,6 +1195,39 @@ export function release(project, id, nonce) {
   }));
 }
 
+export function deleteCheckout(project, id, resource = "main") {
+  return withLifecycleLock(project, async () => {
+    const t = load(project, id);
+    if (t.status !== "resolved") throw new Error(`${id} is not resolved`);
+    if (t.kind !== "ovnfs" || t.working_copy?.backend !== "ovnfs") throw new Error("checkout deletion requires a managed OVNFS thread, not a legacy or external checkout");
+    const matches = resource === "main" ? [worktreeRecord(t)] : (t.working_copies ?? []).filter((w) => w.resource === resource);
+    const [w] = matches;
+    if (matches.length !== 1 || w.owner !== id || w.machine !== t.machine || w.backend !== "ovnfs" || !w.ovnfs || w.ovnfs.label) {
+      throw new Error(`no exact owned OVNFS checkout named ${resource}; snapshots are not deletable`);
+    }
+    if (removedResource(w)) return `OVNFS checkout already removed: ${w.path}`;
+    if (w.phase !== "ready" || !w.identity || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(w.nonce)) throw new Error("OVNFS checkout identity is not confirmed");
+    const hold = holdBlocker(project, t, w);
+    if (hold) throw new Error(hold);
+    const h = host(t.machine);
+    if (h.remote) throw new Error("checkout deletion requires a local OVNFS checkout");
+    requireLocalPaseo();
+    if (!t.agent_id) throw new Error("agent archive unconfirmed");
+    const c = await client(h.url), agent = c.agents.ref(t.agent_id);
+    await agent.refresh();
+    const snap = agent.current();
+    if (snap?.id !== t.agent_id || !Number.isFinite(Date.parse(snap.archivedAt))) throw new Error("agent archive unconfirmed");
+    return deleteOvnfsCheckout(project, t, h, w, (disposal) => update(project, id, (r) => {
+      const current = resourcesOf(r).find((row) => row.nonce === w.nonce);
+      if (r.status !== "resolved" || current?.path !== w.path || r.agent_id !== t.agent_id || holdBlocker(project, r, current)) {
+        throw new Error("thread, resource or hold changed during deletion");
+      }
+      current.disposal = disposal;
+      if (disposal.phase === "removed") current.phase = "removed";
+    }));
+  });
+}
+
 async function clean(project, t, { keepWorktree = false, copyComplete = true, archive, mergedHead = "", dryRun = false } = {}) {
   const notes = [];
   let h;
@@ -1217,8 +1256,8 @@ async function clean(project, t, { keepWorktree = false, copyComplete = true, ar
       notes.push(`agent not archived: ${e.message}`);
     }
   }
-  // A tab thread's workspace goes with it (its folder stays); a worktree's (and a managed OVNFS copy's) stays with its resource.
-  if ((t.kind === "tab" || (t.kind === "ovnfs" && !t.working_copy && agentArchived)) && t.workspace_id && !dryRun) notes.push(await archiveWorkspace(h.url, t.workspace_id));
+  // Only a tab's workspace can be archived while keeping its checkout.
+  if (t.kind === "tab" && t.workspace_id && !dryRun) notes.push(await archiveWorkspace(h.url, t.workspace_id));
   // Paseo's merge auto-archive removes a workspace's worktree whatever pp keeps, so a kept one says so (or that it is unknown).
   const paseoAutoArchive = t.kind === "worktree" && t.workspace_id ? await autoArchiveAfterMerge(h.url) : { on: false };
   const refreshArchive = t.kind === "ovnfs" ? () => finalCopy(project, t) : undefined;
@@ -1240,7 +1279,7 @@ async function clean(project, t, { keepWorktree = false, copyComplete = true, ar
             const r = load(project, t.id);
             const disposal = (i === 0 ? r.working_copy : r.working_copies?.[i - 1])?.disposal;
             const reason = disposal?.check_blocker ?? disposal?.blocker;
-            if (reason && reason !== hold) cleanupException(project, t, w, reason);
+            if (w.backend !== "ovnfs" && reason && reason !== hold) cleanupException(project, t, w, reason);
             if (hold.includes("hold is unknown;")) cleanupException(project, t, w, hold);
           }
           return result;
@@ -1253,7 +1292,7 @@ async function clean(project, t, { keepWorktree = false, copyComplete = true, ar
       if (!done.worktreeGone && t.workspace_id && paseoAutoArchive.on !== false) {
         done.notes.push(paseoAutoArchive.on ? "Paseo merge auto-archive is on and can remove the worktree" : "Paseo merge auto-archive is unknown");
       }
-    } else done = await cleanup.run(project, t, h, { keepWorktree, copyComplete, archive, refreshArchive, agentArchived, mergedHead, dryRun, paseoAutoArchive, legacyGit });
+    } else done = await cleanup.run(project, t, h, { keepWorktree, copyComplete, archive, refreshArchive, agentArchived, dryRun, paseoAutoArchive, legacyGit });
   }
   catch (e) { return [...notes, `cleanup failed: ${e.message}; \`thread cleanup ${project.slug} ${t.id}\` retries`]; }
   notes.push(...done.notes);

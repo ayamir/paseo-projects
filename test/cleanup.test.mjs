@@ -56,11 +56,6 @@ if (args[0] === "--json" && args[1] === "ls") {
   const c = { name, path: realpathSync(path), source, created: new Date().toISOString(), git: true };
   writeFileSync(state, JSON.stringify(c));
   console.log(JSON.stringify({ checkout: c }));
-} else if (args.length === 3 && args[0] === "rm" && args[1] === saved?.name && args[2] === "--sticky-snapshots") {
-  if (process.env.FAKE_OVNFS_DELAY_UNMOUNT) {
-    spawn(process.execPath, ["--input-type=module", "-e", 'import { rmSync } from "node:fs"; setTimeout(() => rmSync(process.argv[1], { recursive: true }), 800)', saved.path], { stdio: "ignore" }).unref();
-  } else rmSync(saved.path, { recursive: true });
-  rmSync(state);
 } else {
   console.error("unexpected ovnfs invocation", args);
   process.exit(1);
@@ -125,7 +120,9 @@ wss.on("connection", (s) => s.on("message", (raw) => {
     const first = mode === "archive-retry" && !archiveAttempts.has(r.agentId);
     archiveAttempts.add(r.agentId);
     if (first) return send({ type: "rpc_error", payload: { requestId, requestType: r.type, error: "agent archive refused" } });
-    return send({ type: "agent_archived", payload: { requestId, agentId: r.agentId, archivedAt: new Date().toISOString() } });
+    const archivedAt = new Date().toISOString(), agent = agents.get(r.agentId);
+    if (agent) agent.archivedAt = archivedAt;
+    return send({ type: "agent_archived", payload: { requestId, agentId: r.agentId, archivedAt } });
   }
   if (r.type === "send_agent_message_request") return send({ type: "send_agent_message_response", payload: { requestId, agentId: r.agentId, accepted: true, error: null } });
   if (requestId) send({ type: "rpc_error", payload: { requestId, requestType: r.type, error: "not faked" } });
@@ -194,8 +191,8 @@ test("explicit OVNFS refuses an unavailable pinned backend before allocating a t
 
 const FAKE_OVN_ADMIN = join(BASE, "fake-ovn-admin.mjs");
 write(FAKE_OVN_ADMIN, `import { createServer } from "node:net";
-import { appendFileSync, chmodSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { appendFileSync, chmodSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { execFileSync } from "node:child_process";
 const [state, mount, behavior] = process.argv.slice(2);
 const socket = join(state, "admin.sock"), checkouts = [], snapshots = [];
@@ -220,11 +217,12 @@ const server = createServer((client) => {
     while (buf.length >= 4 && buf.length >= 4 + buf.readUInt32LE()) {
       const end = 4 + buf.readUInt32LE(), m = JSON.parse(buf.subarray(4, end)); buf = buf.subarray(end);
       const ok = (data) => send({ id: m.id, ok: data });
-      if (m.hello) { send({ welcome: { ...meta, ops: ["status", "ls", "new", "snap"] } }); continue; }
+      if (m.hello) { send({ welcome: { ...meta, ops: ["status", "ls", "new", "snap", "rm"], features: behavior === "no-rm-guarantees" ? [] : ["rm.sticky_snapshots", "rm.keep_commits"] } }); continue; }
       appendFileSync(join(state, "calls"), JSON.stringify(m) + "\\n");
       if (m.status) ok({ ...meta, socket, pid: process.pid, build_version: "v0.8.0" });
       else if (m.ls) {
-        const extra = behavior === "discover" ? JSON.parse(readFileSync(join(state, "discovery"), "utf8")) : {};
+        const discovery = join(state, "discovery");
+        const extra = existsSync(discovery) ? JSON.parse(readFileSync(discovery, "utf8")) : {};
         ok({ checkouts: [...checkouts, ...(extra.checkouts ?? [])], snapshots: [...snapshots, ...(extra.snapshots ?? [])] });
       }
       else if (m.new) {
@@ -234,7 +232,8 @@ const server = createServer((client) => {
         if (snapshot ? (!input || m.new.dir || m.new.rev || m.new.rules) : (!m.new.rev || m.new.rules?.[0] !== "hidden *")) throw new Error("unsafe new");
         const dir = input?.source ?? m.new.dir, rev = input?.rev ?? m.new.rev;
         mkdirSync(join(state, "git"), { recursive: true });
-        git("clone", "--no-checkout", "--", dir, path);
+        git("clone", "--template=", "--no-checkout", "--", dir, path);
+        git("-C", path, "remote", "remove", "origin");
         git("-C", path, "checkout", "--detach", rev);
         if (behavior === "seed-byte-mismatch") {
           const file = join(path, "package.json");
@@ -245,6 +244,10 @@ const server = createServer((client) => {
         renameSync(join(path, ".git"), gd);
         writeFileSync(join(path, ".git"), "gitdir: " + gd + "\\n");
         const c = { name, path, source: dir, base: input?.base ?? "base-capture-" + (checkouts.length + 1), parent: snapshot, created: new Date().toISOString(), git: true };
+        const objects = join(state, "bases", c.base, "objects");
+        if (!existsSync(objects)) { mkdirSync(dirname(objects), { recursive: true }); renameSync(join(gd, "objects"), objects); }
+        else rmSync(join(gd, "objects"), { recursive: true });
+        symlinkSync(objects, join(gd, "objects"));
         checkouts.push(c);
         if (behavior === "ambiguous-new") client.destroy(); else ok({ checkout: c });
       } else if (m.snap) {
@@ -260,6 +263,15 @@ const server = createServer((client) => {
         if (behavior !== "pending-snap") row.tree = "tree-" + id;
         else setTimeout(() => { row.tree = "tree-" + id; }, 1500);
         if (behavior.includes("-snap")) client.destroy(); else ok({ snapshot: row });
+      } else if (m.rm) {
+        const i = checkouts.findIndex((c) => c.name === m.rm.checkout);
+        if (i < 0 || !m.rm.keep_commits || !m.rm.sticky_snapshots) throw new Error("unsafe rm");
+        if (behavior === "refuse-rm") { send({ id: m.id, error: { code: "invalid", message: "cannot keep unique commits" } }); continue; }
+        const [row] = checkouts.splice(i, 1);
+        if (behavior !== "partial-rm") rmSync(row.path, { recursive: true });
+        rmSync(join(state, "git", row.name), { recursive: true });
+        if (behavior === "lost-rm-reply") client.destroy();
+        else ok({});
       } else send({ id: m.id, error: { code: "invalid", message: "unexpected op" } });
     }
   });
@@ -280,6 +292,7 @@ async function managedOvnfsFixture(t, mode = "ambiguous-new", daemon = "create-r
   const executable = (name, source) => { const p = join(bin, name); write(p, `#!${process.execPath}\n${source}`); chmodSync(p, 0o755); };
   executable("ovnfs", `if (process.argv.slice(2).join(" ") === "--json version") console.log(JSON.stringify({ version: "v0.8.0", os: "darwin" })); else process.exit(1);`);
   executable("ps", `console.log("ovnfs serve --no-git-remotes");`);
+  executable("lsof", `import { existsSync, readFileSync } from "node:fs"; const file = process.env.OVNFS_STATE + "/occupied"; process.stdout.write("p12345\\0\\nfcwd\\0n" + (existsSync(file) ? readFileSync(file, "utf8") : "/") + "\\0\\n");`);
   executable("nfsstat", `import { existsSync } from "node:fs"; const { OVNFS_STATE: s, OVNFS_MOUNT: m } = process.env; console.log(JSON.stringify(existsSync(s + "/unmounted") ? {} : { nfs: { "Mount Point": m, "Current mount parameters": { "NFS parameters": ["vers=3", "ticotsord", "port=" + s + "/nfs.sock", "mountport=" + s + "/nfs.sock"] } } }));`);
   const admin = spawn(process.execPath, [FAKE_OVN_ADMIN, state, mount, mode], { stdio: ["ignore", "pipe", "inherit"] });
   t.after(() => admin.kill());
@@ -437,31 +450,143 @@ test("managed OVNFS registers an experiment and snapshots its own checkout befor
   assert.equal(JSON.parse(board.out).working_copies.find((w) => w.resource === "save").identity.id, snapshot.identity.id);
 });
 
-test("managed OVNFS resolve retains every resource with the missing backend guarantee and never calls rm or drop", { skip: process.platform !== "darwin" }, async (t) => {
+test("OVNFS auto-resolve, ticker cleanup, manual cleanup and sweep never delete checkouts or snapshots", { skip: process.platform !== "darwin" }, async (t) => {
+  const f = await managedOvnfsFixture(t, "off", "off");
+  assert.ok(f.start("--reviews", REVIEW_URL).ok);
+  const { thread_dir } = f.show(f.next);
+  write(join(thread_dir, "report.md"), "## Report\nDone\n");
+  assert.ok(f.pp("report", "--thread", `demo/${f.next}`, "--percent", "100").ok);
+  const now = new Date().toISOString();
+  const views = { [REVIEW_URL]: { state: "MERGED" } };
+  for (let i = 0; i < 2; i++) {
+    const tick = await tickOnce(f, now, views);
+    assert.equal(tick.code, 0, tick.out);
+  }
+  assert.equal(f.show(f.next).resolved_reason, "reviewed PR merged");
+  for (const args of [["thread", "cleanup", "demo", f.next], ["sweep", "demo", "--yes"]]) {
+    const r = f.pp(...args);
+    assert.ok(r.ok, r.out);
+  }
+  const { working_copy: w } = f.show(f.next);
+  assert.equal(w.disposal.phase, "retained");
+  assert.match(w.disposal.blocker, /explicit-only/);
+  assert.ok(existsSync(w.path));
+  assert.deepEqual(f.calls().filter((m) => m.rm || m.drop), []);
+});
+
+test("explicit deletion refuses unresolved, held, snapshot and dependent OVNFS resources", { skip: process.platform !== "darwin" }, async (t) => {
+  const f = await managedOvnfsFixture(t, "off", "off");
+  assert.ok(f.start().ok);
+  const del = (...args) => f.pp("thread", "delete-checkout", "demo", f.next, ...args);
+  const refused = (r, reason) => { assert.equal(r.ok, false, r.out); assert.match(r.out, reason); };
+  refused(del(), /not resolved/);
+  assert.ok(f.pp("thread", "experiment", "demo", f.next, "--name", "scratch").ok);
+  assert.ok(f.pp("thread", "snapshot", "demo", f.next, "--name", "save", "--resource", "scratch").ok);
+  assert.ok(f.pp("thread", "hold", "demo", f.next, "--reason", "debugging", "--until", "2099-01-01T00:00:00Z").ok);
+  const resolved = f.pp("thread", "resolve", "demo", f.next);
+  assert.ok(resolved.ok, resolved.out);
+  refused(del(), /hold: debugging/);
+  refused(del("--resource", "save"), /snapshots are not deletable/);
+  refused(del("--resource", "scratch"), /depends on this checkout|depends on this worktree/);
+  assert.deepEqual(f.calls().filter((m) => m.rm || m.drop), []);
+});
+
+test("explicit deletion refuses occupied, unclassified and registry-dependent OVNFS checkouts without rm", { skip: process.platform !== "darwin" }, async (t) => {
+  const f = await managedOvnfsFixture(t, "off", "off");
+  assert.ok(f.start().ok);
+  const resolved = f.pp("thread", "resolve", "demo", f.next);
+  assert.ok(resolved.ok, resolved.out);
+  const { working_copy: w } = f.show(f.next);
+  const refused = (reason) => { const r = f.pp("thread", "delete-checkout", "demo", f.next); assert.equal(r.ok, false, r.out); assert.match(r.out, reason); };
+  write(join(f.state, "occupied"), w.path);
+  refused(/occupied by process 12345/);
+  rmSync(join(f.state, "occupied"));
+  write(join(w.path, "stray.bin"), "unknown\n");
+  refused(/unclassified/);
+  rmSync(join(w.path, "stray.bin"));
+  write(join(f.state, "discovery"), JSON.stringify({ checkouts: [{ name: "external", path: join(f.mount, "external"), source: w.path, base: "b", created: new Date().toISOString(), git: true }] }));
+  refused(/checkout external depends on this checkout/);
+  assert.deepEqual(f.calls().filter((m) => m.rm || m.drop), []);
+  assert.notEqual(f.show(f.next).working_copy.disposal.phase, "unknown");
+});
+
+test("explicit deletion refuses a backend without non-force snapshot-preserving rm before recording removal", { skip: process.platform !== "darwin" }, async (t) => {
+  const f = await managedOvnfsFixture(t, "no-rm-guarantees", "off");
+  assert.ok(f.start().ok);
+  assert.ok(f.pp("thread", "resolve", "demo", f.next).ok);
+  const r = f.pp("thread", "delete-checkout", "demo", f.next);
+  assert.equal(r.ok, false, r.out);
+  assert.match(r.out, /retained: .*does not support non-force, snapshot-preserving OVNFS removal/);
+  assert.notEqual(f.show(f.next).working_copy.disposal.phase, "unknown");
+  assert.deepEqual(f.calls().filter((m) => m.rm), []);
+});
+
+test("an Agent can explicitly delete one resolved managed OVNFS checkout with verified evidence", { skip: process.platform !== "darwin" }, async (t) => {
   const f = await managedOvnfsFixture(t, "off", "off");
   assert.ok(f.start().ok);
   assert.ok(f.pp("thread", "experiment", "demo", f.next, "--name", "scratch").ok);
-  assert.ok(f.pp("thread", "snapshot", "demo", f.next, "--name", "save", "--resource", "scratch").ok);
-  const held = f.pp("thread", "hold", "demo", f.next, "--reason", "debugging", "--until", "2099-01-01T00:00:00Z");
-  assert.ok(held.ok, held.out);
-  for (const cmd of [["resolve"], ["cleanup"]]) {
-    const r = f.pp("thread", ...cmd, "demo", f.next);
-    assert.ok(r.ok, r.out);
-    assert.match(r.out, /no identity- or dependency-fenced/);
-    const rec = f.show(f.next);
-    assert.equal(rec.status, "resolved");
-    assert.match(rec.working_copy.disposal.blocker, /debugging/);
-    const board = JSON.parse(f.pp("board", "thread", "demo", f.next).out);
-    for (const w of [board.working_copy, ...board.working_copies]) assert.ok(w.blockers.some((b) => /no identity- or dependency-fenced/.test(b)), w.resource);
-    for (const w of [rec.working_copy, ...rec.working_copies]) {
-      assert.equal(w.disposal.phase, "retained", w.resource);
-      assert.match(w.disposal.check_blocker ?? w.disposal.blocker, /OVNFS v0\.8\.0 has no identity- or dependency-fenced rm\/drop/);
-      assert.notEqual(w.phase, "removed");
-      if (w.path) assert.ok(existsSync(w.path), w.path);
-    }
-  }
-  assert.deepEqual(f.calls().filter((m) => m.rm || m.drop), []);
+  const { working_copy: w } = f.show(f.next);
+  const output = join(f.show(f.next).thread_dir, "library", "result.txt");
+  write(output, "result\n");
+  git(w.path, "commit", "--allow-empty", "-qm", "private result");
+  const tip = git(w.path, "rev-parse", "HEAD");
+  write(join(f.show(f.next).thread_dir, "cleanup.json"), JSON.stringify({ commits: [tip] }));
+  const resolved = f.pp("thread", "resolve", "demo", f.next);
+  assert.ok(resolved.ok, resolved.out);
+  assert.ok(existsSync(w.path));
+  const deleted = f.pp("thread", "delete-checkout", "demo", f.next);
+  assert.ok(deleted.ok, deleted.out);
+  assert.match(deleted.out, /OVNFS checkout removed/);
+  const { working_copy: gone, working_copies: [scratch] } = f.show(f.next);
+  assert.equal(gone.disposal.phase, "removed");
+  assert.ok(existsSync(scratch.path));
+  assert.ok(!existsSync(w.path));
+  assert.ok(!existsSync(w.identity.git_dir));
+  assert.ok(existsSync(w.ovnfs.capture.path));
+  const evidence = gone.disposal.evidence.path;
+  assert.equal(readFileSync(join(evidence, "files", relative(w.path, output)), "utf8"), "result\n");
+  const restored = join(f.root, "restored.git");
+  git(f.root, "clone", "--mirror", join(evidence, "commits.bundle"), restored);
+  assert.equal(git(restored, "rev-parse", `refs/heads/saved/${tip}`), tip);
+  assert.deepEqual(f.calls().filter((m) => m.rm).map((m) => m.rm), [
+    { checkout: w.identity.name, keep_commits: true, sticky_snapshots: true },
+  ]);
 });
+
+for (const [mode, reason] of [["refuse-rm", /cannot keep unique commits/], ["partial-rm", /not confirmed by registry and filesystem/], ["lost-rm-reply", / closed| EOF|empty response/i]]) {
+  test(`OVNFS explicit deletion reports ${mode} and never repeats an uncertain rm`, { skip: process.platform !== "darwin" }, async (t) => {
+    const f = await managedOvnfsFixture(t, mode, "off");
+    assert.ok(f.start().ok);
+    const del = () => f.pp("thread", "delete-checkout", "demo", f.next);
+    const resolve = f.pp("thread", "resolve", "demo", f.next);
+    assert.ok(resolve.ok, resolve.out);
+    const result = del();
+    assert.equal(result.ok, false, result.out);
+    assert.match(result.out, /removal unconfirmed/);
+    assert.match(result.out, reason);
+    const { working_copy: w } = f.show(f.next);
+    assert.equal(w.disposal.phase, "unknown");
+    const cleanup = f.pp("thread", "cleanup", "demo", f.next);
+    assert.ok(cleanup.ok, cleanup.out);
+    assert.equal(f.show(f.next).working_copy.disposal.phase, "unknown");
+    if (mode === "lost-rm-reply") {
+      write(join(f.state, "unmounted"), "1");
+      const unmounted = del();
+      assert.equal(unmounted.ok, false, unmounted.out);
+      assert.match(unmounted.out, /mount/);
+      rmSync(join(f.state, "unmounted"));
+      const retry = del();
+      assert.ok(retry.ok, retry.out);
+      assert.equal(f.show(f.next).working_copy.disposal.phase, "removed");
+    } else {
+      const retry = del();
+      assert.equal(retry.ok, false, retry.out);
+      assert.match(retry.out, /will not send another rm/);
+      assert.ok(existsSync(w.path));
+    }
+    assert.equal(f.calls().filter((m) => m.rm).length, 1);
+  });
+}
 
 // A legacy OVNFS thread (no working_copy) as earlier pp versions recorded it; `--kind ovnfs` now starts managed ones.
 async function ovnfsFixture(mode, fn, extra = {}) {
@@ -494,33 +619,44 @@ async function ovnfsFixture(mode, fn, extra = {}) {
   } finally { d.stop(); }
 }
 
-test("OVNFS starts and restarts in the source project's directory workspace, then retries cleanup after agent archive fails", async () => {
-  await ovnfsFixture("archive-retry", ({ p, pp, id, t, thread }) => {
+test("legacy OVNFS resolve, cleanup and sweep retain the checkout and even standalone declared discards", async () => {
+  await ovnfsFixture("archive-retry", ({ p, pp, id, t, thread, registry }) => {
     const restarted = pp("thread", "restart", "demo", id, "--fresh");
     assert.ok(restarted.ok, restarted.out);
     assert.equal(thread().cwd, t.cwd);
     assert.equal(thread().workspace_id, t.workspace_id);
     assert.notEqual(thread().agent_id, t.agent_id);
     write(join(t.thread_dir, "library", "result.txt"), "archived output\n");
-    const preview = pp("thread", "cleanup", "demo", id, "--dry-run");
-    assert.ok(preview.ok, preview.out);
-    assert.match(preview.out, /OVNFS checkout would be removed/);
-    assert.ok(existsSync(t.cwd));
-    const first = pp("thread", "resolve", "demo", id);
-    assert.ok(first.ok, first.out);
-    assert.match(first.out, /agent archive refused/);
-    assert.match(first.out, /OVNFS checkout kept/);
-    assert.ok(existsSync(t.cwd));
-    assert.equal(readFileSync(p.path("library", id, "result.txt"), "utf8"), "archived output\n");
-    const retry = pp("thread", "cleanup", "demo", id);
-    assert.ok(retry.ok, retry.out);
-    assert.match(retry.out, /agent archived/);
-    assert.match(retry.out, /OVNFS checkout removed/);
-    assert.ok(!existsSync(t.cwd));
+    const scratch = mkdtempSync(join(TMP, `${id}-ovn-discard-`));
+    try {
+      write(join(scratch, "discard.txt"), "keep legacy discard\n");
+      write(join(t.thread_dir, "cleanup.json"), JSON.stringify({ discard: [{ path: scratch, why: "legacy scratch" }] }));
+      const preview = pp("thread", "cleanup", "demo", id, "--dry-run");
+      assert.ok(preview.ok, preview.out);
+      assert.doesNotMatch(preview.out, /would be removed/);
+      assert.ok(existsSync(scratch));
+      const first = pp("thread", "resolve", "demo", id);
+      assert.ok(first.ok, first.out);
+      assert.match(first.out, /agent archive refused/);
+      assert.match(first.out, /OVNFS checkout kept/);
+      assert.equal(readFileSync(p.path("library", id, "result.txt"), "utf8"), "archived output\n");
+      const retry = pp("thread", "cleanup", "demo", id);
+      assert.ok(retry.ok, retry.out);
+      assert.match(retry.out, /agent archived/);
+      assert.match(retry.out, /legacy OVNFS.*retained/);
+      const sweep = pp("sweep", "demo", "--yes");
+      assert.ok(sweep.ok, sweep.out);
+      const explicit = pp("thread", "delete-checkout", "demo", id);
+      assert.equal(explicit.ok, false, explicit.out);
+      assert.match(explicit.out, /legacy or external checkout/);
+      assert.ok(existsSync(t.cwd));
+      assert.ok(existsSync(registry));
+      assert.equal(readFileSync(join(scratch, "discard.txt"), "utf8"), "keep legacy discard\n");
+    } finally { rmSync(scratch, { recursive: true, force: true }); }
   });
 });
 
-test("OVNFS archives library changes made before the checkout becomes idle", async () => {
+test("legacy OVNFS still archives library changes made before the retained checkout becomes idle", async () => {
   await ovnfsFixture("off", ({ env, p, pp, id, t, root }) => {
     const bin = join(root, "bin");
     const result = join(t.thread_dir, "library", "result.txt");
@@ -540,36 +676,19 @@ if (!fs.existsSync(${JSON.stringify(checked)})) {
     env.PATH = `${bin}:${env.PATH}`;
     const resolved = pp("thread", "resolve", "demo", id);
     assert.ok(resolved.ok, resolved.out);
-    assert.match(resolved.out, /OVNFS checkout removed/);
-    assert.ok(!existsSync(t.cwd));
+    assert.match(resolved.out, /legacy OVNFS.*retained/);
+    assert.ok(existsSync(t.cwd));
     assert.equal(readFileSync(p.path("library", id, "result.txt"), "utf8"), "latest\n");
   });
 });
 
-test("OVNFS cleanup keeps changed identities, dirty files and commits absent from the source repo", async () => {
+test("legacy OVNFS final copy still refuses a changed identity", async () => {
   await ovnfsFixture("off", ({ pp, id, t, registry }) => {
     const record = readFileSync(registry, "utf8");
     write(registry, JSON.stringify({ ...JSON.parse(record), created: "replaced" }));
     const mismatch = pp("thread", "resolve", "demo", id);
     assert.equal(mismatch.ok, false, mismatch.out);
     assert.match(mismatch.out, /OVNFS checkout identity changed/);
-    write(registry, record);
-    write(join(t.cwd, "package.json"), '{"dirty":true}\n');
-    const dirty = pp("thread", "resolve", "demo", id);
-    assert.ok(dirty.ok, dirty.out);
-    assert.match(dirty.out, /uncommitted change: package.json/);
-    assert.ok(existsSync(t.cwd));
-    git(t.cwd, "stash", "push");
-    const stashed = pp("thread", "cleanup", "demo", id);
-    assert.ok(stashed.ok, stashed.out);
-    assert.match(stashed.out, /it has Git stashes/);
-    assert.ok(existsSync(t.cwd));
-    git(t.cwd, "stash", "pop");
-    git(t.cwd, "add", "package.json");
-    git(t.cwd, "commit", "-qm", "private commit");
-    const unique = pp("thread", "cleanup", "demo", id);
-    assert.ok(unique.ok, unique.out);
-    assert.match(unique.out, /not confirmed outside the OVNFS checkout/);
     assert.ok(existsSync(t.cwd));
   });
 });
@@ -2338,7 +2457,6 @@ for (const kind of ["clean", "dirty", "private commit", "published commit", "ref
       write(join(t.thread_dir, "report.md"), `${byFlag ? "" : `Reviewed-PR: ${REVIEW_URL}\n\n`}## Report\nDone\n`);
       const progress = pp("report", "--thread", `demo/${id}`, "--percent", "100");
       assert.ok(progress.ok, progress.out);
-      if (byFlag) f.env.FAKE_OVNFS_DELAY_UNMOUNT = "1";
       if (kind === "dirty") write(join(t.cwd, "package.json"), '{"dirty":true}\n');
       if (kind.endsWith("commit")) git(t.cwd, "commit", "--allow-empty", "-qm", "reviewer change");
       const privateTip = kind === "reflog commit" ? git(t.cwd, "rev-parse", "HEAD") : "";

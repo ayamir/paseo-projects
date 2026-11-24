@@ -99,7 +99,7 @@ worktree 删除前要满足这些条件，任何一条不满足就保留并写�
 - `resolve` 会归档 Paseo agent。工作树已经移除时，也会归档侧边栏里的 workspace。工作树需要保留时，workspace 也保留，因为 Paseo 的 workspace 归档可能删除工作树。`resolve` 和 `thread cleanup` 的输出都会说明 Paseo 归档结果，失败后可以用 `thread cleanup` 重试。
 - 再次 `thread resolve` 会报错，并提示改用 `thread cleanup`。
 - `--dry-run` 会预览 worktree、声明路径和索引，列出 would-remove，不删东西，也不写记录。它不会重新拷贝，所以 library 里的成品可能还没归档。只有 worktree 已经移除时才检查本地分支并归档 workspace。这两项的结果写在命令输出或 resolve 的 inbox 里。
-- `pp sweep` 只重试已登记工作副本的回收，并清理过期的已处理 inbox 项；不会按线程状态、目录名或分支名清扫未接管的历史资源。
+- `pp sweep` 可重试已登记 Git worktree 的回收和待处理的归档，并清理过期的已处理 inbox 项；不删除 OVNFS checkout，也不会按线程状态、目录名或分支名清扫未接管的历史资源。
 - `pp thread discover <slug>` 列出已配置仓库的 Git worktree、历史线程记录及已配置并正在运行的本机 OVNFS 注册表中能与项目关联的条目，不会启动 OVNFS daemon。`pp board resources` 和线程详情显示待确认资源、实际后端、阶段、阻碍和操作。
 - 人确认候选项及实际创建基线后，才可运行 `pp thread adopt <slug> <id> --candidate TOKEN --base OID`。已核对的历史 Git worktree 登记到原线程；无归属的 Git worktree 只能登记到同源的托管线程。接管只写 PP 记录，保留原后端、文件、提交和保留约束；身份或起点证据不足时，先独立保存工作，不要将这个 Git 资源交给 PP 托管。未接管的 OVNFS 和远程资源仅报告阻碍。
 - 对已核对但未接管的历史 Git worktree，显式清理也会检查该工作树自己的 HEAD reflog。任何无法从保留引用到达的提交都会阻止删除，`--dry-run` 同样显示原因，但不写记录。实际清理会记录 `blocked` 而不是人为保留，资源看板显示阻碍，ticker 留下提醒但不自动重试。`archive_scope` 是 `report-and-library`；即使报告和 library 的拷贝完整，`git_history_archive` 仍可能是 `unknown`。没有已登记分支身份时，PP 保留分支和 reflog；接管后的工作树即使已经回收，资源看板仍会显示保留的分支及原因。
@@ -109,9 +109,13 @@ worktree 删除前要满足这些条件，任何一条不满足就保留并写�
 
 `--kind ovnfs` 使用本机 OVNFS v0.8.0 管理 checkout。Paseo 将其作为普通目录 workspace 打开，`pp thread restart` 复用原挂载。OVNFS 进程和挂载需要在启动、重启与清理期间可用。PP 启动 OVNFS daemon 时设置 `OVNFS_GIT_REMOTES=0`，已有 daemon 使用自己的配置。
 
-`resolve` 或 `thread cleanup` 会确认 OVNFS registry 中的 checkout 身份、Paseo agent 归档结果、成品拷贝和 Git 状态。checkout 空闲后会再次拷贝报告和 library。只有 checkout 仍未被占用，且 Git 提交（包括 reflog 中可恢复的提交）可从源仓库的引用或已核实的合并 PR 找到时，才调用 `ovnfs rm --sticky-snapshots`。源仓库的克隆中尚未抓取的远端提交可能需要先 fetch，清理过程本身不会 fetch。`--keep-worktree` 也适用于 OVNFS，`--dry-run` 可预览保留原因。
+`resolve`、`thread cleanup`、ticker 和 `pp sweep` 可以跟进归档，但不会删除 OVNFS checkout。未接管的历史 OVNFS checkout、工作区及其声明丢弃项也会保留。
 
-OVNFS 线程支持 `--reviews` 和报告中的 `Reviewed-PR:`。因被审 PR 合并而 resolve 时，只有私有分支仍指向启动时记录的提交，且提交可从源仓库引用访问，才移除 checkout。线程有尚未合并的自有 PR 时，被审 PR 合并不会触发 resolve。
+接到清理指示的 Agent 可非交互运行 `pp thread delete-checkout <slug> <id> [--resource NAME]`，每次只处理一项。省略 `--resource` 选中主 checkout；实验用其名称。命令要求线程已完成、Agent 已归档、没有有效保留，且本机命名空间、挂载和登记身份一致。它检查 checkout 和私有 Git 目录的占用、依赖、未知内容和可恢复的私有提交，并在副本外验证并保存所需成果。`--keep-worktree` 也阻止这条命令。快照不能删除，依赖关系不明确时也保留。
+
+依赖包括引用该 checkout 的快照，以及 source 位于该 checkout 或其私有 Git 目录内的其他 checkout。命令仅向已运行、并声明支持保留快照和保留提交的非强制删除的后端发出请求；不支持时在记录删除意图前就保留并报错。后端仍可能拒绝仍含未共享提交的 checkout，此时 PP 不改用强制删除。固定版本的按名 `rm` 无法锁住检查后的外部写入或替换。请让目标保持静止。只有注册表、挂载内路径和私有 Git 路径均确认目标已不存在才记为已删除；未挂载或无法查询不是已删除。失败或不确定时查看命令输出和 `pp thread show <slug> <id> --json`，不会后台重试；再次显式运行可核对此前已删除的目标，但不会重发不确定的 `rm`。PP 不删除 base、快照或底层目录；OVNFS 可回收无引用的内部存储。
+
+OVNFS 线程仍支持 `--reviews` 和报告中的 `Reviewed-PR:`。被审 PR 合并可以触发 resolve，但不会触发 checkout 删除；线程有尚未合并的自有 PR 时，也不会因此 resolve。
 
 ## 和 Paseo 的合并自动归档冲突
 

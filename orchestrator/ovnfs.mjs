@@ -1,21 +1,12 @@
-// OVNFS owns the mount and checkout registry. PP only removes a checkout whose saved identity still matches.
+// Legacy OVNFS checkout placement and identity checks; these checkouts are never removed by PP.
 import { randomUUID } from "node:crypto";
 import { lstatSync, realpathSync } from "node:fs";
-import { constants } from "node:os";
 import { isAbsolute } from "node:path";
-import { setTimeout as delay } from "node:timers/promises";
 import { sh } from "./lib.mjs";
 
-function pathGone(cwd, duringUnmount = false) {
-  try {
-    lstatSync(cwd);
-  } catch (e) {
-    if (e.code === "ENOENT") return true;
-    // Node may report Darwin's ESTALE only as a numeric errno.
-    if (duringUnmount && (e.code === "ESTALE" || e.errno === -constants.errno.ESTALE)) return false;
-    throw e;
-  }
-  return false;
+function pathGone(cwd) {
+  try { lstatSync(cwd); return false; }
+  catch (e) { if (e.code === "ENOENT") return true; throw e; }
 }
 
 export const checkoutName = () => `pp-${randomUUID()}`;
@@ -95,39 +86,4 @@ export function createBranch(cwd, branch) {
   const tip = git(cwd, ["rev-parse", "--verify", `refs/heads/${branch}`]);
   if (!tip.ok) throw new Error(`could not read branch ${branch}: ${tip.out}`);
   return tip.stdout.trim();
-}
-
-/** Checkout refs are private. Prove their commits exist on source refs or in the verified merged PR. */
-export function commitReason(t, mergedHead) {
-  const head = git(t.cwd, ["rev-parse", "--verify", "HEAD^{commit}"]);
-  const refs = git(t.cwd, ["for-each-ref", "--format=%(objectname) %(refname)"]);
-  if (!head.ok || !refs.ok) return "could not check its Git commits";
-  const lines = refs.stdout.trim().split("\n").filter(Boolean);
-  if (lines.some((line) => line.endsWith(" refs/stash"))) return "it has Git stashes";
-  const reflog = git(t.cwd, ["rev-list", "--reflog", "--no-walk=unsorted"]);
-  if (!reflog.ok) return "could not check its Git reflogs";
-  const oid = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
-  const tips = new Set([head.stdout.trim(), ...lines.map((line) => line.split(" ", 1)[0]), ...reflog.stdout.trim().split("\n").filter(Boolean)]);
-  for (const tip of tips) {
-    if (!oid.test(tip)) return "could not read its Git refs";
-    if (oid.test(mergedHead ?? "") && git(t.cwd, ["merge-base", "--is-ancestor", tip, mergedHead]).ok) continue;
-    const found = git(t.repo, ["for-each-ref", "--count=1", `--contains=${tip}`, "--format=%(refname)", "refs/heads", "refs/remotes", "refs/tags"]);
-    if (!found.ok || !found.stdout.trim()) return `Git ref ${tip.slice(0, 12)} is not confirmed outside the OVNFS checkout`;
-  }
-  if (t.resolved_reason === "reviewed PR merged") {
-    const start = t.branch_start;
-    if (start?.name !== t.branch || !oid.test(start?.oid ?? "")) return "its original branch and starting commit could not be verified";
-    if (!lines.includes(`${start.oid} refs/heads/${start.name}`)) return `branch ${start.name} has its own commits or moved since creation`;
-  }
-  return "";
-}
-
-export async function remove(t) {
-  command(["rm", t.ovnfs_name, "--sticky-snapshots"]);
-  // macOS NFS can cache the mount path after OVNFS drops the registration.
-  if (!lookup(t)) {
-    const deadline = Date.now() + 10_000;
-    while (Date.now() < deadline && !pathGone(t.cwd, true)) await delay(250);
-  }
-  if (mounted(t)) throw new Error("checkout still registered after ovnfs rm");
 }

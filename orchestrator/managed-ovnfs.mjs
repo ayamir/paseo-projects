@@ -5,6 +5,7 @@ import { lstatSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { sh } from "./lib.mjs";
 import { verifyCapture } from "./copy-inputs.mjs";
+import { lifecycleStdio } from "./lifecycle-lock.mjs";
 
 const PIN = "v0.8.0";
 const ADMIN = fileURLToPath(new URL("./ovnfs-admin.mjs", import.meta.url));
@@ -12,6 +13,8 @@ const same = (a, b) => a && b && Object.keys(a).length === Object.keys(b).length
 const fileId = (path) => { const s = lstatSync(path, { bigint: true }); return `${s.dev}:${s.ino}`; };
 const nonempty = (s) => typeof s === "string" && s.length > 0;
 const stamp = (s) => nonempty(s) && Number.isFinite(Date.parse(s));
+const inside = (p, root) => p === root || p.startsWith(root + "/");
+const RM_FEATURES = ["rm.sticky_snapshots", "rm.keep_commits"];
 
 function local(h) {
   if (h.remote || process.platform !== "darwin") throw new Error(`OVNFS ${PIN} is supported only on local macOS`);
@@ -29,9 +32,9 @@ function namespace(state, mount) {
 function admin(h, ns, op, args = {}) {
   local(h);
   if (!same(ns, namespace(ns.state, ns.mount))) throw new Error("OVNFS state directory identity changed");
-  const ms = ["new", "snap"].includes(op) ? 30_000 : 5000;
+  const ms = ["new", "snap", "rm"].includes(op) ? 30_000 : 5000;
   const r = spawnSync(process.execPath, [ADMIN, ns.state, ns.mount, op, JSON.stringify(args), String(ms)], {
-    encoding: "utf8", timeout: ms + 1000, maxBuffer: 17 << 20,
+    encoding: "utf8", timeout: ms + 1000, maxBuffer: 17 << 20, ...(op === "rm" && { stdio: lifecycleStdio() }),
   });
   if (r.status !== 0) throw new Error(`OVNFS ${PIN} ${op}: ${r.error?.message ?? (r.stderr.trim() || "unknown admin outcome")}`);
   if (!same(ns, namespace(ns.state, ns.mount))) throw new Error("OVNFS state directory identity changed");
@@ -143,10 +146,10 @@ function git(cwd, ...args) {
   return r.stdout.trim();
 }
 
-function checkoutIdentity(h, w, creating = false) {
+function checkoutIdentity(h, w, creating = false, ls) {
   const { namespace: ns, name, from, started_at } = w.ovnfs;
   if (name !== `pp-${w.nonce}` || w.path !== join(ns.mount, name) || !stamp(started_at)) throw new Error("OVNFS checkout intent does not match its name/path");
-  const ls = registry(h, ns);
+  ls ??= registry(h, ns);
   if (from && creating) verifySnapshot(ls.snapshots, from.snapshot);
   const found = ls.checkouts.filter((c) => c.name === name || c.path === w.path);
   const c = found[0];
@@ -189,6 +192,56 @@ export function verify(h, w) {
   if (w.ovnfs.label) verifySnapshot(registry(h, w.ovnfs.namespace).snapshots, w.identity);
   else if (!same(w.identity, checkoutIdentity(h, w))) throw new Error(`OVNFS checkout identity does not match at ${w.path}`);
   return w.path;
+}
+
+function deletionInventory(h, w) {
+  local(h);
+  const { namespace: ns, name, label } = w.ovnfs;
+  const gitRoot = join(ns.state, "git");
+  if (label || !w.identity || name !== `pp-${w.nonce}` || w.identity.name !== name || w.path !== join(ns.mount, name) ||
+      dirname(w.identity.git_dir) !== gitRoot || !lstatSync(gitRoot).isDirectory() || realpathSync(gitRoot) !== gitRoot) {
+    throw new Error("OVNFS checkout deletion identity is not confirmed");
+  }
+  if (!same(ns, configuredNamespace())) throw new Error("OVNFS checkout belongs to a different namespace");
+  mountCheck(ns);
+  const ls = registry(h, ns);
+  const { checkouts, snapshots } = ls;
+  if (checkouts.some((c) => !nonempty(c.name) || !nonempty(c.path) || !isAbsolute(c.path) || !nonempty(c.source) || !isAbsolute(c.source)) ||
+      snapshots.some((s) => !snapshotId(s.id) || !nonempty(s.checkout))) throw new Error("invalid OVNFS dependency registry");
+  const parents = new Set(snapshots.map((s) => s.id));
+  if ([...checkouts, ...snapshots].some((row) => row.parent != null && row.parent !== "" && !parents.has(row.parent))) {
+    throw new Error("OVNFS dependency registry contains an unconfirmed parent");
+  }
+  return ls;
+}
+
+export function verifyDeletion(h, w) {
+  const ls = deletionInventory(h, w);
+  if (!same(w.identity, checkoutIdentity(h, w, false, ls))) throw new Error("OVNFS checkout identity does not match registration");
+  const snapshot = ls.snapshots.find((s) => s.checkout === w.identity.name);
+  if (snapshot) throw new Error(`OVNFS snapshot ${snapshot.id} depends on this checkout`);
+  const child = ls.checkouts.find((c) => c.name !== w.identity.name && [w.path, w.identity.git_dir].some((root) => inside(c.source, root)));
+  if (child) throw new Error(`OVNFS checkout ${child.name} depends on this checkout`);
+  // Checked before PP records "removing", so an unsupported daemon leaves the checkout retained rather than unknown.
+  const { features } = admin(h, w.ovnfs.namespace, "status");
+  if (!RM_FEATURES.every((f) => Array.isArray(features) && features.includes(f))) throw new Error("daemon does not support non-force, snapshot-preserving OVNFS removal");
+}
+
+export function removeCheckout(h, w) {
+  // shortcut: the pinned backend has no conditional rm; external writers must stay quiescent until OVNFS freezes the checkout.
+  return admin(h, w.ovnfs.namespace, "rm", { checkout: w.identity.name, sticky_snapshots: true, keep_commits: true });
+}
+
+export function checkoutGone(h, w) {
+  const { checkouts } = deletionInventory(h, w);
+  if (checkouts.some((c) => c.name === w.identity.name || c.path === w.path)) return false;
+  mountCheck(w.ovnfs.namespace);
+  const gone = [w.path, w.identity.git_dir].every((p) => {
+    try { lstatSync(p); return false; }
+    catch (e) { if (e.code === "ENOENT") return true; throw e; }
+  });
+  mountCheck(w.ovnfs.namespace); // ENOENT counts only if the mount was still live afterwards.
+  return gone;
 }
 
 export function requireSameNamespace(a, b) {
