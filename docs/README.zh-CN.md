@@ -34,7 +34,7 @@ node bin/pp.mjs open myproj       # 启动 coordinator 和常驻 ticker
 - 把线程报告拷回 `threads/<id>.md`；
 - 根据状态变化写 inbox 条目：等你处理、新报告、待合并、空闲；
 - 每 120 秒跟进 PR，并触发 `on = "pr"` routine。`pp set <slug> pr_checks false`（看板设置里也能改）关掉 CI 检查：失败的 check 不再写 inbox、不发通知、不触发 `checks-failed` routine，review 和合并照常跟进；
-- 合并后和空闲超过 `auto_resolve_days` 的线程自动 resolve，并按 [cleanup.md](cleanup.md) 清理它的 worktree、声明丢弃的路径和索引。线程所在机器的 Paseo daemon 不答时跳过它：agent 是否还在工作是未知的，不算空闲；
+- 合并后和空闲超过 `auto_resolve_days` 的线程自动 resolve，并按 [cleanup.md](cleanup.md) 检查回收条件。本机托管 Git worktree 只有在独立核对保全证据后才会回收；SSH 托管 worktree 因无法在远端完成同等验证而保留；OVNFS checkout 只接受单独显式删除。只有兼容的历史清理流程才单独清理声明丢弃的路径和已核实移除路径下的 Codebase Memory 索引。线程所在机器的 Paseo daemon 不答时跳过它：agent 是否还在工作是未知的，不算空闲；
 - 运行定时 routine。命令型 routine 需要用户在终端执行 `pp routine approve`；
 - coordinator 空闲 60 秒后，用 `[pp inbox] …` nudge 它。
 

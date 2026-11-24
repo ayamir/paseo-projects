@@ -8,11 +8,16 @@ import { dirname, join } from "node:path";
 const require = createRequire(fileURLToPath(import.meta.resolve("@getpaseo/client")));
 const ws = require("ws");
 const agents = new Map(), archiveAttempts = new Set(), at = new Date().toISOString();
-let creates = 0;
+let creates = 0, projectLists = 0;
 const workspaces = [], pageInfo = { nextCursor: null, prevCursor: null, hasMore: false };
 const projectFile = process.env.FAKE_PASEO_PROJECT;
 const project = () => ({ projectId: "prj_repo", projectRootPath: readFileSync(projectFile, "utf8"), projectDisplayName: "Repo", projectKind: "git" });
 const mode = process.env.FAKE_DAEMON_MODE, wss = new ws.WebSocketServer({ port: 0, host: "127.0.0.1" });
+const fakeAgent = (id, cwd, workspaceId, labels) => ({ id, provider: "claude", cwd, workspaceId: workspaceId ?? "wks_restarted", model: null, createdAt: at, updatedAt: at, lastUserMessageAt: null, status: "idle",
+      capabilities: { supportsStreaming: false, supportsSessionPersistence: false, supportsDynamicModes: false, supportsMcpServers: false, supportsReasoningStream: false, supportsToolInvocations: false },
+      currentModeId: null, availableModes: [], pendingPermissions: [], persistence: null, title: null, labels: labels ?? {} });
+const existingCwd = process.env.FAKE_PASEO_EXISTING_CWD;
+if (existingCwd) agents.set("agent-for-resolve", { ...fakeAgent("agent-for-resolve", existingCwd), archivedAt: at });
 wss.on("listening", () => console.log(wss.address().port));
 wss.on("connection", (s) => s.on("message", (raw) => {
   const m = JSON.parse(String(raw)), send = (message) => s.send(JSON.stringify({ type: "session", message }));
@@ -26,6 +31,7 @@ wss.on("connection", (s) => s.on("message", (raw) => {
     archiveAttempts.add(r.workspaceId);
     return send({ type: "archive_workspace_response", payload: { requestId, workspaceId: r.workspaceId, archivedAt: first ? null : new Date().toISOString(), error: first ? "workspace archive refused" : null } });
   }
+  if (r.type === "project.list.request" && mode === "before-launch" && ++projectLists === 1) return send({ type: "rpc_error", payload: { requestId, requestType: r.type, error: "workspace lookup refused" } });
   if (r.type === "project.list.request") return send({ type: "project.list.response", payload: { requestId, projects: projectFile ? [project()] : [] } });
   if (r.type === "fetch_workspaces_request") return send({ type: "fetch_workspaces_response", payload: { requestId, entries: workspaces, pageInfo } });
   if (r.type === "workspace.create.request") {
@@ -35,18 +41,23 @@ wss.on("connection", (s) => s.on("message", (raw) => {
     workspaces.push(workspace);
     return send({ type: "workspace.create.response", payload: { requestId, workspace, setupTerminalId: null, error: null } });
   }
-  if (r.type === "fetch_agents_request") return send({ type: "fetch_agents_response", payload: { requestId, entries: [], pageInfo } });
+  if (r.type === "fetch_agents_request") {
+    const entries = mode === "lost-launch" ? [...agents.values()].map((agent) => ({ agent, project: {
+      projectKey: "fake", projectName: "Fake", checkout: { cwd: agent.cwd, isGit: true, currentBranch: null, remoteUrl: null, isPaseoOwnedWorktree: false },
+    } })) : [];
+    return send({ type: "fetch_agents_response", payload: { requestId, entries, pageInfo } });
+  }
   if (r.type === "create_agent_request") {
     if (++creates === 1 && mode === "create-retry") return send({ type: "rpc_error", payload: { requestId, requestType: r.type, error: "agent create refused" } });
     const id = "agent-" + (agents.size + 1), { branch, newBranch, base } = r.worktree ?? {};
     const cwd = r.worktree ? join(dirname(r.config.cwd), newBranch || "wt") : r.config.cwd;
     if (r.worktree) execFileSync("git", ["-C", r.config.cwd, "worktree", "add", "-q", ...(newBranch ? ["-b", newBranch, cwd, base || "HEAD"] : [cwd, branch])], { stdio: "ignore" });
     else if (r.workspaceId && !workspaces.some((w) => w.id === r.workspaceId && w.workspaceDirectory === cwd)) throw new Error("agent placed outside the directory workspace");
-    const agent = { id, provider: "claude", cwd, workspaceId: r.workspaceId ?? "wks_restarted", model: null, createdAt: at, updatedAt: at, lastUserMessageAt: null, status: "idle",
-      capabilities: { supportsStreaming: false, supportsSessionPersistence: false, supportsDynamicModes: false, supportsMcpServers: false, supportsReasoningStream: false, supportsToolInvocations: false },
-      currentModeId: null, availableModes: [], pendingPermissions: [], persistence: null, title: null, labels: r.labels ?? {} };
+    const agent = fakeAgent(id, cwd, r.workspaceId, r.labels);
+    if (mode === "error-first" && creates === 1) agent.status = "error";
     agents.set(id, agent);
     if (process.env.FAKE_PASEO_AGENTS) appendFileSync(process.env.FAKE_PASEO_AGENTS, JSON.stringify({ id, cwd }) + "\n");
+    if (mode === "lost-launch") return send({ type: "rpc_error", payload: { requestId, requestType: r.type, error: "agent create result lost" } });
     return send({ type: "status", payload: { status: "agent_created", requestId, agentId: id, agent } });
   }
   if (r.type === "fetch_agent_request") return send({ type: "fetch_agent_response", payload: { requestId, agent: agents.get(r.agentId) ?? null, error: null } });

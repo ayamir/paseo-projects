@@ -46,7 +46,7 @@ const keepsOf = (t, decl) => decl.keep.map((k) => canon(isAbsolute(k.path) ? k.p
  * Whether a declared path is the thread's to delete (see the rule at the top). `keeps`: the real paths it
  * declared kept; `removedBefore`: the targets an earlier run removed, the only proof a missing path was its.
  */
-export function checkDiscard(t, e, { keeps = [], removedBefore = new Set() } = {}) {
+export function checkDiscard(t, e, { keeps = [], removedBefore = new Set(), remaining } = {}) {
   const abs = isAbsolute(e.path) ? e.path : resolvePath(t.thread_dir, e.path);
   const item = { kind: "discard", target: canon(abs), why: e.why };
   if (t.machine) return { ...item, status: "kept", reason: "declared paths on another machine are not cleaned from here" };
@@ -64,12 +64,12 @@ export function checkDiscard(t, e, { keeps = [], removedBefore = new Set() } = {
   const td = canon(t.thread_dir);
   if (inside(td, real)) return { ...item, target: real, status: "kept", reason: "contains this thread folder" };
   if (real.split("/").includes(".paseo-project") && !inside(real, td)) return { ...item, target: real, status: "kept", reason: "is or is in another thread folder" };
-  const holds = sh(["find", real, "-name", ".paseo-project", "-print", "-quit"]);
+  const holds = sh(["find", real, "-name", ".paseo-project", "-print", "-quit"], undefined, undefined, { timeout: remaining?.() });
   if (!holds.ok || holds.stdout.trim()) return { ...item, target: real, status: "kept", reason: holds.ok ? `holds a thread folder: ${holds.stdout.trim()}` : `could not be searched for thread folders: ${holds.out}` };
   const k = keeps.find((x) => inside(x, real) || inside(real, x));
   if (k) return { ...item, target: real, status: "kept", reason: `overlaps the declared keep ${k}` };
   if (inOwn && (t.kind === "worktree" || t.kind === "ovnfs")) {
-    const tracked = sh(["git", "--literal-pathspecs", "-C", own, "ls-files", "--", real]);
+    const tracked = sh(["git", "--literal-pathspecs", "-C", own, "ls-files", "--", real], undefined, undefined, { timeout: remaining?.() });
     if (!tracked.ok || tracked.stdout.trim() || (t.kind === "ovnfs" && relative(own, real).split("/").includes(".git"))) {
       return { ...item, target: real, status: "kept", reason: tracked.ok ? "has tracked files or Git metadata" : "could not check for tracked files" };
     }

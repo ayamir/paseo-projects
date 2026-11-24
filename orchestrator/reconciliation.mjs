@@ -10,31 +10,32 @@ export const branchIdentityBlocker = (t) => t.kind === "worktree" && t.branch &&
   ? `PP has no recorded branch identity; the branch and its reflog are not eligible for removal; ${preserveUnmanagedGit}` : "";
 const real = (p) => { try { return realpathSync(p); } catch { return p; } };
 
-function ownership(project) {
+export function* ownershipRecords(project, visit) {
   const dirs = (parent) => readdirSync(parent, { withFileTypes: true }).filter((e) => e.isDirectory() || e.isSymbolicLink()).map((e) => join(parent, e.name));
   const trash = join(project.root, ".trash");
   const trashStat = lstatSync(trash, { throwIfNoEntry: false });
   if (trashStat && !trashStat.isDirectory()) throw new Error("trash folder is not a directory");
   const projects = [...dirs(project.root).filter((p) => p !== trash), ...(trashStat ? dirs(trash) : [])];
-  const records = [];
   for (const dir of projects) {
+    visit?.();
     const manifest = lstatSync(join(dir, "PROJECT.md"), { throwIfNoEntry: false });
     if (!manifest) continue;
-    if (!manifest.isFile() || !lstatSync(dir).isDirectory()) throw new Error("project ownership path is not canonical");
+    if (!manifest.isFile() || !lstatSync(dir).isDirectory() || realpathSync(dir) !== dir) throw new Error("project ownership path is not canonical");
     const folder = join(dir, "threads");
     if (!lstatSync(folder).isDirectory()) throw new Error("thread records are not a directory");
     for (const name of readdirSync(folder).filter((n) => /^t-\d{4,}\.json$/.test(n))) {
       const file = join(folder, name);
-      if (!lstatSync(file).isFile()) throw new Error("thread record is not a regular file");
+      const st = lstatSync(file);
+      if (!st.isFile()) throw new Error("thread record is not a regular file");
+      visit?.(st.size);
       const t = JSON.parse(readFileSync(file, "utf8"));
       if (t?.id !== name.slice(0, -5) || (t.working_copies != null && !Array.isArray(t.working_copies)) ||
           [t.working_copy, ...(t.working_copies ?? [])].filter((w) => w !== undefined && w !== null).some((w) => w.owner !== t.id || typeof w.nonce !== "string")) {
         throw new Error("thread ownership records are incomplete");
       }
-      records.push({ dir, t });
+      yield { dir, t };
     }
   }
-  return records;
 }
 
 // A legacy Git record predates PP generation markers. Require the old recorded origin
@@ -105,7 +106,7 @@ export function discover(project, threads) {
   const items = [], candidates = new Map(), legacy = threads.filter(isLegacy);
   const problem = (backend, source, blocker, machine = "") => items.push(pending(project, { backend, source, machine }, [blocker]));
   let records;
-  try { records = ownership(project); }
+  try { records = [...ownershipRecords(project)]; }
   catch { problem("unknown", "", "PP ownership records could not be verified; discovery and adoption blocked"); }
 
   const legacyProofs = new Map();

@@ -28,8 +28,8 @@ const identityKeys = ["revision", "candidate", "baseline", "workload"];
 const sameRun = (a, b) => object(a) && object(b) && identityKeys.every((key) => typeof a[key] === "string" && a[key] === b[key]);
 // Reviewed unfiltered Node 26 inventory; Node can report zero skips under --test-name-pattern.
 const fullSuite = {
-  "test/cleanup.test.mjs": [91, "41f8183a65b16f7a34bb4182a005933b7da4a47ac5285d56069086a2d6387fcf"],
-  "test/cli.test.mjs": [11, "d3b64d0b1723a66174f729240b9d1bacc871ba7dfbd98731cd918a935e1a7b40"],
+  "test/cleanup.test.mjs": [99, "27372bc798a13ae4b101050546081bd1ddf72c7083b60d23d9c4847c049c6d9c"],
+  "test/cli.test.mjs": [11, "946901a01ced22ae0d96cd2cd7c0c7d0b014bbb6b72ef8cd9e6f43f231e3f047"],
   "test/logic.test.mjs": [19, "571fd0496806d9900a54254f0a06e93a50529b145e8d9bfc03b8f347147022bf"],
   "test/ovnfs-tooling.test.mjs": [4, "6b389acab042826009ab017e708a250892e9215c62ed06770d56616645bda6ed"],
 };

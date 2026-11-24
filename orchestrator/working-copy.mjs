@@ -59,13 +59,17 @@ export function adoptedGitIdentity({ path, source, branch }) {
   return { git_dir, directory, registration, link, repository };
 }
 
-// Plain `git worktree remove` drops this registration's HEAD log. Check both sides of
-// every entry (including the oldest predecessor), and discount only shared, retained refs.
-export function linkedHeadReflogBlocker(path, identity) {
+function reflogEntry(line) {
+  const [meta, action = ""] = line.split("\t", 2);
+  const match = /^(\S+) (\S+) .+ (-?\d+) [+-]\d{4}$/.exec(meta);
+  if (!match || !commitOid.test(match[1]) || !commitOid.test(match[2])) throw new Error("invalid Git reflog entry");
+  return [match[1], match[2], action, BigInt(match[3])];
+}
+
+export function reflogTips(log, size) {
   try {
-    const log = join(identity.git_dir, "logs", "HEAD"), id = birthId(log, false);
+    const id = birthId(log, false);
     const fd = openSync(log, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-    let input;
     try {
       const before = fstatSync(fd, { bigint: true });
       if (!before.isFile() || `${before.dev}:${before.ino}:${before.birthtimeNs}` !== id || before.size <= 0n || before.size > 1024n * 1024n) throw new Error();
@@ -79,17 +83,25 @@ export function linkedHeadReflogBlocker(path, identity) {
       const after = fstatSync(fd, { bigint: true });
       if (after.size !== before.size || after.mtimeNs !== before.mtimeNs || after.ctimeNs !== before.ctimeNs || birthId(log, false) !== id || bytes.at(-1) !== 10) throw new Error();
       const tips = new Set();
-      const size = readGit(path, "rev-parse", "--show-object-format") === "sha256" ? 64 : 40;
       for (const line of bytes.toString("utf8").slice(0, -1).split("\n")) {
-        const [old, next] = line.split(" ", 2);
+        const [old, next] = reflogEntry(line);
         for (const oid of [old, next]) {
           if (!commitOid.test(oid) || oid.length !== size) throw new Error();
           if (!/^0+$/.test(oid)) tips.add(oid);
         }
       }
       if (!tips.size) throw new Error();
-      input = [...tips].join("\n") + "\n";
+      return [...tips];
     } finally { closeSync(fd); }
+  } catch (e) { throw new Error(`Git reflog could not be verified: ${log}`, { cause: e }); }
+}
+
+// Plain `git worktree remove` drops this registration's HEAD log. Check both sides of
+// every entry (including the oldest predecessor), and discount only shared, retained refs.
+export function linkedHeadReflogBlocker(path, identity) {
+  try {
+    const size = readGit(path, "rev-parse", "--show-object-format") === "sha256" ? 64 : 40;
+    const input = reflogTips(join(identity.git_dir, "logs", "HEAD"), size).join("\n") + "\n";
     const privateCommit = readGitWithInput(path, ["rev-list", "--max-count=1", "--single-worktree", "--not",
       "--exclude=refs/bisect/*", "--exclude=refs/rewritten/*", "--exclude=refs/worktree/*", "--glob=refs/*", "--not", "--stdin"], input);
     return privateCommit ? "the linked worktree HEAD reflog contains commits not reachable from any retained ref; preserve the work independently before retrying" : "";
@@ -105,11 +117,8 @@ function reflogPrefix(log, count) {
     const lines = buf.toString("utf8", 0, readSync(fd, buf, 0, buf.length, 0)).split("\n");
     if (lines.length <= count) throw new Error();
     return lines.slice(0, count).map((line) => {
-      const [meta, action = ""] = line.split("\t", 2);
-      const [old, next] = meta.split(" ", 2);
-      const stamp = / (\d+) [+-]\d{4}$/.exec(meta);
-      if (!commitOid.test(old) || !commitOid.test(next) || !stamp) throw new Error();
-      return { old, next, action, stamp: BigInt(stamp[1]) };
+      const [old, next, action, stamp] = reflogEntry(line);
+      return { old, next, action, stamp };
     });
   } finally { closeSync(fd); }
 }

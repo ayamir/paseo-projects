@@ -7,6 +7,7 @@ import { sh, sha256 } from "./lib.mjs";
 import * as gitCopy from "./working-copy.mjs";
 import * as ovnfs from "./managed-ovnfs.mjs";
 import { checkDiscard } from "./cleanup.mjs";
+import { ownershipRecords } from "./reconciliation.mjs";
 
 const oid = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 const inside = (p, root) => p === root || p.startsWith(root + "/");
@@ -15,39 +16,44 @@ function stat(path) {
   try { return lstatSync(path); }
   catch (e) { if (e.code === "ENOENT") return null; throw e; }
 }
-function git(cwd, args, what, env) {
-  const r = sh(["git", "--no-replace-objects", ...args], cwd, undefined, { timeout: 120_000, env });
+// A recurring status check can defer unusually large repositories to an explicit command.
+function statusBudget() {
+  const deadline = Date.now() + 5_000;
+  let entries = 10_000, bytes = 32 * 1024 * 1024;
+  const timeout = () => {
+    const ms = deadline - Date.now();
+    if (ms <= 0) fail("deletion status check exceeded its budget; inspect with thread cleanup");
+    return ms;
+  };
+  return { timeout, visit(size = 0) {
+    if (--entries < 0 || (bytes -= size) < 0) fail("deletion status check exceeded its budget; inspect with thread cleanup");
+    timeout();
+  } };
+}
+function git(cwd, args, what, env, budget) {
+  const r = sh(["git", "--no-replace-objects", ...args], cwd, undefined, { timeout: budget?.timeout() ?? 120_000, env });
   if (!r.ok || r.stderr) fail(`${what}: ${r.out}`);
   return r.stdout;
 }
-function checkDependencies(project, t, w) {
-  const directories = (p) => readdirSync(p, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => join(p, e.name));
+function checkDependencies(project, t, w, budget) {
   const targets = w.backend === "ovnfs" ? [w.path, w.identity.git_dir] : [w.path];
   const overlaps = (p) => typeof p === "string" && isAbsolute(p) && targets.some((path) => inside(resolve(p), path) || Boolean(stat(p) && inside(realpathSync(p), path)));
   try {
-    const trash = project.path("..", ".trash");
-    const projects = [...directories(project.root), ...(stat(trash) ? directories(trash) : [])];
     let found = false;
-    for (const dir of projects) {
-      if (!stat(join(dir, "PROJECT.md"))) continue;
-      const threads = join(dir, "threads");
-      for (const name of readdirSync(threads).filter((n) => /^t-\d{4,}\.json$/.test(n))) {
-        const file = join(threads, name);
-        const other = JSON.parse(readFileSync(file, "utf8"));
-        if (other?.id !== name.slice(0, -5) || (other.working_copies != null && !Array.isArray(other.working_copies))) fail(`invalid thread record ${file}`);
-        if (!other.working_copy && other.machine === w.machine && [other.cwd, other.repo].some(overlaps)) fail(`${other.id} uses this worktree`);
-        for (const r of [...(other.working_copy ? [other.working_copy] : []), ...(other.working_copies ?? [])]) {
-          if (!r || r.owner !== other.id || typeof r.nonce !== "string" || typeof r.machine !== "string") fail(`invalid resource record ${file}`);
-          if (dir === project.dir && other.id === t.id && r.nonce === w.nonce) {
-            if (found || r.path !== w.path) fail(`ambiguous worktree registration ${file}`);
-            found = true;
-            continue;
-          }
-          if (r.phase === "removed" && r.disposal?.phase === "removed") continue;
-          const deps = r.depends_on ?? (r.backend === "git-worktree" ? [] : null);
-          if (!Array.isArray(deps) || deps.some((id) => typeof id !== "string")) fail(`unconfirmed dependencies in ${file}`);
-          if (deps.includes(w.nonce) || (r.machine === w.machine && [r.path, r.source].some(overlaps))) fail(`${other.id} resource ${r.nonce} depends on this worktree`);
+    for (const { dir, t: other } of ownershipRecords(project, budget?.visit)) {
+      const file = join(dir, "threads", `${other.id}.json`);
+      if (!other.working_copy && other.machine === w.machine && [other.cwd, other.repo].some(overlaps)) fail(`${other.id} uses this worktree`);
+      for (const r of [...(other.working_copy ? [other.working_copy] : []), ...(other.working_copies ?? [])]) {
+        if (!r || r.owner !== other.id || typeof r.nonce !== "string" || typeof r.machine !== "string") fail(`invalid resource record ${file}`);
+        if (dir === project.dir && other.id === t.id && r.nonce === w.nonce) {
+          if (found || r.path !== w.path) fail(`ambiguous worktree registration ${file}`);
+          found = true;
+          continue;
         }
+        if (r.phase === "removed" && r.disposal?.phase === "removed") continue;
+        const deps = r.depends_on ?? (r.backend === "git-worktree" ? [] : null);
+        if (!Array.isArray(deps) || deps.some((id) => typeof id !== "string")) fail(`unconfirmed dependencies in ${file}`);
+        if (deps.includes(w.nonce) || (r.machine === w.machine && [r.path, r.source].some(overlaps))) fail(`${other.id} resource ${r.nonce} depends on this worktree`);
       }
     }
     if (!found || overlaps(w.source) || overlaps(project.root)) fail("worktree registration, source or independent evidence location cannot be confirmed");
@@ -70,11 +76,12 @@ function backendGone(w, manifest) {
   return !listing.split("\0").includes(`worktree ${w.path}`);
 }
 
-function checkOccupancy(...paths) {
-  const r = spawnSync("lsof", ["-nP", "-F0pn"], { encoding: "utf8", timeout: 60_000, maxBuffer: 32 * 1024 * 1024 });
+function checkOccupancy(paths, budget) {
+  const r = spawnSync("lsof", ["-nP", "-F0pn"], { encoding: "utf8", timeout: budget?.timeout() ?? 60_000, maxBuffer: 32 * 1024 * 1024 });
   if (r.status !== 0 || r.error || r.stderr || !r.stdout?.endsWith("\0\n")) fail("occupancy probe failed");
   let pid = "", files = 0;
   for (const record of r.stdout.slice(0, -2).split("\0\n")) {
+    budget?.timeout();
     const [field, name, extra] = record.split("\0");
     if (/^p[1-9]\d*$/.test(field) && name === undefined) pid = field.slice(1);
     else if (pid && /^f.+/.test(field) && name?.startsWith("n") && extra === undefined) {
@@ -85,17 +92,21 @@ function checkOccupancy(...paths) {
   if (!files) fail("occupancy probe returned no file records");
 }
 
-function declaration(project, t, w) {
+function declaration(project, t, w, budget) {
   const td = [w.thread_dir, t.thread_dir].find((dir) => typeof dir === "string" && dir !== w.path && inside(dir, w.path)) ?? null;
   const decl = td ? join(td, "cleanup.json") : null;
   const st = decl && stat(decl);
   if (!st) {
     const previous = project.path("threads", `${t.id}.cleanup.json`);
-    const recorded = t.working_copy?.nonce === w.nonce && stat(previous) ? JSON.parse(readFileSync(previous, "utf8")).declaration : null;
+    const saved = t.working_copy?.nonce === w.nonce && stat(previous);
+    if (saved && (!saved.isFile() || realpathSync(previous) !== previous)) fail("unsafe previous cleanup record");
+    if (saved) budget?.visit(saved.size);
+    const recorded = saved ? JSON.parse(readFileSync(previous, "utf8")).declaration : null;
     if (recorded?.error || (recorded?.keep != null && !Array.isArray(recorded.keep))) fail("previous path keeps could not be confirmed");
     return { td, decl, d: {}, keep: w.disposal?.path_keep || Boolean(recorded?.keep?.length) };
   }
   if (!st.isFile() || realpathSync(decl) !== decl) fail("unsafe cleanup.json path");
+  budget?.visit(st.size);
   const d = JSON.parse(readFileSync(decl, "utf8"));
   if (!d || typeof d !== "object" || Array.isArray(d)) fail("cleanup.json must be an object");
   if (d.keep != null && (!Array.isArray(d.keep) || d.keep.some((e) => typeof e?.path !== "string" || !e.path.trim()))) fail("invalid cleanup.json keep declaration");
@@ -107,7 +118,7 @@ const ovnfsGitEnv = {
   GIT_OPTIONAL_LOCKS: "0", GIT_NO_LAZY_FETCH: "1", GIT_ALLOW_PROTOCOL: "file",
   GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null",
 };
-function checkPrivateGit(w) {
+function checkPrivateGit(w, budget) {
   const { git_dir: root, initial_oid: initial, base } = w.identity;
   if (!oid.test(initial) || !/^[a-zA-Z0-9_-]+$/.test(base)) fail("invalid OVNFS commit or base identity");
   const objects = join(w.ovnfs.namespace.state, "bases", base, "objects");
@@ -116,7 +127,7 @@ function checkPrivateGit(w) {
   }
   const regular = new Set(["HEAD", "ORIG_HEAD", "FETCH_HEAD", "COMMIT_EDITMSG", "config", "index", "packed-refs", "pp-working-copy", "info/exclude"]);
   const ref = new RegExp(`^(?:[a-f0-9]{${initial.length}}|ref: refs/[^\\r\\n]+)\\n?$`);
-  const log = new RegExp(`^[a-f0-9]{${initial.length}} [a-f0-9]{${initial.length}} .+ -?\\d+ [+-]\\d{4}(?:\\t.*)?$`);
+  const tips = [];
   const dev = lstatSync(root).dev;
   function walk(dir) {
     for (const raw of readdirSync(dir, { encoding: "buffer" })) {
@@ -124,25 +135,32 @@ function checkPrivateGit(w) {
       if (!raw.equals(Buffer.from(name))) fail("cannot inspect non-UTF-8 name in OVNFS private Git directory");
       if (rel === "objects") continue;
       const st = lstatSync(full);
+      budget?.visit(st.size);
       if (st.dev === dev) {
         if (st.isDirectory() && /^(?:refs(?:\/(?!replace(?:\/|$)).+)?|logs(?:\/refs(?:\/.+)?)?|info)$/.test(rel)) { walk(full); continue; }
-        if (st.isFile() && (regular.has(rel) || (rel.startsWith("refs/") && ref.test(readFileSync(full, "utf8"))) ||
-            ((rel === "logs/HEAD" || rel.startsWith("logs/refs/")) && readFileSync(full, "utf8").trimEnd().split("\n").every((line) => log.test(line))))) continue;
+        if (st.isFile()) {
+          if (regular.has(rel) || (rel.startsWith("refs/") && ref.test(readFileSync(full, "utf8")))) continue;
+          if (rel === "logs/HEAD" || rel.startsWith("logs/refs/")) {
+            for (const tip of gitCopy.reflogTips(full, initial.length)) tips.push(tip);
+            continue;
+          }
+        }
       }
       fail(`unclassified OVNFS private Git entry: ${rel}`);
     }
   }
   walk(root);
-  const keys = git(root, ["config", "--file", join(root, "config"), "--no-includes", "--name-only", "--null", "--list"], "cannot inspect OVNFS private Git config", ovnfsGitEnv).split("\0").filter(Boolean);
+  const keys = git(root, ["config", "--file", join(root, "config"), "--no-includes", "--name-only", "--null", "--list"], "cannot inspect OVNFS private Git config", ovnfsGitEnv, budget).split("\0").filter(Boolean);
   if (keys.some((key) => !/^(?:core\.(?:repositoryformatversion|filemode|bare|logallrefupdates|ignorecase|precomposeunicode|checkstat|trustctime|untrackedcache|fsmonitor)|extensions\.objectformat|ovnfs\.checkout)$/.test(key))) {
     fail("unsupported OVNFS private Git configuration");
   }
+  return tips;
 }
 
-function inspect(t, w, { td, decl, d }) {
+function inspect(t, w, { td, decl, d }, budget) {
   const path = w.path, ovn = w.backend === "ovnfs";
-  if (ovn) checkPrivateGit(w);
-  const run = (args, what) => git(path, args, what, ovn ? ovnfsGitEnv : undefined);
+  const privateTips = ovn ? checkPrivateGit(w, budget) : [];
+  const run = (args, what) => git(path, args, what, ovn ? ovnfsGitEnv : undefined, budget);
   const lines = (s) => s.trim().split("\n").filter(Boolean);
   const head = run(["rev-parse", "--verify", "HEAD^{commit}"], "cannot inspect HEAD").trim();
   const baseline = ovn ? w.identity.initial_oid : w.baseline;
@@ -151,8 +169,9 @@ function inspect(t, w, { td, decl, d }) {
   if (!Array.isArray(commits) || commits.some((c) => typeof c !== "string" || !oid.test(c))) fail("cleanup.json commits must be full commit IDs");
   if (stat(join(w.identity.git_dir, "modules"))) fail("worktree Git metadata contains submodule repositories");
   const branch = `refs/heads/${w.branch}`;
-  const tips = ovn ? lines(run(["rev-list", "--all", "--reflog", "--no-walk=unsorted"], "cannot inspect OVNFS private refs and reflogs"))
-    : ["HEAD", branch].flatMap((ref) => lines(run(["reflog", "show", "--format=%H", ref], `cannot inspect ${ref} reflog`)));
+  const tips = ovn ? [...privateTips, ...lines(run(["rev-list", "--all", "--no-walk=unsorted"], "cannot inspect OVNFS private refs"))]
+    : [join(w.identity.git_dir, "logs", "HEAD"), join(dirname(dirname(w.identity.git_dir)), "logs", branch)]
+      .flatMap((log) => gitCopy.reflogTips(log, head.length));
   const refs = ovn ? lines(run(["fsck", "--unreachable", "--no-progress"], "cannot inspect OVNFS unreachable objects")).filter((r) => r.startsWith("unreachable commit ")).map((r) => r.slice(19))
     : lines(run(["for-each-ref", "--format=%(objectname)", "refs/bisect", "refs/worktree", "refs/rewritten", branch], "cannot inspect worktree refs"));
   const candidates = [...new Set([head, ...tips, ...refs])];
@@ -172,10 +191,11 @@ function inspect(t, w, { td, decl, d }) {
     const entries = d[key] ?? [];
     if (!Array.isArray(entries) || entries.some((e) => typeof e?.path !== "string" || !e.path.trim())) fail(`invalid cleanup.json ${key} declaration`);
     return entries.map((entry) => {
+      budget?.visit();
       const p = resolve(td, entry.path);
       if (!scope(p) || realpathSync(p) !== p) fail(`unsafe ${key} path: ${entry.path}`);
       if (key === "discard") {
-        const item = checkDiscard({ ...t, cwd: path, thread_dir: td }, entry);
+        const item = checkDiscard({ ...t, cwd: path, thread_dir: td }, entry, { remaining: budget?.timeout });
         if (item.status) fail(`cannot discard ${entry.path}: ${item.reason}`);
         return item;
       }
@@ -199,6 +219,7 @@ function inspect(t, w, { td, decl, d }) {
       const rel = relative(path, full);
       if (rel === ".git") continue;
       const st = lstatSync(full);
+      budget?.visit(st.size);
       if (st.dev !== device || name === ".git") fail(`cannot verify dependencies at ${rel}`);
       const entry = tracked.get(rel);
       if (entry) {
@@ -231,12 +252,15 @@ function inspect(t, w, { td, decl, d }) {
 
 const exclusions = (manifest) => manifest.ignored.map((p) => `/${p.replace(/[\\*?[\] ]/g, "\\$&")}\n`).join("");
 
-function verifyEvidence(e, path, manifest) {
+function verifyEvidence(e, path, manifest, budget) {
   if (e.path !== path || realpathSync(path) !== path || !stat(path)?.isDirectory()) fail("evidence path could not be verified");
   const expected = JSON.stringify(manifest);
   const check = (rel, hash) => {
     const p = join(path, rel);
-    if (!stat(p)?.isFile() || realpathSync(p) !== p || sha256(readFileSync(p)) !== hash) fail(`evidence missing or corrupt: ${rel}`);
+    const st = stat(p);
+    if (!st?.isFile() || realpathSync(p) !== p) fail(`evidence missing or corrupt: ${rel}`);
+    budget?.visit(st.size);
+    if (sha256(readFileSync(p)) !== hash) fail(`evidence missing or corrupt: ${rel}`);
   };
   if (e.manifest !== sha256(expected)) fail("evidence is stale: checkout contents changed");
   check("manifest.json", e.manifest);
@@ -251,29 +275,70 @@ function evidencePath(project, w) {
   return path;
 }
 
-function storedManifest(proof, path, nonce) {
-  if (!proof || proof.path !== path || realpathSync(path) !== path) fail("no verified evidence for interrupted removal");
+function storedManifest(proof, path, nonce, budget) {
+  if (!proof || typeof proof.manifest !== "string" || !/^[a-f0-9]{64}$/.test(proof.manifest) ||
+      ![path, `${path}-${proof.manifest}`].includes(proof.path)) fail("no verified evidence for interrupted removal");
+  path = proof.path;
+  if (realpathSync(path) !== path) fail("evidence path could not be verified");
   const file = join(path, "manifest.json");
-  if (!stat(file)?.isFile() || realpathSync(file) !== file) fail("evidence missing or corrupt: manifest.json");
+  const st = stat(file);
+  if (!st?.isFile() || realpathSync(file) !== file) fail("evidence missing or corrupt: manifest.json");
+  budget?.visit(st.size);
   const text = readFileSync(file, "utf8");
   if (sha256(text) !== proof.manifest) fail("evidence missing or corrupt: manifest.json");
   const manifest = JSON.parse(text);
   if (manifest.nonce !== nonce) fail("evidence belongs to a different resource");
-  verifyEvidence(proof, path, manifest);
+  verifyEvidence(proof, path, manifest, budget);
   return manifest;
 }
 
 function flush(path, recursive = false) {
   if (recursive && lstatSync(path).isDirectory()) for (const name of readdirSync(path)) flush(join(path, name), true);
-  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try { fsyncSync(fd); } finally { closeSync(fd); }
 }
 
-function evidence(project, w, manifest) {
-  const path = evidencePath(project, w), root = dirname(path);
+function verifyBundle(w, root, bundle, manifest) {
+  const stage = mkdtempSync(join(root, ".restore-"));
+  try {
+    const run = (cwd, args, what) => git(cwd, args, what, w.backend === "ovnfs" ? ovnfsGitEnv : undefined);
+    const restored = join(stage, "verify.git");
+    run(stage, ["clone", "--quiet", "--mirror", "--", bundle, restored], "could not independently restore commits");
+    if (run(restored, ["rev-parse", "HEAD^{commit}"], "could not verify restored HEAD").trim() !== manifest.head) fail("restored commit does not match worktree HEAD");
+    for (const c of manifest.commits) if (run(restored, ["rev-parse", `refs/heads/saved/${c}^{commit}`], "could not verify restored commit").trim() !== c) fail(`could not verify restored commit ${c}`);
+    if (run(restored, ["rev-parse", "--is-shallow-repository"], "cannot verify restored history").trim() !== "false") fail("restored commits depend on shallow history");
+    run(restored, ["fsck", "--full"], "restored commits are incomplete");
+  } finally { rmSync(stage, { recursive: true, force: true }); }
+}
+
+function evidence(project, w, manifest, previous) {
+  const base = evidencePath(project, w), root = dirname(base);
+  const hash = sha256(JSON.stringify(manifest));
+  if (previous) {
+    storedManifest(previous, base, w.nonce);
+    if (previous.manifest === hash) return previous;
+  }
+  // Never replace a published generation, including proof from an earlier failed attempt.
+  const generation = `${base}-${hash}`;
+  // Recover the original nonce-only layout if it is a candidate for this exact manifest.
+  // An unmatched legacy directory remains untouched and is not used as proof.
+  const legacy = join(base, "manifest.json");
+  const path = !previous && stat(base)?.isDirectory() && realpathSync(base) === base && stat(legacy)?.isFile() && realpathSync(legacy) === legacy && sha256(readFileSync(legacy)) === hash
+    ? base : generation;
   mkdirSync(root, { recursive: true, mode: 0o700 });
   if (realpathSync(root) !== root) fail("evidence directory is a symbolic link");
-  if (stat(path)) fail("evidence exists without a verified record");
+  if (stat(path)) {
+    const bundle = join(path, "commits.bundle");
+    if (!stat(path)?.isDirectory() || realpathSync(path) !== path || !stat(bundle)?.isFile() || realpathSync(bundle) !== bundle) fail("unverified published evidence path");
+    const proof = { path, manifest: hash, bundle: sha256(readFileSync(bundle)) };
+    verifyEvidence(proof, path, manifest);
+    verifyBundle(w, root, bundle, manifest);
+    verifyEvidence(proof, path, manifest);
+    // The staging files were synced before publication; sync the rename before recording it.
+    flush(root);
+    flush(dirname(root));
+    return proof;
+  }
   const stage = mkdtempSync(join(root, ".verify-"));
   try {
     const bundle = join(stage, "commits.bundle");
@@ -283,13 +348,7 @@ function evidence(project, w, manifest) {
     run(source, ["fetch", "--quiet", "--no-tags", "--", w.path, "HEAD:refs/heads/main", ...manifest.commits.map((c) => `${c}:refs/heads/saved/${c}`)], "could not save commits");
     run(source, ["bundle", "create", bundle, "HEAD", "--all"], "could not create commit bundle");
     rmSync(source, { recursive: true });
-    const restored = join(stage, "verify.git");
-    run(stage, ["clone", "--quiet", "--mirror", "--", bundle, restored], "could not independently restore commits");
-    if (run(restored, ["rev-parse", "HEAD^{commit}"], "could not verify restored HEAD").trim() !== manifest.head) fail("restored commit does not match worktree HEAD");
-    for (const c of manifest.commits) if (run(restored, ["rev-parse", `refs/heads/saved/${c}^{commit}`], "could not verify restored commit").trim() !== c) fail(`could not verify restored commit ${c}`);
-    if (run(restored, ["rev-parse", "--is-shallow-repository"], "cannot verify restored history").trim() !== "false") fail("restored commits depend on shallow history");
-    run(restored, ["fsck", "--full"], "restored commits are incomplete");
-    rmSync(restored, { recursive: true });
+    verifyBundle(w, root, bundle, manifest);
     for (const rel of Object.keys(manifest.files)) {
       const dst = join(stage, "files", rel);
       mkdirSync(dirname(dst), { recursive: true, mode: 0o700 });
@@ -301,6 +360,7 @@ function evidence(project, w, manifest) {
     const e = { path, manifest: sha256(text), bundle: sha256(readFileSync(bundle)) };
     verifyEvidence({ ...e, path: stage }, stage, manifest);
     flush(stage, true);
+    if (stat(path)) fail("evidence generation appeared during verification");
     renameSync(stage, path);
     flush(root);
     flush(dirname(root));
@@ -308,14 +368,39 @@ function evidence(project, w, manifest) {
   } finally { rmSync(stage, { recursive: true, force: true }); }
 }
 
-function retainOvnfs(w, { keepWorktree, holdBlocker, dryRun, save }) {
+function inspectOvnfs(project, t, h, w, budget) {
+  ovnfs.verifyDeletion(h, w);
+  checkDependencies(project, t, w, budget);
+  checkOccupancy([w.path, w.identity.git_dir], budget);
+  const declared = declaration(project, t, w, budget);
+  if (declared.keep) fail("explicit path keep applies to this checkout");
+  return inspect(t, w, declared, budget);
+}
+
+function retainOvnfs(project, t, h, w, { keepWorktree, holdBlocker, agentArchived, dryRun, scheduled, save }) {
   const resource = w.resource ?? "main";
   if (w.phase === "removed" && w.disposal?.phase === "removed") return { gone: true, note: `OVNFS ${resource} already removed: ${w.path}` };
   const hold = holdBlocker || (keepWorktree || w.kept_worktree ? "explicit --keep-worktree hold" : "");
   const reason = w.ovnfs.label ? "snapshot retained" : "checkout deletion is explicit-only";
   const disposal = w.disposal ?? {};
-  if (!dryRun && !disposal.phase) save({ phase: "retained", blocker: hold || reason, ...(hold ? { hold_blocker: hold, check_blocker: reason } : {}) });
-  const detail = [...new Set([hold, disposal.blocker, reason].filter(Boolean))].join("; ");
+  const uncertain = ["removing", "unknown"].includes(disposal.phase);
+  let check = reason;
+  if (uncertain) check = disposal.check_blocker || disposal.blocker || "previous OVNFS removal is unconfirmed";
+  else if (!w.ovnfs.label) {
+    try {
+      if (w.phase !== "ready" || !w.identity) fail("working-copy allocation is unconfirmed");
+      if (!agentArchived) fail("agent archive unconfirmed; run thread cleanup explicitly");
+      const budget = scheduled ? statusBudget() : undefined;
+      inspectOvnfs(project, t, h, w, budget);
+      if (disposal.evidence || disposal.phase === "archived") storedManifest(disposal.evidence, evidencePath(project, w), w.nonce, budget);
+    } catch (e) { check = e.message; }
+  }
+  const next = { ...disposal, phase: disposal.phase || "retained", blocker: hold || check };
+  delete next.hold_blocker;
+  delete next.check_blocker;
+  if (hold) Object.assign(next, { hold_blocker: hold, check_blocker: check });
+  if (!dryRun && !uncertain && JSON.stringify(next) !== JSON.stringify(disposal)) save(next);
+  const detail = [...new Set([hold, check, reason].filter(Boolean))].join("; ");
   return { gone: false, note: `OVNFS ${resource} kept: ${w.path || w.identity?.id || w.nonce}: ${detail}` };
 }
 
@@ -331,17 +416,10 @@ export function deleteOvnfsCheckout(project, t, h, w, save) {
       const manifest = storedManifest(proof, path, w.nonce);
       if (manifest.repository !== w.identity.registration || !ovnfs.checkoutGone(h, w)) fail("previous OVNFS removal is unconfirmed; will not send another rm");
     } else {
-      const inspectNow = () => {
-        ovnfs.verifyDeletion(h, w);
-        checkDependencies(project, t, w);
-        checkOccupancy(w.path, w.identity.git_dir);
-        const declared = declaration(project, t, w);
-        if (declared.keep) fail("explicit path keep applies to this checkout");
-        return inspect(t, w, declared);
-      };
+      const inspectNow = () => inspectOvnfs(project, t, h, w);
       const manifest = inspectNow();
-      proof ??= evidence(project, w, manifest);
-      verifyEvidence(proof, path, inspectNow());
+      proof = evidence(project, w, manifest, proof);
+      verifyEvidence(proof, proof.path, inspectNow());
       record("removing");
       phase = "unknown";
       ovnfs.removeCheckout(h, w);
@@ -356,7 +434,7 @@ export function deleteOvnfsCheckout(project, t, h, w, save) {
 }
 
 export function dispose(project, t, h, w, options) {
-  if (w.backend === "ovnfs") return retainOvnfs(w, options);
+  if (w.backend === "ovnfs") return retainOvnfs(project, t, h, w, options);
   const { keepWorktree, agentArchived, dryRun, save, holdBlocker } = options;
   const path = w.path;
   const hold = holdBlocker || ((keepWorktree || w.kept_worktree) ? "explicit --keep-worktree hold" : "");
@@ -392,17 +470,17 @@ export function dispose(project, t, h, w, options) {
     gitCopy.verify(h, w);
     const declared = withoutHold();
     checkDependencies(project, t, w);
-    checkOccupancy(path);
+    checkOccupancy([path]);
     const manifest = inspect(t, w, declared);
-    if (proof) verifyEvidence(proof, evidencePath(project, w), manifest);
+    if (proof) storedManifest(proof, evidencePath(project, w), w.nonce);
     if (hold) return retained("");
     if (dryRun) return { gone: false, note: `worktree would be archived and removed if evidence verifies: ${path}` };
-    proof ??= evidence(project, w, manifest);
+    proof = evidence(project, w, manifest, proof);
     save({ phase: "archived", blocker: "", evidence: proof });
     gitCopy.verify(h, w);
     checkDependencies(project, t, w);
-    checkOccupancy(path);
-    verifyEvidence(proof, evidencePath(project, w), inspect(t, w, withoutHold()));
+    checkOccupancy([path]);
+    verifyEvidence(proof, proof.path, inspect(t, w, withoutHold()));
     save({ phase: "removing", blocker: "", evidence: proof });
     phase = "unknown";
     // Only already classified paths enter the per-command exclude file; Git still rejects dirty and new untracked files.

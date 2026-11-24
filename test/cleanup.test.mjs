@@ -5,7 +5,7 @@ import { once } from "node:events";
 import { setTimeout as delay } from "node:timers/promises";
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -64,9 +64,9 @@ chmodSync(FAKE_OVNFS, 0o755);
 
 const NO_DAEMON = "ws://127.0.0.1:1/ws";
 const FAKE_DAEMON = fileURLToPath(new URL("./fixtures/fake-paseo.mjs", import.meta.url));
-async function fakeDaemon(mode, projectFile = "") {
+async function fakeDaemon(mode, projectFile = "", existingCwd = "") {
   if (mode === "down") return { url: NO_DAEMON, stop: () => {} };
-  const child = spawn(process.execPath, [FAKE_DAEMON], { env: { ...process.env, FAKE_DAEMON_MODE: mode, FAKE_PASEO_PROJECT: projectFile }, stdio: ["ignore", "pipe", "inherit"] });
+  const child = spawn(process.execPath, [FAKE_DAEMON], { env: { ...process.env, FAKE_DAEMON_MODE: mode, FAKE_PASEO_PROJECT: projectFile, FAKE_PASEO_EXISTING_CWD: existingCwd }, stdio: ["ignore", "pipe", "inherit"] });
   const port = await new Promise((ok, no) => { child.stdout.once("data", (d) => ok(String(d).trim())); child.once("exit", () => no(new Error("the fake daemon exited"))); });
   return { url: `ws://127.0.0.1:${port}/ws`, stop: () => child.kill() };
 }
@@ -215,7 +215,7 @@ const server = createServer((client) => {
 server.listen(socket, () => { chmodSync(socket, 0o600); console.log("ready"); });
 `);
 
-async function managedOvnfsFixture(t, mode = "ambiguous-new", daemon = "create-retry") {
+async function managedOvnfsFixture(t, mode = "ambiguous-new", daemon = "before-launch") {
   const projectFile = join(BASE, `managed-ovnfs-project-${n}`);
   const d = await fakeDaemon(daemon, projectFile);
   t.after(d.stop);
@@ -308,7 +308,7 @@ test("managed OVNFS reconciles an ambiguous allocation before Agent start and ne
   assert.ok(f.pp("set", "demo", "working_copy_policy", "ovnfs-preferred").ok);
   const r = f.pp("thread", "start", "demo", "--title", "Policy OVNFS", "--task", "test", "--repo", f.repo, "--profile", "fake");
   assert.equal(r.ok, false, r.out);
-  assert.match(r.out, /agent create refused/);
+  assert.match(r.out, /workspace lookup refused/);
   assert.doesNotMatch(r.out, /fell back/);
   const failed = f.show(f.next);
   assert.equal(failed.working_copy.backend, "ovnfs");
@@ -444,6 +444,55 @@ test("explicit deletion refuses occupied, unclassified and registry-dependent OV
   refused(/checkout external depends on this checkout/);
   assert.deepEqual(f.calls().filter((m) => m.rm || m.drop), []);
   assert.notEqual(f.show(f.next).working_copy.disposal.phase, "unknown");
+});
+
+test("resolved OVNFS status rechecks actionable blockers without sending rm or drop", { skip: process.platform !== "darwin" }, async (t) => {
+  const f = await managedOvnfsFixture(t, "off", "off");
+  assert.ok(f.start().ok);
+  assert.ok(f.pp("thread", "resolve", "demo", f.next).ok);
+  const view = () => f.show(f.next).working_copy.disposal;
+  const { path, nonce } = f.show(f.next).working_copy;
+  const tick = async () => {
+    const r = await tickOnce(f, new Date().toISOString(), {});
+    assert.equal(r.code, 0, r.out);
+  };
+  write(join(f.state, "occupied"), path);
+  await tick();
+  assert.match(view().blocker, /occupied by process 12345/);
+  rmSync(join(f.state, "occupied"));
+  write(join(path, "stray.bin"), "needs classification\n");
+  await tick();
+  assert.match(view().blocker, /unclassified.*stray.bin/);
+  rmSync(join(path, "stray.bin"));
+  write(join(f.state, "discovery"), JSON.stringify({ checkouts: [{ name: "external", path: join(f.mount, "external"), source: path, base: "b", created: new Date().toISOString(), git: true }] }));
+  await tick();
+  assert.match(view().blocker, /checkout external depends on this checkout/);
+  rmSync(join(f.state, "discovery"));
+  await tick();
+  assert.match(view().blocker, /explicit-only/);
+  // A status refresh must flag a missing previously recorded proof, not publish a replacement.
+  const record = f.p.path("threads", `${f.next}.json`), row = JSON.parse(readFileSync(record));
+  row.working_copy.disposal.evidence = { path: f.p.path("disposal-evidence", nonce), manifest: "a".repeat(64), bundle: "b".repeat(64) };
+  write(record, JSON.stringify(row));
+  await tick();
+  assert.match(view().blocker, /evidence.*(?:missing|verified)|ENOENT/);
+  assert.ok(!existsSync(f.p.path("disposal-evidence")));
+  assert.deepEqual(f.calls().filter((m) => m.rm || m.drop), []);
+});
+
+test("explicit OVNFS deletion accepts a ready checkout whose Agent was never dispatched", { skip: process.platform !== "darwin" }, async (t) => {
+  const f = await managedOvnfsFixture(t, "off", "before-launch");
+  const started = f.start();
+  assert.equal(started.ok, false, started.out);
+  assert.match(started.out, /workspace lookup refused/);
+  const row = f.show(f.next);
+  assert.equal(row.agent_id, "");
+  assert.equal(row.working_copy.phase, "ready");
+  assert.ok(f.pp("thread", "resolve", "demo", f.next, "--skip-copy").ok);
+  const deleted = f.pp("thread", "delete-checkout", "demo", f.next);
+  assert.ok(deleted.ok, deleted.out);
+  assert.equal(f.show(f.next).working_copy.disposal.phase, "removed");
+  assert.equal(f.calls().filter((m) => m.rm).length, 1);
 });
 
 test("explicit deletion refuses a backend without non-force snapshot-preserving rm before recording removal", { skip: process.platform !== "darwin" }, async (t) => {
@@ -1339,7 +1388,7 @@ for (const backend of ["git-worktree", "ovnfs"]) test(`managed inputs: ${backend
 });
 
 test("managed inputs: ordinary Git filters still work without a verified cache claim", async (t) => {
-  const f = await managedFixture(t);
+  const f = await managedFixture(t, "error-first");
   write(join(f.repo, ".gitattributes"), "package.json filter=fixture\n");
   git(f.repo, "add", ".gitattributes"); git(f.repo, "commit", "-qm", "normal checkout filter");
   git(f.repo, "config", "filter.fixture.smudge", "sed 's/^{}/DUMMY &/'");
@@ -1400,6 +1449,129 @@ test("managed holds: an agent needs a reason and a valid bound, and cannot relea
   assert.equal(row.working_copy.disposal.phase, "retained");
   assert.match(row.working_copy.disposal.blocker, /hold: debugging/);
   assert.ok(existsSync(row.cwd));
+});
+
+// Kill the CLI immediately after an atomic publication, before its next instruction.
+function interruptRename(f, condition) {
+  const hook = join(f.root, "interrupt.mjs");
+  write(hook, `import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+const rename = fs.renameSync;
+fs.renameSync = (from, to) => {
+  rename(from, to);
+  if (${condition}) process.kill(process.pid, "SIGKILL");
+};
+syncBuiltinESMExports();`);
+  f.env.NODE_OPTIONS = `--import=${pathToFileURL(hook)}`;
+  return () => delete f.env.NODE_OPTIONS;
+}
+
+test("managed worktree: an interrupted creating intent can be resolved without allocating or deleting", async (t) => {
+  const f = await managedFixture(t);
+  const record = f.p.path("threads", `${f.id}.json`);
+  const resume = interruptRename(f, `to === ${JSON.stringify(record)} && JSON.parse(fs.readFileSync(to)).working_copy?.phase === "creating"`);
+  assert.equal(f.start().ok, false);
+  resume();
+  // Emulate waiting for the dead process’s generic project lock to expire.
+  utimesSync(f.p.path(".state", ".lock"), new Date(0), new Date(0));
+  const worktrees = git(f.repo, "worktree", "list", "--porcelain");
+  const planned = f.show().working_copy;
+  assert.equal(planned.phase, "creating");
+  assert.equal(planned.identity, null);
+  assert.ok(!existsSync(planned.path));
+  assert.equal(f.pp("thread", "resolve", "demo", f.id).ok, false);
+  const finished = f.pp("thread", "resolve", "demo", f.id, "--skip-copy");
+  assert.ok(finished.ok, finished.out);
+  assert.match(finished.out, /allocation.*unconfirmed/);
+  const tick = await tickOnce(f, new Date().toISOString(), {});
+  assert.equal(tick.code, 0, tick.out);
+  assert.equal(f.show().status, "resolved");
+  assert.equal(f.show().working_copy.phase, "creating");
+  assert.equal(git(f.repo, "worktree", "list", "--porcelain"), worktrees);
+  assert.ok(!existsSync(planned.path));
+});
+
+test("managed disposal: oldest linked HEAD reflog old OID is retained then restored from the bundle", async (t) => {
+  const f = await managedFixture(t);
+  assert.ok(f.start().ok);
+  const { cwd, branch, thread_dir: td, working_copy: w } = f.show();
+  git(cwd, "switch", "--detach", "HEAD");
+  git(cwd, "commit", "--allow-empty", "-qm", "detached result");
+  const commit = git(cwd, "rev-parse", "HEAD");
+  git(cwd, "switch", branch);
+  const reflog = join(w.identity.git_dir, "logs", "HEAD");
+  write(reflog, readFileSync(reflog, "utf8").trimEnd().split("\n").at(-1) + "\n");
+  assert.ok(readFileSync(reflog, "utf8").startsWith(`${commit} `));
+  assert.ok(!git(cwd, "reflog", "show", "--format=%H").includes(commit));
+  assert.equal(git(f.repo, "for-each-ref", "--contains", commit), "");
+  const retained = f.pp("thread", "resolve", "demo", f.id);
+  assert.ok(retained.ok, retained.out);
+  assert.ok(existsSync(cwd), retained.out);
+  assert.match(retained.out, new RegExp(`commit ${commit} not declared`));
+  write(join(td, "cleanup.json"), JSON.stringify({ commits: [commit] }));
+  const completeLog = readFileSync(reflog, "utf8");
+  write(reflog, completeLog.trimEnd());
+  const incomplete = f.pp("thread", "cleanup", "demo", f.id);
+  assert.match(incomplete.out, /Git reflog could not be verified/);
+  assert.ok(existsSync(cwd), incomplete.out);
+  write(reflog, completeLog);
+  const removed = f.pp("thread", "cleanup", "demo", f.id);
+  assert.ok(removed.ok, removed.out);
+  assert.ok(!existsSync(cwd), removed.out);
+  const restored = join(f.root, "restored.git");
+  git(f.root, "clone", "--mirror", join(f.show().working_copy.disposal.evidence.path, "commits.bundle"), restored);
+  assert.equal(git(restored, "rev-parse", `refs/heads/saved/${commit}`), commit);
+});
+
+test("managed disposal: verifies already published evidence after interrupted record save", async (t) => {
+  const f = await managedFixture(t);
+  assert.ok(f.start().ok);
+  const { cwd, thread_dir: td } = f.show();
+  write(join(td, "report.md"), "independently verified\n");
+  const resume = interruptRename(f, `String(from).includes("/.verify-") && String(to).includes("/disposal-evidence/")`);
+  assert.equal(f.pp("thread", "resolve", "demo", f.id).ok, false);
+  resume();
+  const root = f.p.path("disposal-evidence");
+  const [name] = readdirSync(root);
+  const evidence = join(root, name), bundle = join(evidence, "commits.bundle");
+  const original = readFileSync(bundle);
+  assert.ok(existsSync(cwd));
+  assert.equal(f.show().working_copy.disposal?.evidence, undefined);
+  write(bundle, "not a bundle\n");
+  const bad = f.pp("thread", "cleanup", "demo", f.id);
+  assert.ok(bad.ok, bad.out);
+  assert.ok(existsSync(cwd), bad.out);
+  assert.equal(f.show().working_copy.disposal.evidence, undefined);
+  write(bundle, original);
+  const retried = f.pp("thread", "cleanup", "demo", f.id);
+  assert.ok(retried.ok, retried.out);
+  assert.ok(!existsSync(cwd), retried.out);
+  assert.equal(f.show().working_copy.disposal.evidence.path, evidence);
+});
+
+test("managed disposal: reconciles a precisely labeled Agent after lost launch acknowledgement", async (t) => {
+  const f = await managedFixture(t, "lost-launch");
+  const started = f.start();
+  assert.equal(started.ok, false, started.out);
+  assert.match(started.out, /agent create result lost/);
+  assert.equal(f.show().agent_id, "");
+  const r = f.pp("thread", "resolve", "demo", f.id, "--skip-copy");
+  assert.ok(r.ok, r.out);
+  assert.match(r.out, /agent archived/);
+  assert.equal(f.show().agent_id, "agent-1");
+  assert.equal(f.show().working_copy.disposal.phase, "removed");
+});
+
+test("managed disposal: an empty Agent lookup does not prove launch never happened", async (t) => {
+  const f = await managedFixture(t, "create-retry");
+  assert.equal(f.start().ok, false);
+  const { cwd } = f.show();
+  const retry = f.pp("thread", "restart", "demo", f.id, "--fresh");
+  assert.equal(retry.ok, false, retry.out);
+  const r = f.pp("thread", "resolve", "demo", f.id, "--skip-copy");
+  assert.ok(r.ok, r.out);
+  assert.match(r.out, /agent archive unconfirmed/);
+  assert.ok(existsSync(cwd));
 });
 
 test("managed disposal: private commits need an explicit declaration, then restore with report and product after removal", async (t) => {
@@ -1506,7 +1678,7 @@ test("managed disposal: recorded path keeps and --keep-worktree survive cleanup 
   assert.match(f.board().working_copy.disposal.blocker, /--keep-worktree hold/);
 });
 
-test("managed disposal: backend failure leaves recoverable evidence and missing, corrupt or stale proof blocks retry", async (t) => {
+test("managed disposal: backend failure retains prior proof and changed contents get a fresh verified generation", async (t) => {
   const f = await managedFixture(t);
   assert.ok(f.start().ok);
   const { cwd, thread_dir: td } = f.show();
@@ -1572,12 +1744,14 @@ process.exit(result.status ?? 1);
   retry(/evidence missing or corrupt: .*report.md/);
   write(saved, "verified report\n");
   write(report, "changed after verification\n");
-  retry(/evidence is stale/);
-  write(report, "verified report\n");
   write(mode, "lost-result");
   const interrupted = retry();
   assert.ok(!existsSync(cwd), interrupted.out);
-  assert.equal(f.show().working_copy.disposal.phase, "unknown");
+  const changed = f.show().working_copy.disposal;
+  assert.equal(changed.phase, "unknown");
+  assert.notEqual(changed.evidence.path, proof.path);
+  assert.equal(readFileSync(saved, "utf8"), "verified report\n");
+  assert.equal(readFileSync(join(changed.evidence.path, "files", relative(cwd, report)), "utf8"), "changed after verification\n");
   const reconciled = retry();
   assert.equal(f.show().working_copy.disposal.phase, "removed", reconciled.out);
 });
@@ -1650,15 +1824,36 @@ exec sh -c "$4"
   assert.deepEqual(f.board().working_copy, after.working_copy);
 });
 
-test("managed worktree: agent creation failure retains a restartable copy and its changes", async (t) => {
-  const f = await managedFixture(t, "create-retry");
+test("managed disposal: fake SSH clean worktree is retained when remote evidence cannot be verified", async (t) => {
+  const f = await managedFixture(t, "off", true);
+  const bin = join(f.root, "bin"), log = join(f.root, "ssh.log");
+  write(join(bin, "ssh"), `#!/bin/sh
+[ "$1" = -o ] && [ "$2" = BatchMode=yes ] && [ "$3" = fake-host ] || exit 1
+printf '%s\\n' "$4" >> ${JSON.stringify(log)}
+exec sh -c "$4"
+`);
+  chmodSync(join(bin, "ssh"), 0o755);
+  f.env.PATH = `${bin}:${f.env.PATH}`;
+  write(f.env.PP_CONFIG, JSON.stringify({ profiles: { fake: { provider: "claude/fake-model" } }, machines: { remote: { url: f.env.PASEO_URL, ssh: "fake-host" } } }));
+  const started = f.start("--machine", "remote");
+  assert.ok(started.ok, started.out);
+  const { cwd } = f.show();
+  const r = f.pp("thread", "resolve", "demo", f.id);
+  assert.ok(r.ok, r.out);
+  assert.ok(existsSync(cwd), r.out);
+  assert.match(r.out, /independent evidence verification for remote worktrees is not supported/);
+  assert.doesNotMatch(readFileSync(log, "utf8"), /worktree remove/);
+});
+
+test("managed worktree: failure before Agent dispatch retains a restartable copy and its changes", async (t) => {
+  const f = await managedFixture(t, "before-launch");
   const started = f.start();
   assert.ok(!started.ok, started.out);
-  assert.match(started.out, /agent create refused/);
+  assert.match(started.out, /workspace lookup refused/);
   const row = f.show();
   assert.equal(row.status, "failed");
   assert.equal(row.working_copy.phase, "ready");
-  assert.equal(f.board().error.includes("agent create refused"), true);
+  assert.equal(f.board().error.includes("workspace lookup refused"), true);
   const worktrees = git(f.repo, "worktree", "list", "--porcelain");
   git(row.cwd, "commit", "--allow-empty", "-qm", "saved progress");
   write(join(row.cwd, "local-progress"), "keep me\n");
@@ -1854,8 +2049,10 @@ test("reconciliation cleanup retains a same-tip replacement branch and its reflo
 });
 
 test("reconciliation lists the retained branch after an adopted worktree is reclaimed", async (t) => {
-  const daemon = await fakeDaemon("off");
   const f = fixture();
+  const daemon = await fakeDaemon("off", "", f.wt);
+  const record = f.p.path("threads", `${f.id}.json`);
+  write(record, JSON.stringify({ ...JSON.parse(readFileSync(record)), agent_id: "agent-for-resolve" }));
   f.env.PASEO_URL = daemon.url;
   t.after(() => { daemon.stop(); rmSync(f.root, { recursive: true, force: true }); });
   const discovery = f.pp("thread", "discover", "demo");
@@ -2332,7 +2529,7 @@ process.exit(r.status || (fs.existsSync(${JSON.stringify(seen)}) ? 42 : 0));
 });
 
 test("managed worktree: missing or substituted checkout blocks execution and cleanup", async (t) => {
-  const f = await managedFixture(t);
+  const f = await managedFixture(t, "error-first");
   const started = f.start();
   assert.ok(started.ok, started.out);
   const row = f.show();

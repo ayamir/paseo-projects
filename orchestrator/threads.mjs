@@ -294,7 +294,7 @@ export function copyHome(project, t, withLibrary = false, exclude = []) {
   let h;
   try {
     h = host(t.machine);
-    if (t.working_copy) verifyWorktree(h, t);
+    if (t.working_copy) verifyWorkingCopy(h, t);
   } catch (e) { return { outcome: "failed", error: e.message, notes: [] }; }
   if (!h.isDir(t.thread_dir)) {
     // Gone before a final copy. Only a complete one recorded for this agent proves the library home whole: a library
@@ -359,19 +359,19 @@ function admitWorkingCopy(project, h, args) {
   }, h, args);
 }
 
-function worktreeRecord(t) {
+function workingCopyRecord(t) {
   const w = t.working_copy;
   if (w.backend !== (t.kind === "ovnfs" ? "ovnfs" : "git-worktree") || w.owner !== t.id || w.source !== t.repo || w.machine !== t.machine || (t.cwd && w.path !== t.cwd)) {
-    throw new Error(`${t.id}'s worktree record does not match its checkout`);
+    throw new Error(`${t.id}'s working-copy record does not match its checkout`);
   }
   return w;
 }
 
-function verifyWorktree(h, t) {
-  const w = worktreeRecord(t);
+function verifyWorkingCopy(h, t) {
+  const w = workingCopyRecord(t);
   if (w.backend === "ovnfs" && ["removing", "unknown"].includes(w.disposal?.phase)) throw new Error("OVNFS checkout removal is unconfirmed");
   const path = copyBackend(w).verify(h, w);
-  if (path !== t.cwd) throw new Error(`${t.id}'s worktree record does not match its checkout`);
+  if (path !== t.cwd) throw new Error(`${t.id}'s working-copy record does not match its checkout`);
   return path;
 }
 
@@ -385,23 +385,23 @@ function stageCache(project, h, w, identity, save) {
   return plan.result;
 }
 
-function reconcileWorktree(project, t, h) {
-  if (worktreeRecord(t).phase === "creating") {
+function reconcileWorkingCopy(project, t, h) {
+  if (workingCopyRecord(t).phase === "creating") {
     let identity;
     try { identity = copyBackend(t.working_copy).recover(h, t.working_copy); }
     catch (e) {
       // Another pass may have recorded the identity and released the creation lock.
       t = load(project, t.id);
-      if (worktreeRecord(t).phase !== "ready") throw e;
+      if (workingCopyRecord(t).phase !== "ready") throw e;
     }
     if (identity) {
-      const w = worktreeRecord(t);
+      const w = workingCopyRecord(t);
       if (w.seed) verifySeed(w, w.path);
       const cache = stageCache(project, h, w, identity, (intent) => {
-        update(project, t.id, (r) => { worktreeRecord(r).cache = intent; });
+        update(project, t.id, (r) => { workingCopyRecord(r).cache = intent; });
       });
       t = update(project, t.id, (r) => {
-        const w = worktreeRecord(r);
+        const w = workingCopyRecord(r);
         if (w.phase !== "creating") return;
         Object.assign(w, { phase: "ready", identity, blocker: "", ...(cache ? { cache } : {}) });
         r.cwd = w.path;
@@ -410,12 +410,12 @@ function reconcileWorktree(project, t, h) {
       });
     }
   }
-  verifyWorktree(h, t);
+  verifyWorkingCopy(h, t);
   copyBackend(t.working_copy).unlockCreation?.(h, t.working_copy);
   return t;
 }
 
-function setWorktreeBlocker(project, t, blocker) {
+function setWorkingCopyBlocker(project, t, blocker) {
   return blocker === t.working_copy.blocker ? t : update(project, t.id, (r) => {
     if (r.working_copy.phase === t.working_copy.phase) r.working_copy.blocker = blocker;
   });
@@ -429,7 +429,7 @@ export function ovnfsResource(project, id, type, name, { base, resource = "main"
     const t = load(project, id), h = host(t.machine);
     if (project.status !== "active" || t.status === "resolved") throw new Error("OVNFS resources require an active project and unresolved thread");
     if (t.kind !== "ovnfs" || t.working_copy?.backend !== "ovnfs") throw new Error("OVNFS resources require a managed OVNFS thread; existing legacy checkouts are not adopted");
-    const all = ovnfsResources(t), main = worktreeRecord(t);
+    const all = ovnfsResources(t), main = workingCopyRecord(t);
     const source = resource === "main" ? main : all.find((w) => w.resource === resource);
     const snapshot = type === "snapshot";
     if (snapshot && (!source || source.owner !== id || source.backend !== "ovnfs" || source.ovnfs.label)) throw new Error(`no owned OVNFS checkout named ${resource}`);
@@ -503,7 +503,7 @@ function reconcileOvnfsResource(project, t, h, w, { start = false } = {}) {
   return w;
 }
 
-function prepareWorktree(project, t, h) {
+function prepareWorkingCopy(project, t, h) {
   if (t.working_copy.backend === "ovnfs") return withLifecycleLock(project, () => prepareCheckout(project, load(project, t.id), h));
   return prepareCheckout(project, t, h);
 }
@@ -520,7 +520,7 @@ function snapshotSource(project, h, ref) {
 }
 
 function prepareInputs(project, t, { recoverSeed = false } = {}) {
-  const w = worktreeRecord(t);
+  const w = workingCopyRecord(t);
   if ((w.seed && !w.seed.oid) || (w.backend === "ovnfs" && !w.ovnfs.from && !w.ovnfs.capture?.oid)) {
     const capture = createCapture(project, w, w.seed ?? w.ovnfs.capture, Boolean(w.seed), { recoverOnly: Boolean(w.seed && recoverSeed) });
     return update(project, t.id, (r) => {
@@ -534,7 +534,7 @@ function prepareInputs(project, t, { recoverSeed = false } = {}) {
 function prepareCheckout(project, t, h) {
   let createError;
   try {
-    if (worktreeRecord(t).phase === "planned") {
+    if (workingCopyRecord(t).phase === "planned") {
       const from = t.working_copy.ovnfs?.from;
       if (from) {
         const s = snapshotSource(project, h, `${from.owner}/${from.resource}`);
@@ -549,7 +549,7 @@ function prepareCheckout(project, t, h) {
       }
       copyBackend(t.working_copy).ensureAvailable?.(h, t.working_copy);
       t = update(project, t.id, (r) => {
-        const w = worktreeRecord(r);
+        const w = workingCopyRecord(r);
         if (w.phase !== "planned") throw new Error(`${r.id}'s worktree creation already started`);
         w.phase = "creating";
         if (w.backend === "ovnfs") w.ovnfs.started_at = now();
@@ -559,11 +559,11 @@ function prepareCheckout(project, t, h) {
         if (created && !created.ok && t.working_copy.backend === "git-worktree") createError = `git worktree add: ${created.out}`;
       } catch (e) { createError = e.message; }
     }
-    t = reconcileWorktree(project, t, h);
-    return setWorktreeBlocker(project, t, "").cwd;
+    t = reconcileWorkingCopy(project, t, h);
+    return setWorkingCopyBlocker(project, t, "").cwd;
   } catch (e) {
     const message = createError ? `${e.message}; ${createError}` : e.message;
-    setWorktreeBlocker(project, load(project, t.id), message);
+    setWorkingCopyBlocker(project, load(project, t.id), message);
     throw new Error(message);
   }
 }
@@ -587,10 +587,10 @@ function checkWorktreeLocked(project, t, at) {
       t = load(project, t.id);
     }
     try {
-      t = reconcileWorktree(project, t, host(t.machine));
-      return setWorktreeBlocker(project, t, "");
+      t = reconcileWorkingCopy(project, t, host(t.machine));
+      return setWorkingCopyBlocker(project, t, "");
     } catch (e) {
-      return setWorktreeBlocker(project, load(project, t.id), e.message);
+      return setWorkingCopyBlocker(project, load(project, t.id), e.message);
     }
   };
   return t.working_copy.backend === "ovnfs" ? withLifecycleLock(project, check) : check();
@@ -630,6 +630,61 @@ export async function tabWorkspace(c, cwd, repo, title, remote = false) {
   if (!p) return null;
   const old = (await c.workspaces.list()).entries.find((w) => w.projectId === p.projectId && pathOf(w.workspaceDirectory) === pathOf(cwd));
   return old ? c.workspaces.ref(old.id) : c.workspaces.create({ source: { kind: "directory", path: cwd, projectId: p.projectId }, title });
+}
+
+const neverDispatchedAgent = (t) => !t.agent_id && t.agent_launch?.state === "unstarted";
+const archivedAgent = (snap) => Number.isFinite(Date.parse(snap?.archivedAt));
+
+function launchLabels(project, t) {
+  return { project: project.slug, role: "thread", thread: t.id };
+}
+
+function beginManagedLaunch(project, t) {
+  const nonce = randomUUID();
+  // Record uncertainty before the RPC. A missing acknowledgement never permits another launch.
+  update(project, t.id, (r) => {
+    r.agent_id = "";
+    r.agent_launch = { state: "dispatched", nonce, project: project.slug };
+  });
+  return { ...launchLabels(project, t), pp_launch: nonce };
+}
+
+function recordManagedAgent(project, id, nonce, agentId, workspaceId) {
+  return update(project, id, (r) => {
+    if (r.agent_launch?.state !== "dispatched" || r.agent_launch.nonce !== nonce || r.agent_id) throw new Error("Agent launch record changed");
+    r.agent_id = agentId;
+    r.agent_launch.state = "confirmed";
+    if (workspaceId) r.workspace_id = workspaceId;
+  });
+}
+
+async function managedAgent(project, t, c, { readOnly = false } = {}) {
+  const launch = t.agent_launch;
+  const labels = { ...launchLabels(project, t), project: launch?.project, pp_launch: launch?.nonce };
+  const matches = (snap) => snap?.cwd === t.cwd && (!launch || Object.entries(labels).every(([k, v]) => snap.labels?.[k] === v));
+  let id = t.agent_id;
+  if (!id) {
+    // An old record without an attempt ID cannot distinguish earlier attempts from an in-flight one.
+    if (launch?.state !== "dispatched" || !launch.nonce || !launch.project || !t.cwd) throw new Error("Agent launch unconfirmed; no exact launch attempt to reconcile");
+    const { entries, pageInfo } = await c.agents.list({ filter: { labels }, page: { limit: 10 } });
+    const candidates = entries.map(({ agent }) => agent).filter(matches);
+    if (pageInfo?.hasMore !== false || candidates.length !== 1) throw new Error("Agent launch unconfirmed; no unique matching Agent");
+    id = candidates[0].id;
+  }
+  const handle = c.agents.ref(id);
+  await handle.refresh();
+  const snap = handle.current();
+  if (snap?.id !== id || !matches(snap)) throw new Error("Agent identity unconfirmed");
+  if (!t.agent_id && !readOnly) t = recordManagedAgent(project, t.id, launch.nonce, id, snap.workspaceId);
+  return { t, handle, snap };
+}
+
+async function archiveManagedAgent({ handle, snap }) {
+  if (archivedAgent(snap)) return;
+  const { archivedAt } = await handle.archive();
+  if (!Number.isFinite(Date.parse(archivedAt))) throw new Error("Paseo did not confirm the archive");
+  await handle.refresh();
+  if (handle.current()?.id !== snap.id || !archivedAgent(handle.current())) throw new Error("Paseo did not confirm the archive of this Agent");
 }
 
 /** `thread start`: places the agent, writes the brief, sends the one-line prompt. */
@@ -706,6 +761,7 @@ async function startLocked(project, a) {
       }
       if (a.inherit_dirty) t.working_copy.seed = capturePlan(project, t.working_copy);
       if (selection) t.working_copy.selection = selection;
+      if (t.working_copy) t.agent_launch = { state: "unstarted" };
     });
   };
   let t = register();
@@ -715,18 +771,20 @@ async function startLocked(project, a) {
     // substitute later source changes for the original intent, even if the daemon was down.
     if (t.working_copy?.seed) t = prepareInputs(project, t);
     const c = await client(h.url);
-    const cwd = t.working_copy ? prepareWorktree(project, t, h) : kind === "tab" ? project.path("threads", t.id) : kind === "ovnfs" ? ovnfsCwd(project, t) : repo;
+    const cwd = t.working_copy ? prepareWorkingCopy(project, t, h) : kind === "tab" ? project.path("threads", t.id) : kind === "ovnfs" ? ovnfsCwd(project, t) : repo;
     if (kind === "tab") mkdirSync(cwd, { recursive: true });
     const ws = kind === "checkout" ? null : await tabWorkspace(c, cwd, repo, t.title, h.remote);
-    if (t.working_copy) verifyWorktree(h, load(project, t.id));
+    if (t.working_copy) verifyWorkingCopy(h, load(project, t.id));
+    const cfg = agentConfig(profile, safety);
+    const labels = t.working_copy ? beginManagedLaunch(project, t) : launchLabels(project, t);
     const handle = await (ws ? ws.agents : c.agents).create({
-      config: agentConfig(profile, safety),
+      config: cfg,
       cwd,
       title: `${project.displayName(settings)} · ${t.id} ${t.title}`.slice(0, 120),
-      labels: { project: project.slug, role: "thread", thread: t.id },
+      labels,
       env: machine ? undefined : { PP_THREAD: `${project.slug}/${t.id}` },
     });
-    if (t.working_copy) update(project, t.id, (r) => { r.agent_id = handle.id; });
+    if (t.working_copy) recordManagedAgent(project, t.id, labels.pp_launch, handle.id, ws?.id);
     await handle.refresh();
     const snap = handle.current();
     const placed = update(project, t.id, (r) => Object.assign(r, {
@@ -734,7 +792,7 @@ async function startLocked(project, a) {
     }));
     if (placed.working_copy) {
       if (snap?.cwd !== cwd) throw new Error(`Paseo did not confirm the agent at its worktree ${cwd}`);
-      verifyWorktree(h, placed);
+      verifyWorkingCopy(h, placed);
     }
     placed.thread_dir = threadDir(placed.cwd, project.slug, t.id);
     update(project, t.id, (r) => { r.thread_dir = placed.thread_dir; });
@@ -795,49 +853,43 @@ export async function restart(project, id, requested, opts) {
 }
 
 async function restartLocked(project, id, requested, opts = {}) {
-  const t = load(project, id);
+  let t = load(project, id);
   if (t.status === "resolved") throw new Error(`${id} is resolved; \`thread resolve --reopen\` first`);
   if (t.status === "starting" && secondsSince(t.launch_started ?? t.created) < STARTING_TIMEOUT_SECS) throw new Error(`${id} is still starting`);
-  const agents = await agentsOf(project, new Set([t.machine]));
-  const managed = Boolean(t.working_copy);
-  if (managed && agents.unreachable?.length) throw new Error(`cannot verify ${id}'s agents: ${agents.error}`);
-  for (const a of agents.values()) {
-    if (a.id !== t.agent_id && (!managed || a.labels?.thread !== id)) continue;
-    const live = liveOf(t, a, null);
-    const interrupted = t.status === "failed" || t.status === "starting";
-    if (live.exists && live.state !== "error" && !(managed && interrupted && live.state === "idle")) {
-      throw new Error(`${id} is running: it has an agent (${live.state}); \`thread prompt\` reaches it`);
-    }
-  }
   const { settings } = project.read();
   const config = loadConfig();
   const safety = loadSafety(config, project.dir);
   const profile = resolveProfile(config, safety, settings, "thread", requested || t.profile, project.slug);
   const h = host(t.machine, config);
   const c = await client(h.url);
+  const managed = Boolean(t.working_copy);
+  const agents = managed ? new Map() : await agentsOf(project, new Set([t.machine]));
+  const prior = managed && !neverDispatchedAgent(t) ? await managedAgent(project, t, c) : null;
+  if (prior) t = prior.t;
+  const live = liveOf(t, prior?.snap ?? agents.get(t.agent_id), null);
+  const interrupted = t.status === "failed" || t.status === "starting";
+  if (live.exists && live.state !== "error" && !(managed && interrupted && live.state === "idle")) {
+    throw new Error(`${id} is running: it has an agent (${live.state}); \`thread prompt\` reaches it`);
+  }
   if (!managed) return restartAt(project, t, h, c, agents, settings, safety, profile, opts);
   update(project, id, (r) => {
     if (r.status !== t.status || r.agent_id !== t.agent_id || r.launch_started !== t.launch_started) throw new Error(`${id} changed during restart; try again`);
     r.status = "starting";
     r.launch_started = now();
   });
-  try { return await restartAt(project, t, h, c, agents, settings, safety, profile, opts); }
+  try { return await restartAt(project, t, h, c, agents, settings, safety, profile, opts, prior); }
   catch (e) {
     update(project, id, (r) => { r.status = "failed"; r.error = e.message; });
     throw e;
   }
 }
 
-async function restartAt(project, t, h, c, agents, settings, safety, profile, opts) {
+async function restartAt(project, t, h, c, agents, settings, safety, profile, opts, prior) {
   const { id } = t;
   let cwd = t.cwd, worktree;
   if (t.working_copy) {
-    cwd = prepareWorktree(project, t, h);
-    for (const a of agents.values()) {
-      if ((a.id !== t.agent_id && a.labels?.thread !== id) || !liveOf(t, a, null).exists) continue;
-      const { archivedAt } = await c.agents.ref(a.id).archive();
-      if (!archivedAt) throw new Error(`Paseo did not confirm archive of agent ${a.id}`);
-    }
+    cwd = prepareWorkingCopy(project, t, h);
+    if (prior) await archiveManagedAgent(prior);
   } else if (t.kind === "ovnfs") {
     requireLocalPaseo();
     cwd = ovnfsCwd(project, t);
@@ -853,19 +905,23 @@ async function restartAt(project, t, h, c, agents, settings, safety, profile, op
   }
   // A session belongs to its folder: a new worktree cannot pick it up.
   if (worktree && opts.session) throw new Error(`${id}'s worktree is gone, so its session cannot be picked up; restart without --session`);
-  const session = worktree ? null : sessionFor(t, agents.get(t.agent_id), kindOf(profile), opts);
+  const session = worktree ? null : sessionFor(t, prior?.snap ?? agents.get(t.agent_id), kindOf(profile), opts);
   const cfg = agentConfig(profile, safety);
   const title = `${project.displayName(settings)} · ${id} ${t.title}`.slice(0, 120);
-  const labels = { project: project.slug, role: "thread", thread: id };
   const ws = t.working_copy || t.kind === "tab" || t.kind === "ovnfs" ? await tabWorkspace(c, cwd, t.repo, t.title, h.remote) : null;
-  if (t.working_copy) verifyWorktree(h, load(project, id));
+  if (t.working_copy) verifyWorkingCopy(h, load(project, id));
+  const labels = t.working_copy ? beginManagedLaunch(project, t) : launchLabels(project, t);
   let handle;
   if (session) {
     // shortcut: an imported agent has no PP_THREAD; the brief's `report` command names the thread anyway.
     try {
       const a = await importSession(h.url, { provider: session.provider, sessionId: session.id, cwd, workspaceId: ws?.id, labels, model: modelOf(profile), modeId: cfg.modeId, title });
       handle = c.agents.ref(a.id);
-    } catch (e) { throw new Error(`${id}: session ${session.id} could not be picked up (${e.message}); \`thread restart ${project.slug} ${id} --fresh\` starts a new one`); }
+    } catch (e) {
+      const next = t.working_copy ? "Agent launch is unconfirmed; another launch requires exact reconciliation"
+        : `\`thread restart ${project.slug} ${id} --fresh\` starts a new one`;
+      throw new Error(`${id}: session ${session.id} could not be picked up (${e.message}); ${next}`);
+    }
   } else {
     handle = await (ws ? ws.agents : c.agents).create({
       config: cfg, cwd, title, labels,
@@ -873,7 +929,7 @@ async function restartAt(project, t, h, c, agents, settings, safety, profile, op
       ...(worktree ? { worktree } : {}),
     });
   }
-  if (t.working_copy) update(project, id, (r) => { r.agent_id = handle.id; });
+  if (t.working_copy) recordManagedAgent(project, id, labels.pp_launch, handle.id, ws?.id);
   await handle.refresh();
   const snap = handle.current();
   const placed = update(project, id, (r) => Object.assign(r, {
@@ -883,7 +939,7 @@ async function restartAt(project, t, h, c, agents, settings, safety, profile, op
   }));
   if (placed.working_copy) {
     if (snap?.cwd !== cwd) throw new Error(`Paseo did not confirm the agent at its worktree ${cwd}`);
-    verifyWorktree(h, placed);
+    verifyWorkingCopy(h, placed);
   }
   placed.thread_dir = threadDir(placed.cwd, project.slug, id);
   update(project, id, (r) => { r.thread_dir = placed.thread_dir; });
@@ -914,7 +970,7 @@ export async function prompt(project, id, text) {
   const { handle, snap } = await handleOf(project, t);
   if (t.working_copy) {
     if (snap.cwd !== t.cwd) throw new Error(`Paseo did not confirm the agent at its worktree ${t.cwd}`);
-    verifyWorktree(host(t.machine), t);
+    verifyWorkingCopy(host(t.machine), t);
   }
   if (snap.pendingPermissions?.length) throw new Error(`${id} is blocked on a permission request: \`thread permissions ${project.slug} ${id}\` shows it; answer it first`);
   appendFollowUp(project, id, text);
@@ -967,7 +1023,7 @@ export async function answer(project, id, { behavior, request, action, message, 
   const { handle, snap } = await handleOf(project, t);
   if (t.working_copy && behavior === "allow") {
     if (snap.cwd !== t.cwd) throw new Error(`Paseo did not confirm the agent at its worktree ${t.cwd}`);
-    verifyWorktree(host(t.machine), t);
+    verifyWorkingCopy(host(t.machine), t);
   }
   const pending = snap.pendingPermissions ?? [];
   if (!pending.length) throw new Error(`${id} has no pending permission request`);
@@ -999,7 +1055,7 @@ export function refreshBranch(project, t) {
   if (!hasBranchCheckout(t) || !t.cwd) return t;
   try {
     const h = host(t.machine);
-    if (t.working_copy) verifyWorktree(h, t);
+    if (t.working_copy) verifyWorkingCopy(h, t);
     const r = h.shell("git branch --show-current", t.cwd, undefined, 5000);
     const b = r.ok ? r.stdout.trim() : "";
     if (b && b !== t.branch) return update(project, t.id, (x) => { x.branch = b; });
@@ -1200,7 +1256,7 @@ export function deleteCheckout(project, id, resource = "main") {
     const t = load(project, id);
     if (t.status !== "resolved") throw new Error(`${id} is not resolved`);
     if (t.kind !== "ovnfs" || t.working_copy?.backend !== "ovnfs") throw new Error("checkout deletion requires a managed OVNFS thread, not a legacy or external checkout");
-    const matches = resource === "main" ? [worktreeRecord(t)] : (t.working_copies ?? []).filter((w) => w.resource === resource);
+    const matches = resource === "main" ? [workingCopyRecord(t)] : (t.working_copies ?? []).filter((w) => w.resource === resource);
     const [w] = matches;
     if (matches.length !== 1 || w.owner !== id || w.machine !== t.machine || w.backend !== "ovnfs" || !w.ovnfs || w.ovnfs.label) {
       throw new Error(`no exact owned OVNFS checkout named ${resource}; snapshots are not deletable`);
@@ -1212,14 +1268,17 @@ export function deleteCheckout(project, id, resource = "main") {
     const h = host(t.machine);
     if (h.remote) throw new Error("checkout deletion requires a local OVNFS checkout");
     requireLocalPaseo();
-    if (!t.agent_id) throw new Error("agent archive unconfirmed");
-    const c = await client(h.url), agent = c.agents.ref(t.agent_id);
-    await agent.refresh();
-    const snap = agent.current();
-    if (snap?.id !== t.agent_id || !Number.isFinite(Date.parse(snap.archivedAt))) throw new Error("agent archive unconfirmed");
+    let archived = t;
+    if (!neverDispatchedAgent(t)) {
+      const prior = await managedAgent(project, t, await client(h.url)).catch((e) => {
+        throw new Error(`agent archive unconfirmed: ${e.message}`);
+      });
+      if (!archivedAgent(prior.snap)) throw new Error("agent archive unconfirmed");
+      archived = prior.t;
+    }
     return deleteOvnfsCheckout(project, t, h, w, (disposal) => update(project, id, (r) => {
       const current = resourcesOf(r).find((row) => row.nonce === w.nonce);
-      if (r.status !== "resolved" || current?.path !== w.path || r.agent_id !== t.agent_id || holdBlocker(project, r, current)) {
+      if (r.status !== "resolved" || current?.path !== w.path || r.agent_id !== archived.agent_id || r.agent_launch?.state !== archived.agent_launch?.state || holdBlocker(project, r, current)) {
         throw new Error("thread, resource or hold changed during deletion");
       }
       current.disposal = disposal;
@@ -1228,7 +1287,11 @@ export function deleteCheckout(project, id, resource = "main") {
   });
 }
 
-async function clean(project, t, { keepWorktree = false, copyComplete = true, archive, mergedHead = "", dryRun = false } = {}) {
+const unconfirmedAllocation = (w) => w && !w.identity && ["planned", "creating"].includes(w.phase);
+const allocationBlocker = "working-copy allocation is unconfirmed; retained without copying or deleting";
+
+async function clean(project, t, { keepWorktree = false, copyComplete = true, archive, mergedHead = "", dryRun = false, scheduled = false } = {}) {
+  if (unconfirmedAllocation(t.working_copy)) return [allocationBlocker];
   const notes = [];
   let h;
   try { h = host(t.machine); }
@@ -1243,15 +1306,25 @@ async function clean(project, t, { keepWorktree = false, copyComplete = true, ar
     try { ovnfs.mounted(t); }
     catch { return (await cleanup.run(project, t, h, { archive, dryRun })).notes; }
   }
-  let agentArchived = !t.agent_id || dryRun;
-  if (t.agent_id && !dryRun) {
+  const managed = Boolean(t.working_copy);
+  const readOnlyOvnfs = managed && t.kind === "ovnfs" && scheduled;
+  let agentArchived = dryRun || (managed ? neverDispatchedAgent(t) : !t.agent_id);
+  if (!agentArchived) {
     try {
       if (t.kind === "ovnfs") requireLocalPaseo();
       const c = await client(h.url);
-      const { archivedAt } = await c.agents.ref(t.agent_id).archive();
-      if (!archivedAt) throw new Error("Paseo did not confirm the archive");
+      if (managed) {
+        const prior = await managedAgent(project, t, c, { readOnly: readOnlyOvnfs });
+        t = prior.t;
+        if (readOnlyOvnfs) {
+          if (!archivedAgent(prior.snap)) throw new Error("agent archive unconfirmed; run thread cleanup explicitly");
+        } else await archiveManagedAgent(prior);
+      } else {
+        const { archivedAt } = await c.agents.ref(t.agent_id).archive();
+        if (!archivedAt) throw new Error("Paseo did not confirm the archive");
+      }
       agentArchived = true;
-      notes.push("agent archived");
+      if (!readOnlyOvnfs) notes.push("agent archived");
     } catch (e) {
       notes.push(`agent not archived: ${e.message}`);
     }
@@ -1264,12 +1337,12 @@ async function clean(project, t, { keepWorktree = false, copyComplete = true, ar
   let done;
   try {
     if (t.working_copy) {
-      const resources = [worktreeRecord(t), ...(t.working_copies ?? [])];
+      const resources = [workingCopyRecord(t), ...(t.working_copies ?? [])];
       const results = resources.map((w, i) => {
         try {
           const hold = holdBlocker(project, t, w);
-          const result = dispose(project, t, h, w, { keepWorktree, agentArchived, dryRun, holdBlocker: hold, save: (disposal) => update(project, t.id, (r) => {
-            const current = i === 0 ? worktreeRecord(r) : r.working_copies?.[i - 1];
+          const result = dispose(project, t, h, w, { keepWorktree, agentArchived, dryRun, scheduled, holdBlocker: hold, save: (disposal) => update(project, t.id, (r) => {
+            const current = i === 0 ? workingCopyRecord(r) : r.working_copies?.[i - 1];
             if (r.status !== "resolved" || current?.nonce !== w.nonce || current.path !== w.path) throw new Error("thread or resource changed during disposal");
             if (disposal.phase === "removing" && holdBlocker(project, r, current)) throw new Error("resource still has a hold");
             current.disposal = disposal;
@@ -1280,11 +1353,11 @@ async function clean(project, t, { keepWorktree = false, copyComplete = true, ar
             const disposal = (i === 0 ? r.working_copy : r.working_copies?.[i - 1])?.disposal;
             const reason = disposal?.check_blocker ?? disposal?.blocker;
             if (w.backend !== "ovnfs" && reason && reason !== hold) cleanupException(project, t, w, reason);
-            if (hold.includes("hold is unknown;")) cleanupException(project, t, w, hold);
+            if (w.backend !== "ovnfs" && hold.includes("hold is unknown;")) cleanupException(project, t, w, hold);
           }
           return result;
         } catch (e) {
-          if (!dryRun) cleanupException(project, t, w, e.message);
+          if (!dryRun && w.backend !== "ovnfs") cleanupException(project, t, w, e.message);
           return { gone: false, note: `resource cleanup failed: ${e.message}` };
         }
       });
@@ -1347,12 +1420,14 @@ export async function resolve(project, id, options) {
 async function resolveLocked(project, id, { keepWorktree = false, force = false, skipCopy = false, reason = "user", mergedHead = "", why } = {}) {
   let t = load(project, id);
   if (t.status === "resolved") throw new Error(`${id} is already resolved; \`thread cleanup ${project.slug} ${id}\` cleans what is left of it`);
+  const resolveWithoutCheckout = unconfirmedAllocation(t.working_copy) && reason === "user" && skipCopy;
   if (t.working_copy) {
     if (keepWorktree) requirePerson("thread resolve --keep-worktree");
-    verifyWorktree(host(t.machine), t);
+    if (resolveWithoutCheckout) workingCopyRecord(t);
+    else verifyWorkingCopy(host(t.machine), t);
   }
   const retainLegacy = reason !== "user" && isLegacy(t);
-  if (!isLegacy(t)) t = refreshBranch(project, t);
+  if (!isLegacy(t) && !resolveWithoutCheckout) t = refreshBranch(project, t);
   let copied = { outcome: "complete", notes: [] };
   if (!skipCopy && !retainLegacy) {
     copied = finalCopy(project, t);
@@ -1362,8 +1437,9 @@ async function resolveLocked(project, id, { keepWorktree = false, force = false,
     r.status = "resolved"; r.resolved_reason = reason;
     if (keepWorktree || (!resourcesOf(r).length && !isLegacy(r))) r.kept_worktree = keepWorktree;
     if (copied.hash) r.report_hash = copied.hash;
+    if (resolveWithoutCheckout) r.working_copy.disposal = { phase: "retained", blocker: allocationBlocker };
   });
-  const notes = retainLegacy ? ["legacy resource retained pending confirmation; background resolution does not clean it"] :
+  const notes = resolveWithoutCheckout ? [allocationBlocker] : retainLegacy ? ["legacy resource retained pending confirmation; background resolution does not clean it"] :
     [...copied.notes, ...(await clean(project, resolved, { keepWorktree: keepWorktree || (isLegacy(resolved) && legacyHold(resolved)), copyComplete: copied.outcome === "complete" || force, archive: skipCopy ? { outcome: "skipped" } : copied, mergedHead }))];
   inbox.write(project, "thread-state", id, "resolved", `${id} "${t.title}" ${why ?? "was resolved"}: ${notes.join("; ")}`);
   return notes;
@@ -1380,7 +1456,7 @@ function finalCopy(project, t) {
     catch (e) { return { outcome: "failed", notes: [], error: e.message }; }
   }
   if (t.working_copy) {
-    try { verifyWorktree(host(t.machine), t); }
+    try { verifyWorkingCopy(host(t.machine), t); }
     catch (e) { return { outcome: "failed", notes: [], error: e.message }; }
   }
   let excludes = [];
@@ -1405,7 +1481,7 @@ async function cleanupLocked(project, id, { dryRun = false, scheduled = false } 
     notes.push(...copied.notes, ...(copied.error ? [`the copy home failed: ${copied.error}`] : []));
   } else if (dryRun) notes.push("preview: assumes the final copy completes");
   const mergedHead = t.kind === "ovnfs" && t.resolved_reason === "merged" && t.pr_summary?.state === "MERGED" ? t.pr_summary.head_oid : "";
-  return [...notes, ...(await clean(project, t, { keepWorktree: t.status === "resolved" && legacyHold(t), copyComplete: !copied || copied.outcome === "complete", archive: copied, mergedHead, dryRun }))];
+  return [...notes, ...(await clean(project, t, { keepWorktree: t.status === "resolved" && legacyHold(t), copyComplete: !copied || copied.outcome === "complete", archive: copied, mergedHead, dryRun, scheduled }))];
 }
 
 export function reopen(project, id) {
