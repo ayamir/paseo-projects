@@ -135,6 +135,7 @@ const socket = join(state, "admin.sock"), checkouts = [], snapshots = [];
 const meta = { version: 5, proto: "nfs", port: 0, mount, state };
 const git = (...args) => execFileSync("git", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 const contents = new Map();
+let hideDerived;
 const checkIntent = (where, value) => {
   const dir = readFileSync(join(state, "intent"), "utf8");
   const intents = readdirSync(dir).filter((n) => /^t-[0-9]+\\.json$/.test(n)).flatMap((n) => {
@@ -159,7 +160,8 @@ const server = createServer((client) => {
       else if (m.ls) {
         const discovery = join(state, "discovery");
         const extra = existsSync(discovery) ? JSON.parse(readFileSync(discovery, "utf8")) : {};
-        ok({ checkouts: [...checkouts, ...(extra.checkouts ?? [])], snapshots: [...snapshots, ...(extra.snapshots ?? [])] });
+        ok({ checkouts: [...checkouts.filter((c) => c.name !== hideDerived), ...(extra.checkouts ?? [])], snapshots: [...snapshots, ...(extra.snapshots ?? [])] });
+        hideDerived = undefined;
       }
       else if (m.new) {
         const { name, snapshot } = m.new, path = join(mount, name), gd = join(state, "git", name);
@@ -178,6 +180,7 @@ const server = createServer((client) => {
         if (input) for (const f of readdirSync(input.disk)) cpSync(join(input.disk, f), join(path, f), { recursive: true });
         git("-C", path, "config", "ovnfs.checkout", name);
         renameSync(join(path, ".git"), gd);
+        if (input) writeFileSync(join(gd, "pp-working-copy"), input.generation);
         writeFileSync(join(path, ".git"), "gitdir: " + gd + "\\n");
         const c = { name, path, source: dir, base: input?.base ?? "base-capture-" + (checkouts.length + 1), parent: snapshot, created: new Date().toISOString(), git: true };
         const objects = join(state, "bases", c.base, "objects");
@@ -185,6 +188,7 @@ const server = createServer((client) => {
         else rmSync(join(gd, "objects"), { recursive: true });
         symlinkSync(objects, join(gd, "objects"));
         checkouts.push(c);
+        if (input && behavior === "interrupted-derived") hideDerived = name;
         if (behavior === "ambiguous-new") client.destroy(); else ok({ checkout: c });
       } else if (m.snap) {
         const { checkout, label } = m.snap, c = checkouts.find((c) => c.name === checkout);
@@ -194,7 +198,8 @@ const server = createServer((client) => {
         const row = { id, checkout, label, created: new Date().toISOString(), parent: snapshots.filter((s) => s.checkout === checkout).at(-1)?.id ?? c.parent };
         mkdirSync(disk);
         for (const f of readdirSync(c.path).filter((n) => n !== ".git")) cpSync(join(c.path, f), join(disk, f), { recursive: true });
-        contents.set(id, { disk, source: c.source, base: c.base, rev: git("-C", c.path, "rev-parse", "HEAD") });
+        const generation = readFileSync(join(state, "git", c.name, "pp-working-copy"));
+        contents.set(id, { disk, source: c.source, base: c.base, generation, rev: git("-C", c.path, "rev-parse", "HEAD") });
         snapshots.push(row);
         if (behavior !== "pending-snap") row.tree = "tree-" + id;
         else setTimeout(() => { row.tree = "tree-" + id; }, 1500);
@@ -338,6 +343,54 @@ test("managed OVNFS reconciles an ambiguous allocation before Agent start and ne
   assert.equal(git(f.repo, "branch", "--list", failed.branch), "");
 });
 
+test("managed OVNFS restarts and explicitly deletes a checkout after only its saved NFS device changes", { skip: process.platform !== "darwin" }, async (t) => {
+  const f = await managedOvnfsFixture(t, "off", "off");
+  assert.ok(f.start().ok);
+  const resolve = (...args) => f.pp("thread", "resolve", "demo", f.next, ...args);
+  assert.ok(resolve().ok);
+  assert.ok(resolve("--reopen").ok);
+  const path = f.p.path("threads", `${f.next}.json`);
+  const record = JSON.parse(readFileSync(path, "utf8")), w = record.working_copy;
+  const old = w.identity;
+  const [device, inode] = old.directory.split(":");
+  const remounted = `${BigInt(device) + 1n}:${inode}`;
+  const restart = () => f.pp("thread", "restart", "demo", f.next, "--fresh");
+  const setIdentity = (identity) => {
+    const current = JSON.parse(readFileSync(path, "utf8"));
+    current.working_copy.identity = { ...old, ...identity };
+    write(path, JSON.stringify(current));
+  };
+  for (const identity of [{ directory: `${device}:${BigInt(inode) + 1n}` }, { directory: remounted, registration: "0:1" }, { directory: remounted, created: "2025-01-01T00:00:00.000Z" }]) {
+    setIdentity(identity);
+    const refused = restart();
+    assert.equal(refused.ok, false, refused.out);
+    assert.match(refused.out, /checkout identity does not match/);
+    assert.equal(f.show(f.next).agent_id, record.agent_id);
+  }
+  setIdentity({ directory: remounted });
+  const mark = join(w.identity.git_dir, "pp-working-copy");
+  const generation = readFileSync(mark, "utf8");
+  rmSync(mark);
+  const missingMarker = restart();
+  assert.equal(missingMarker.ok, false, missingMarker.out);
+  assert.match(missingMarker.out, /checkout generation does not match/);
+  assert.equal(f.show(f.next).agent_id, record.agent_id);
+  assert.equal(existsSync(mark), false);
+  write(mark, generation);
+  const retry = restart();
+  assert.ok(retry.ok, retry.out);
+  const after = f.show(f.next);
+  assert.equal(after.cwd, w.path);
+  assert.equal(after.working_copy.nonce, w.nonce);
+  assert.equal(after.agent_id, "agent-2");
+  assert.equal(f.calls().filter((m) => m.new).length, 1);
+  assert.ok(resolve().ok);
+  const deleted = f.pp("thread", "delete-checkout", "demo", f.next);
+  assert.ok(deleted.ok, deleted.out);
+  assert.equal(f.show(f.next).working_copy.phase, "removed");
+  assert.equal(f.calls().filter((m) => m.rm).length, 1);
+});
+
 test("managed preflight: resource and space pressure refuse additions without disturbing a held OVNFS checkout", { skip: process.platform !== "darwin" }, async (t) => {
   const f = await managedOvnfsFixture(t, "off", "off");
   assert.ok(f.start().ok);
@@ -394,6 +447,53 @@ test("managed OVNFS registers an experiment and snapshots its own checkout befor
   const board = f.pp("board", "thread", "demo", f.next);
   assert.ok(board.ok, board.out);
   assert.equal(JSON.parse(board.out).working_copies.find((w) => w.resource === "save").identity.id, snapshot.identity.id);
+});
+
+test("managed OVNFS recovers one interrupted derived allocation and refuses any other generation", { skip: process.platform !== "darwin" }, async (t) => {
+  const f = await managedOvnfsFixture(t, "interrupted-derived", "off");
+  assert.ok(f.start().ok);
+  assert.ok(f.pp("thread", "snapshot", "demo", f.next, "--name", "save").ok);
+  const parent = f.show(f.next).working_copy;
+  const failed = f.start("--from-snapshot", `${f.next}/save`);
+  assert.equal(failed.ok, false, failed.out);
+  assert.match(failed.out, /checkout identity could not be confirmed/);
+  const id = `t-${Number(f.next.slice(2)) + 1}`;
+  const before = f.show(id);
+  assert.equal(before.agent_id, "");
+  assert.equal(before.working_copy.phase, "creating");
+  const { path, nonce, ovnfs } = before.working_copy;
+  const mark = join(f.state, "git", ovnfs.name, "pp-working-copy");
+  const inherited = readFileSync(mark, "utf8");
+  const restart = () => f.pp("thread", "restart", "demo", id, "--fresh");
+  for (const invalid of [`${randomUUID()}\n${parent.identity.initial_oid}\n`, `${parent.nonce}\n${"0".repeat(40)}\n`, null]) {
+    if (invalid === null) rmSync(mark);
+    else write(mark, invalid);
+    const refused = restart();
+    assert.equal(refused.ok, false, refused.out);
+    assert.match(refused.out, /checkout generation does not match/);
+    assert.equal(existsSync(mark) ? readFileSync(mark, "utf8") : null, invalid);
+    assert.equal(f.show(id).agent_id, "");
+  }
+  write(mark, inherited);
+  git(path, "branch", before.branch);
+  const branchCollision = restart();
+  assert.equal(branchCollision.ok, false, branchCollision.out);
+  assert.match(branchCollision.out, /already exists/);
+  assert.equal(f.show(id).working_copy.phase, "creating");
+  assert.equal(f.show(id).agent_id, "");
+  assert.equal(readFileSync(mark, "utf8"), `${nonce}\n${parent.identity.initial_oid}\n`);
+  git(path, "branch", "-m", before.branch, "retained-fixture-ref");
+  const recovered = restart();
+  assert.ok(recovered.ok, recovered.out);
+  const after = f.show(id);
+  assert.equal(after.cwd, path);
+  assert.equal(after.working_copy.nonce, nonce);
+  assert.equal(after.working_copy.phase, "ready");
+  assert.equal(readFileSync(mark, "utf8"), `${nonce}\n${after.working_copy.identity.initial_oid}\n`);
+  assert.equal(readFileSync(join(parent.identity.git_dir, "pp-working-copy"), "utf8"), inherited);
+  assert.equal(f.calls().filter((m) => m.new).length, 2);
+  assert.equal(after.agent_id, "agent-2");
+  assert.match(restart().out, /it has an agent/);
 });
 
 test("OVNFS auto-resolve, ticker cleanup, manual cleanup and sweep never delete checkouts or snapshots", { skip: process.platform !== "darwin" }, async (t) => {

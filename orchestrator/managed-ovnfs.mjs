@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { dirname, isAbsolute, join } from "node:path";
-import { lstatSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { closeSync, constants, fstatSync, linkSync, lstatSync, openSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { sh } from "./lib.mjs";
 import { preservationTarget, verifyCapture } from "./copy-inputs.mjs";
@@ -11,6 +11,13 @@ const PIN = "v0.8.0";
 const ADMIN = fileURLToPath(new URL("./ovnfs-admin.mjs", import.meta.url));
 const same = (a, b) => a && b && Object.keys(a).length === Object.keys(b).length && Object.entries(a).every(([key, val]) => b[key] === val);
 const fileId = (path) => { const s = lstatSync(path, { bigint: true }); return `${s.dev}:${s.ino}`; };
+const inode = (id) => /^-?\d+:(\d+)$/.exec(id)?.[1];
+const oidPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+function sameCheckout(saved, observed) {
+  // Darwin assigns a new device number on remount of the same verified NFS export.
+  const savedInode = inode(saved.directory);
+  return savedInode && same({ ...saved, directory: savedInode }, { ...observed, directory: inode(observed.directory) });
+}
 const nonempty = (s) => typeof s === "string" && s.length > 0;
 const stamp = (s) => nonempty(s) && Number.isFinite(Date.parse(s));
 const inside = (p, root) => p === root || p.startsWith(root + "/");
@@ -147,7 +154,31 @@ function git(cwd, ...args) {
   return r.stdout.trim();
 }
 
-function checkoutIdentity(h, w, creating = false, ls) {
+function readGeneration(path) {
+  let fd;
+  try { fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); }
+  catch (e) { if (e.code === "ENOENT") return null; throw e; }
+  try {
+    const s = fstatSync(fd);
+    if (!s.isFile() || s.size > 36 + 64 + 2) throw new Error(`invalid OVNFS checkout generation marker at ${path}`);
+    return readFileSync(fd, "utf8");
+  } finally { closeSync(fd); }
+}
+
+function publishGeneration(mark, expected, previous) {
+  // Stage outside the private Git directory so an interrupted publish leaves no file for snapshots to copy.
+  const staged = join(dirname(dirname(mark)), `.pp-generation-${randomUUID()}`);
+  writeFileSync(staged, expected, { flag: "wx", mode: 0o600, flush: true });
+  try {
+    if (previous === null) linkSync(staged, mark);
+    else {
+      if (readGeneration(mark) !== previous) throw new Error(`OVNFS checkout generation changed at ${mark}`);
+      renameSync(staged, mark);
+    }
+  } finally { rmSync(staged, { force: true }); }
+}
+
+function checkoutIdentity(h, w, { creating = false, ls, sourceOfSnapshot } = {}) {
   const { namespace: ns, name, from, started_at } = w.ovnfs;
   if (name !== `pp-${w.nonce}` || w.path !== join(ns.mount, name) || !stamp(started_at)) throw new Error("OVNFS checkout intent does not match its name/path");
   ls ??= registry(h, ns);
@@ -167,21 +198,31 @@ function checkoutIdentity(h, w, creating = false, ls) {
     throw new Error(`OVNFS private Git identity does not match at ${w.path}`);
   }
   const mark = join(gd, "pp-working-copy");
-  const identity = { name, base: c.base, created: c.created, parent: c.parent ?? "", git_dir: gd, directory: fileId(w.path), registration: fileId(gd) };
-  if (creating) {
-    const oid = git(w.path, "rev-parse", "--verify", "HEAD^{commit}");
-    if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(oid) || (!from && oid !== (w.seed?.oid ?? w.baseline))) throw new Error(`OVNFS checkout does not match its baseline at ${w.path}`);
-    try { writeFileSync(mark, `${w.nonce}\n${oid}\n`, { flag: "wx", mode: 0o600 }); } catch (e) { if (e.code !== "EEXIST") throw e; }
-    identity.initial_oid = oid;
-  } else identity.initial_oid = w.identity?.initial_oid;
-  if (!lstatSync(mark).isFile() || readFileSync(mark, "utf8") !== `${w.nonce}\n${identity.initial_oid}\n`) throw new Error(`OVNFS checkout generation does not match at ${w.path}`);
+  const directory = fileId(w.path);
+  if (directory.split(":")[0] !== fileId(ns.mount).split(":")[0]) throw new Error(`OVNFS checkout is not on its registered mount at ${w.path}`);
+  const oid = creating ? git(w.path, "rev-parse", "--verify", "HEAD^{commit}") : w.identity?.initial_oid;
+  if (!oidPattern.test(oid) || (creating && !from && oid !== (w.seed?.oid ?? w.baseline))) throw new Error(`OVNFS checkout does not match its baseline at ${w.path}`);
+  const identity = { name, base: c.base, created: c.created, parent: c.parent ?? "", git_dir: gd, directory, registration: fileId(gd), initial_oid: oid };
+  const expected = `${w.nonce}\n${oid}\n`;
+  const previous = readGeneration(mark);
+  if (previous !== expected) {
+    if (!creating) throw new Error(`OVNFS checkout generation does not match at ${w.path}`);
+    // OVNFS v0.8.0 restores the source checkout's private Git files from the snapshot.
+    const source = from && sourceOfSnapshot?.();
+    const inherited = source && same(source.ovnfs.namespace, ns) && nonempty(source.identity.git_dir) && dirname(source.identity.git_dir) === dirname(gd) &&
+      source.identity.git_dir !== gd && inode(source.identity.registration) && source.identity.registration !== identity.registration &&
+      oidPattern.test(source.identity.initial_oid) && previous === `${source.nonce}\n${source.identity.initial_oid}\n`;
+    if (from ? !inherited : previous !== null) throw new Error(`OVNFS checkout generation does not match at ${w.path}`);
+    publishGeneration(mark, expected, previous);
+    if (readGeneration(mark) !== expected) throw new Error(`OVNFS checkout generation does not match at ${w.path}`);
+  }
   if (creating && git(w.path, "branch", "--show-current") !== w.branch) git(w.path, "-c", "core.hooksPath=/dev/null", "switch", "-c", w.branch);
   return identity;
 }
 
-export function recover(h, w) {
+export function recover(h, w, sourceOfSnapshot) {
   const { namespace: ns, label, from, started_at, parents } = w.ovnfs;
-  if (!label) return checkoutIdentity(h, w, true);
+  if (!label) return checkoutIdentity(h, w, { creating: true, sourceOfSnapshot });
   const s = snapshotRow(registry(h, ns).snapshots, { label, checkout: from.checkout, id: w.identity?.id });
   if (label !== `pp-${w.nonce}` || !stamp(started_at) || Date.parse(s.created) < Date.parse(started_at) || !parents?.includes(s.parent) ||
       (w.identity && !same(w.identity, { ...s, tree: w.identity.tree || "" }))) throw new Error("OVNFS snapshot does not match its original capture intent");
@@ -191,7 +232,7 @@ export function recover(h, w) {
 export function verify(h, w) {
   if (w.phase !== "ready" || !w.identity) throw new Error("OVNFS resource identity is not confirmed");
   if (w.ovnfs.label) verifySnapshot(registry(h, w.ovnfs.namespace).snapshots, w.identity);
-  else if (!same(w.identity, checkoutIdentity(h, w))) throw new Error(`OVNFS checkout identity does not match at ${w.path}`);
+  else if (!sameCheckout(w.identity, checkoutIdentity(h, w))) throw new Error(`OVNFS checkout identity does not match at ${w.path}`);
   return w.path;
 }
 
@@ -218,7 +259,7 @@ function deletionInventory(h, w) {
 
 export function verifyDeletion(h, w) {
   const ls = deletionInventory(h, w);
-  if (!same(w.identity, checkoutIdentity(h, w, false, ls))) throw new Error("OVNFS checkout identity does not match registration");
+  if (!sameCheckout(w.identity, checkoutIdentity(h, w, { ls }))) throw new Error("OVNFS checkout identity does not match registration");
   const snapshot = ls.snapshots.find((s) => s.checkout === w.identity.name);
   if (snapshot) throw new Error(`OVNFS snapshot ${snapshot.id} depends on this checkout`);
   const child = ls.checkouts.find((c) => c.name !== w.identity.name && [w.path, w.identity.git_dir].some((root) => inside(c.source, root)));

@@ -388,8 +388,10 @@ function stageCache(project, h, w, identity, save) {
 function reconcileWorkingCopy(project, t, h) {
   if (workingCopyRecord(t).phase === "creating") {
     let identity;
-    try { identity = copyBackend(t.working_copy).recover(h, t.working_copy); }
-    catch (e) {
+    try {
+      const w = t.working_copy;
+      identity = w.backend === "ovnfs" ? managedOvnfs.recover(h, w, () => snapshotCheckout(project, w)) : workingCopy.recover(h, w);
+    } catch (e) {
       // Another pass may have recorded the identity and released the creation lock.
       t = load(project, t.id);
       if (workingCopyRecord(t).phase !== "ready") throw e;
@@ -517,6 +519,17 @@ function snapshotSource(project, h, ref) {
   if (rows.length !== 1 || w.owner !== owner.id || w.backend !== "ovnfs" || !w.ovnfs.label) throw new Error(`no managed OVNFS snapshot ${ref}`);
   managedOvnfs.verify(h, w);
   return w;
+}
+
+function snapshotCheckout(project, w) {
+  const { owner, resource, snapshot, base } = w.ovnfs.from;
+  const rows = ovnfsResources(load(project, owner)).filter((r) => r.owner === owner && r.backend === "ovnfs" && r.phase === "ready");
+  const snapshots = rows.filter((r) => r.resource === resource && r.nonce === w.depends_on[0] && r.ovnfs.label === snapshot.label &&
+    r.ovnfs.from?.checkout === snapshot.checkout && r.ovnfs.from?.base === base && r.identity?.id === snapshot.id && r.identity.tree === snapshot.tree);
+  if (snapshots.length !== 1) return null;
+  const sources = rows.filter((r) => r.nonce === snapshots[0].depends_on[0] && !r.ovnfs.label && r.source === w.source &&
+    r.identity?.name === snapshot.checkout && snapshot.checkout === `pp-${r.nonce}` && r.identity.base === base);
+  return sources.length === 1 ? sources[0] : null;
 }
 
 function prepareInputs(project, t, { recoverSeed = false } = {}) {

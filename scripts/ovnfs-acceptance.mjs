@@ -109,6 +109,8 @@ export async function accept(f) {
         experiment = (await f.show(main.id)).working_copies.find((w) => w.resource === "scratch");
         await checkoutIdentity(f, experiment);
         check(experiment.identity.git_dir !== main.working_copy.identity.git_dir && await f.git(experiment.path, "rev-parse", "HEAD") === baseline, "experiment Git state shares identity or has incorrect baseline");
+        await f.git(experiment.path, "commit", "--allow-empty", "-qm", "experiment commit");
+        const experimentHead = await f.git(experiment.path, "rev-parse", "HEAD");
         await write(f, join(experiment.path, "input.txt"), "frozen edit\n");
         await f.proveMount();
         await f.cli("thread", "snapshot", "fixture", main.id, "--name", "save", "--resource", "scratch");
@@ -127,6 +129,10 @@ export async function accept(f) {
         child = await f.show(launchResult.id);
         const w = child.working_copy, row = await checkoutIdentity(f, w);
         check(launchResult.agent.cwd === w.path && w.owner === child.id && w.depends_on[0] === snapshot.nonce && row.parent === snapshot.identity.id, "cross-thread derivative lost snapshot lineage or cwd");
+        check(w.identity.git_dir !== experiment.identity.git_dir && w.identity.initial_oid === experimentHead &&
+          await f.git(w.path, "rev-parse", "HEAD") === experimentHead, "derived checkout lost the snapshot's private Git commit");
+        check(await read(f, join(w.identity.git_dir, "pp-working-copy")) === `${w.nonce}\n${experimentHead}` &&
+          await read(f, join(experiment.identity.git_dir, "pp-working-copy")) === `${experiment.nonce}\n${baseline}`, "derivation changed the source generation or failed to register a child generation");
         check(await read(f, join(w.path, "input.txt")) === "frozen edit", "snapshot did not freeze the edited bytes");
         await write(f, join(w.path, "input.txt"), "child only\n");
         check(await read(f, join(experiment.path, "input.txt")) === "frozen edit" && await read(f, join(main.cwd, "input.txt")) === clean.trim() &&
@@ -139,10 +145,12 @@ export async function accept(f) {
         await f.cli("report", "--thread", `fixture/${main.id}`, "--percent", "100");
         for (let i = 0; i < 2; i++) await f.runTicker();
         check((await f.show(main.id)).resolved_reason === "reviewed PR merged", "ticker did not automatically resolve the simulated merged review");
-        await f.cli("thread", "cleanup", "fixture", main.id);
+        const cleanup = await f.cli("thread", "cleanup", "fixture", main.id);
         await f.cli("sweep", "fixture", "--yes");
         const after = await f.show(main.id);
-        check(after.working_copy.disposal.phase === "retained" && /explicit-only/.test(after.working_copy.disposal.blocker) && sameRegistry(registry, await f.registry()), "automatic resolution/cleanup/sweep lost a resource or did not report retention");
+        const mainNote = cleanup.split(/; (?=OVNFS \S+ kept:)/).find((note) => note.includes("OVNFS main kept:"));
+        check(after.working_copy.disposal.phase === "retained" && mainNote?.includes("checkout deletion is explicit-only"), `automatic resolution/cleanup/sweep did not report retention: ${cleanup}`);
+        check(sameRegistry(registry, await f.registry()), "automatic resolution/cleanup/sweep lost a resource");
         if (snapshot) {
           await fails(f, /snapshots are not deletable/, ...deleteArgs(main.id, "--resource", "save"));
           await fails(f, /depends on this checkout|depends on this worktree/, ...deleteArgs(main.id, "--resource", "scratch"));
@@ -151,29 +159,39 @@ export async function accept(f) {
       });
       await run("restart", async () => {
         const { id } = await launch(f, "ovnfs");
+        await f.cli("thread", "resolve", "fixture", id);
+        await f.cli("thread", "resolve", "fixture", id, "--reopen");
         const registry = await f.registry(), w = (await f.show(id)).working_copy, numberAgents = f.agents().length;
+        const row = await checkoutIdentity(f, w);
         await f.stopOvnfs();
-        const outage = await fails(f, unavailable, "thread", "restart", "fixture", id, "--fresh");
-        check(f.agents().length === numberAgents && (await f.show(id)).working_copy.nonce === w.nonce, "offline restart created an Agent or changed the registered resource");
-        const startup_ms = await f.startOvnfs();
+        let outage, startup_ms;
+        try {
+          outage = await fails(f, unavailable, "thread", "restart", "fixture", id, "--fresh");
+          check(f.agents().length === numberAgents && (await f.show(id)).working_copy.nonce === w.nonce, "offline restart created an Agent or changed the registered resource");
+        } finally {
+          startup_ms = await f.startOvnfs();
+        }
         await f.proveMount();
         check(sameRegistry(registry, await f.registry()), "daemon restart added or removed registered resources");
+        const remounted = await checkoutIdentity(f, w);
+        check(["created", "source", "base", "parent"].every((key) => row[key] === remounted[key]), "remount changed the checkout registration");
+        const stat = await f.node("read fixture directory identity", ["-e", `
+          const s = require('node:fs').lstatSync(process.argv[1], { bigint: true });
+          console.log(s.dev + ':' + s.ino);
+        `, w.path], 5000);
+        const [device, inode] = stat.split(":");
+        const [oldDevice, oldInode] = w.identity.directory.split(":");
+        check(inode === oldInode, "remount changed the checkout inode");
         try { await f.cli("thread", "restart", "fixture", id, "--fresh"); }
         catch (e) {
           if (!e.message.includes("checkout identity does not match")) throw e;
           check(f.agents().length === numberAgents && (await f.show(id)).working_copy.nonce === w.nonce, "rejected restart changed the registered resource or created an Agent");
-          const stat = await f.node("read fixture directory identity", ["-e", `
-            const s = require('node:fs').lstatSync(process.argv[1], { bigint: true });
-            console.log(s.dev + ':' + s.ino);
-          `, w.path], 5000);
-          const [device, inode] = stat.split(":");
-          const [oldDevice, oldInode] = w.identity.directory.split(":");
-          throw new Error(`${e.message}; NFS device ${device === oldDevice ? "unchanged" : "changed"}, inode ${inode === oldInode ? "unchanged" : "changed"}; no duplicate checkout or Agent`);
+          throw new Error(`${e.message}; NFS device ${device === oldDevice ? "unchanged" : "changed"}, inode unchanged; no duplicate checkout or Agent`);
         }
         const after = await f.show(id);
         check(after.cwd === w.path && after.working_copy.nonce === w.nonce && f.agents().length === numberAgents + 1 && f.agents().at(-1)?.cwd === w.path, "restart changed identity or fake Agent cwd");
         check(sameRegistry(registry, await f.registry()), "restart added or removed registered resources");
-        return { outage, startup_ms };
+        return { outage, startup_ms, device_changed: device !== oldDevice, inode_unchanged: true };
       });
     }
     if (f.mounted) await run("explicit-delete", async () => {
@@ -181,13 +199,20 @@ export async function accept(f) {
       rmSync(join(f.project, "working-copy-cache.json"), { force: true });
       const { id: offlineVictim } = await launch(f, "ovnfs");
       await f.cli("thread", "resolve", "fixture", offlineVictim);
-      const beforeOutage = await f.registry();
+      const beforeOutage = await f.registry(), offline = (await f.show(offlineVictim)).working_copy;
       await f.stopOvnfs();
-      await fails(f, unavailable, ...deleteArgs(offlineVictim));
-      check((await f.show(offlineVictim)).working_copy.disposal.phase !== "removed", "offline removal was reported as complete");
-      await f.startOvnfs();
+      try {
+        await fails(f, unavailable, ...deleteArgs(offlineVictim));
+        check((await f.show(offlineVictim)).working_copy.disposal.phase !== "removed", "offline removal was reported as complete");
+      } finally {
+        await f.startOvnfs();
+      }
       check(sameRegistry(beforeOutage, await f.registry()), "blocked disposal altered the registry");
-      // An independent candidate tests healthy removal without relying on a successful remount recovery.
+      await f.cli(...deleteArgs(offlineVictim));
+      check((await f.show(offlineVictim)).working_copy.disposal.phase === "removed" && await absent(f, offline.path) &&
+        await absent(f, offline.identity.git_dir) && sameRegistry({ ...beforeOutage, checkouts: beforeOutage.checkouts.filter((c) => c.name !== offline.identity.name) }, await f.registry()),
+      "explicit deletion after remount did not remove exactly the same checkout");
+      // The second checkout tests preservation of a commit and a declared file.
       ({ id: victim } = await launch(f, "ovnfs"));
       const { working_copy: w, thread_dir } = await f.show(victim);
       await checkoutIdentity(f, w);
