@@ -1,5 +1,5 @@
 // Registered copies use their own evidence gate. A copy-home result alone never authorizes removal.
-import { closeSync, constants, copyFileSync, fsyncSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, constants, copyFileSync, fstatSync, fsyncSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -252,21 +252,42 @@ function inspect(t, w, { td, decl, d }, budget) {
 
 const exclusions = (manifest) => manifest.ignored.map((p) => `/${p.replace(/[\\*?[\] ]/g, "\\$&")}\n`).join("");
 
-function verifyEvidence(e, path, manifest, budget) {
+function verifyEvidence(e, path, manifest, { budget, durable = false } = {}) {
   if (e.path !== path || realpathSync(path) !== path || !stat(path)?.isDirectory()) fail("evidence path could not be verified");
-  const expected = JSON.stringify(manifest);
+  const dirs = durable ? new Set([path, dirname(path), dirname(dirname(path))]) : null;
   const check = (rel, hash) => {
     const p = join(path, rel);
     const st = stat(p);
-    if (!st?.isFile() || realpathSync(p) !== p) fail(`evidence missing or corrupt: ${rel}`);
+    if (!inside(p, path) || !st?.isFile() || realpathSync(p) !== p) fail(`evidence missing or corrupt: ${rel}`);
     budget?.visit(st.size);
-    if (sha256(readFileSync(p)) !== hash) fail(`evidence missing or corrupt: ${rel}`);
+    if (!durable) {
+      if (sha256(readFileSync(p)) !== hash) fail(`evidence missing or corrupt: ${rel}`);
+      return;
+    }
+    // A published or recorded hash does not show that repaired bytes are durable.
+    // Flush the same file descriptor that supplied the verified bytes.
+    const fd = openSync(p, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    try {
+      const before = fstatSync(fd, { bigint: true });
+      if (!before.isFile() || sha256(readFileSync(fd)) !== hash) fail(`evidence missing or corrupt: ${rel}`);
+      syncEvidence(fd, p);
+      const after = lstatSync(p, { bigint: true });
+      if (!after.isFile() || realpathSync(p) !== p || ["dev", "ino", "size", "mtimeNs", "ctimeNs"].some((key) => before[key] !== after[key])) {
+        fail(`evidence changed during sync: ${rel}`);
+      }
+    } finally { closeSync(fd); }
+    for (let dir = dirname(p); dir !== path; dir = dirname(dir)) dirs.add(dir);
   };
-  if (e.manifest !== sha256(expected)) fail("evidence is stale: checkout contents changed");
+  if (e.manifest !== sha256(JSON.stringify(manifest))) fail("evidence is stale: checkout contents changed");
   check("manifest.json", e.manifest);
   check("commits.bundle", e.bundle);
   check("excludes", sha256(exclusions(manifest)));
   for (const [rel, hash] of Object.entries(manifest.files)) check(join("files", rel), hash);
+  if (dirs) for (const dir of [...dirs].sort((a, b) => b.length - a.length)) {
+    if (realpathSync(dir) !== dir) fail(`evidence directory could not be verified: ${dir}`);
+    const fd = openSync(dir, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+    try { syncEvidence(fd, dir); } finally { closeSync(fd); }
+  }
 }
 
 function evidencePath(project, w) {
@@ -288,14 +309,19 @@ function storedManifest(proof, path, nonce, budget) {
   if (sha256(text) !== proof.manifest) fail("evidence missing or corrupt: manifest.json");
   const manifest = JSON.parse(text);
   if (manifest.nonce !== nonce) fail("evidence belongs to a different resource");
-  verifyEvidence(proof, path, manifest, budget);
+  verifyEvidence(proof, path, manifest, { budget });
   return manifest;
+}
+
+function syncEvidence(fd, path) {
+  try { fsyncSync(fd); }
+  catch (e) { throw new Error(`could not durably sync evidence ${path}: ${e.message}`, { cause: e }); }
 }
 
 function flush(path, recursive = false) {
   if (recursive && lstatSync(path).isDirectory()) for (const name of readdirSync(path)) flush(join(path, name), true);
   const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-  try { fsyncSync(fd); } finally { closeSync(fd); }
+  try { syncEvidence(fd, path); } finally { closeSync(fd); }
 }
 
 function verifyBundle(w, root, bundle, manifest) {
@@ -333,10 +359,7 @@ function evidence(project, w, manifest, previous) {
     const proof = { path, manifest: hash, bundle: sha256(readFileSync(bundle)) };
     verifyEvidence(proof, path, manifest);
     verifyBundle(w, root, bundle, manifest);
-    verifyEvidence(proof, path, manifest);
-    // The staging files were synced before publication; sync the rename before recording it.
-    flush(root);
-    flush(dirname(root));
+    // The final deletion gate rechecks and syncs this generation, including its directory entries.
     return proof;
   }
   const stage = mkdtempSync(join(root, ".verify-"));
@@ -419,7 +442,7 @@ export function deleteOvnfsCheckout(project, t, h, w, save) {
       const inspectNow = () => inspectOvnfs(project, t, h, w);
       const manifest = inspectNow();
       proof = evidence(project, w, manifest, proof);
-      verifyEvidence(proof, proof.path, inspectNow());
+      verifyEvidence(proof, proof.path, inspectNow(), { durable: true });
       record("removing");
       phase = "unknown";
       ovnfs.removeCheckout(h, w);
@@ -476,11 +499,11 @@ export function dispose(project, t, h, w, options) {
     if (hold) return retained("");
     if (dryRun) return { gone: false, note: `worktree would be archived and removed if evidence verifies: ${path}` };
     proof = evidence(project, w, manifest, proof);
-    save({ phase: "archived", blocker: "", evidence: proof });
     gitCopy.verify(h, w);
     checkDependencies(project, t, w);
     checkOccupancy([path]);
-    verifyEvidence(proof, proof.path, inspect(t, w, withoutHold()));
+    verifyEvidence(proof, proof.path, inspect(t, w, withoutHold()), { durable: true });
+    save({ phase: "archived", blocker: "", evidence: proof });
     save({ phase: "removing", blocker: "", evidence: proof });
     phase = "unknown";
     // Only already classified paths enter the per-command exclude file; Git still rejects dirty and new untracked files.

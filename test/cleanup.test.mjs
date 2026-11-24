@@ -1549,6 +1549,89 @@ test("managed disposal: verifies already published evidence after interrupted re
   assert.equal(f.show().working_copy.disposal.evidence.path, evidence);
 });
 
+for (const recorded of [false, true]) test(`managed disposal: syncs repaired ${recorded ? "recorded" : "unrecorded"} proof before removal`, async (t) => {
+  const f = await managedFixture(t);
+  assert.ok(f.start().ok);
+  const { cwd, thread_dir: td } = f.show();
+  write(join(td, "report.md"), "report to preserve\n");
+  write(join(td, "library", "nested", "output.txt"), "nested output\n");
+  const hook = join(f.root, "sync-probe.mjs"), log = join(f.root, "sync-probe.log");
+  write(hook, `import fs from "node:fs";
+import cp from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
+const paths = new Map(), { openSync, closeSync, fsyncSync, appendFileSync } = fs, { spawnSync } = cp;
+const note = (...event) => appendFileSync(${JSON.stringify(log)}, JSON.stringify(event) + "\\n");
+fs.openSync = (p, ...args) => { const fd = openSync(p, ...args); paths.set(fd, String(p)); return fd; };
+fs.closeSync = (fd) => { paths.delete(fd); return closeSync(fd); };
+fs.fsyncSync = (fd) => {
+  const p = paths.get(fd);
+  if (p && p === process.env.PP_TEST_FAIL_SYNC) {
+    note("sync failed", p);
+    throw Object.assign(new Error("injected fsync failure"), { code: "EIO" });
+  }
+  fsyncSync(fd);
+  if (p) note("synced", p);
+};
+cp.spawnSync = (cmd, args, opts) => {
+  if (cmd === "git" && args.includes("worktree") && args.includes("remove")) {
+    note("remove");
+    if (process.env.PP_TEST_REFUSE_REMOVE) return { status: 42 };
+  }
+  return spawnSync(cmd, args, opts);
+};
+syncBuiltinESMExports();`);
+  const probe = `--import=${pathToFileURL(hook)}`;
+  const resolveThread = () => f.pp("thread", "resolve", "demo", f.id);
+  const cleanupThread = () => f.pp("thread", "cleanup", "demo", f.id);
+  if (recorded) {
+    f.env.NODE_OPTIONS = probe;
+    f.env.PP_TEST_REFUSE_REMOVE = "1";
+    const first = resolveThread();
+    assert.match(first.out, /backend worktree removal failed/);
+    delete f.env.PP_TEST_REFUSE_REMOVE;
+  } else {
+    const resume = interruptRename(f, `String(from).includes("/.verify-") && String(to).includes("/disposal-evidence/")`);
+    assert.equal(resolveThread().ok, false);
+    resume();
+  }
+  const root = f.p.path("disposal-evidence");
+  const [generation] = readdirSync(root);
+  const path = join(root, generation), bundle = join(path, "commits.bundle");
+  assert.equal(f.show().working_copy.disposal?.evidence?.path, recorded ? path : undefined);
+  const original = readFileSync(bundle);
+  // Make the corrupt bytes durable, then repair them without an explicit flush.
+  writeFileSync(bundle, "not a bundle\n", { flush: true });
+  writeFileSync(bundle, original);
+  const manifest = JSON.parse(readFileSync(join(path, "manifest.json"), "utf8"));
+  const artifacts = Object.keys(manifest.files).map((rel) => join(path, "files", rel));
+  assert.ok(artifacts.some((p) => p.endsWith("/nested/output.txt")));
+  const expected = new Set([bundle, join(path, "manifest.json"), join(path, "excludes"), ...artifacts, root, dirname(root)]);
+  for (const file of artifacts) for (let p = dirname(file); p.startsWith(path + "/"); p = dirname(p)) expected.add(p);
+  expected.add(path);
+  const events = () => readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  f.env.NODE_OPTIONS = probe;
+  for (const failed of [bundle, dirname(artifacts.find((p) => p.endsWith("/nested/output.txt")))]) {
+    writeFileSync(log, "");
+    f.env.PP_TEST_FAIL_SYNC = failed;
+    const blocked = cleanupThread();
+    assert.ok(blocked.ok, blocked.out);
+    assert.match(blocked.out, /injected fsync failure/);
+    assert.ok(existsSync(cwd), blocked.out);
+    const trace = events();
+    assert.ok(trace.some(([event, p]) => event === "sync failed" && p === failed));
+    assert.ok(!trace.some(([event]) => event === "remove"));
+  }
+  delete f.env.PP_TEST_FAIL_SYNC;
+  writeFileSync(log, "");
+  const retried = cleanupThread();
+  assert.ok(retried.ok && !existsSync(cwd), retried.out);
+  const trace = events(), removal = trace.findIndex(([event]) => event === "remove");
+  assert.ok(removal >= 0);
+  const durable = new Set(trace.slice(0, removal).filter(([event]) => event === "synced").map(([, p]) => p));
+  for (const p of expected) assert.ok(durable.has(p), `not synced before removal: ${p}`);
+  assert.equal(f.show().working_copy.disposal.evidence.path, path);
+});
+
 test("managed disposal: reconciles a precisely labeled Agent after lost launch acknowledgement", async (t) => {
   const f = await managedFixture(t, "lost-launch");
   const started = f.start();
