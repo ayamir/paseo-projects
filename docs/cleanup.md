@@ -8,7 +8,8 @@
 
 - 在远端核对创建登记、目录和 Git 管理记录，以及同机器路径引用、已登记依赖、挂载、占用、原始 reflog、index 和文件内容。Git 忽略规则不授予删除权限。需要远端 Node.js、Git、`lsof` 及 macOS 的 `mount` 或 Linux 的 `findmnt`。副本内部挂载、探测或读取失败、超出 10,000 项或 32 MiB 的检查和传输预算都阻止删除。
 - 把提交 bundle 和已分类的普通文件传回 PP 所在机器；在副本外独立恢复并校验提交、核对文件字节、同步归档。然后在远端重检，只用非强制 `git worktree remove`。只有原仓库登记、worktree 目录和 Git 管理目录均确认不存在时才记录已回收。SSH 断开时保留未知状态；重试可核对并确认已删除。若副本仍存在，当前没有能证明原请求已结束且不会迟到执行的远端凭据，PP 不重发删除。
-- 不自动删 SSH 分支：缺少分支身份与 reflog 的删除核验。未接管的 SSH worktree、复杂的私有 Git 元数据、依赖替代对象库的仓库和声明 `discard` 也保留；目前没有远端 `discard` 路径与成品验证。`lsof` 只覆盖 SSH 会话可见的进程；不证明其他机器或命名空间没有占用。最终检查和 Git 删除不是由同一个原子操作完成，不能隔离未登记的外部写入。不要绕过阻碍强制删除。
+- 不自动删 SSH 分支：缺少分支身份与 reflog 的删除核验。未接管的 SSH worktree、复杂的私有 Git 元数据、依赖替代对象库的仓库和声明 `discard` 也保留；目前没有远端 `discard` 路径与成品验证。`lsof` 只覆盖 SSH 会话可见的进程；对于不可读的路径，只能检查最近可解析的祖先，不能证明不可见的别名或其他机器、命名空间没有占用。最终检查和 Git 删除不是由同一个原子操作完成，不能隔离未登记的外部写入。不要绕过阻碍强制删除。
+- 若远端删除进程异常退出并遗留锁，锁目录是 `<远端 Git common dir>/pp-disposal-<working_copy.nonce>.lock`。用 `git -C <源仓库> rev-parse --path-format=absolute --git-common-dir` 查前半段，用 `pp thread show <slug> <id> --json` 查 nonce。管理员确认该次 SSH 请求和所有相关 Git 进程均已结束、不会再执行后，才可在远端用 `rmdir -- <锁目录>` 移除该空目录。移除锁不会清除 PP 的未知回收状态，也不会让 PP 重发不确定的请求。
 
 ## 归属规则（只有这一条）
 
@@ -57,7 +58,7 @@ worktree 删除前要满足这些条件，任何一条不满足就保留并写�
 - 没有未提交改动、untracked 文件，也没有不认识的 ignored 内容；
 - 用 `lsof` 确认没有进程打开里面的文件。重试 5 次，每次间隔 1 秒，等刚归档的 agent 退出。没有 `lsof` 就保留。
 
-删除只用 `git worktree remove -- <path>`，不加 `--force`，不跑 `git worktree prune`（它会处理整个仓库），也不跑 `submodule deinit`。worktree 目录已经不在时：如果它还登记在 `t.repo` 里，只移除这一条登记，移除失败记为 failed；如果没登记，就记为 gone，它下面的索引不动。
+删除只用 `git -c status.showUntrackedFiles=all worktree remove -- <path>`，不加 `--force`，不跑 `git worktree prune`（它会处理整个仓库），也不跑 `submodule deinit`。worktree 目录已经不在时：如果它还登记在 `t.repo` 里，只移除这一条登记，移除失败记为 failed；如果没登记，就记为 gone，它下面的索引不动。
 
 ## 保留的（写明原因）
 

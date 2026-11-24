@@ -2068,7 +2068,8 @@ const target = process.env.FAKE_SSH_LOSE_REMOVAL;
 const existed = target && existsSync(target);
 const input = process.env.FAKE_SSH_DROP_REMOVAL ? readFileSync(0) : undefined;
 if (input?.includes('"action":"remove"')) process.exit(255);
-const r = spawnSync('sh', ['-c', command], { input, stdio: [input ? 'pipe' : 'inherit', 'pipe', 'pipe'], maxBuffer: 48 * 1024 * 1024 });
+const script = process.env.FAKE_LSOF_DENIED_PATH ? command.replace('NODE_PATH= node -e', 'NODE_PATH= node --require "$FAKE_SSH_FS_PROBE" -e') : command;
+const r = spawnSync('sh', ['-c', script], { input, stdio: [input ? 'pipe' : 'inherit', 'pipe', 'pipe'], maxBuffer: 48 * 1024 * 1024 });
 if (existed && !existsSync(target)) process.exit(255);
 let output = r.stdout || '';
 if (process.env.FAKE_SSH_DAMAGE_BUNDLE && String(output).includes('"bundle":')) {
@@ -2102,6 +2103,14 @@ if [ -n "$FAKE_MOUNT_PATH" ]; then
   printf '%s\\n' "$FAKE_MOUNT_PATH"
 fi
 `, { mode: 0o755 });
+  f.env.FAKE_SSH_FS_PROBE = join(bin, "denied-path.cjs");
+  writeFileSync(f.env.FAKE_SSH_FS_PROBE, `const fs = require('node:fs');
+const lstat = fs.lstatSync;
+fs.lstatSync = (path, ...args) => {
+  if (String(path) === process.env.FAKE_LSOF_DENIED_PATH) throw Object.assign(new Error('injected stat denial: ' + path), { code: 'EACCES' });
+  return lstat(path, ...args);
+};
+`);
   f.env.PATH = `${bin}:${f.env.PATH}`;
   write(f.env.PP_CONFIG, JSON.stringify({ profiles: { fake: { provider: "claude/fake-model" } }, machines: { remote: { url: f.env.PASEO_URL, ssh: "fake-host" } } }));
   const started = f.start("--machine", "remote");
@@ -2145,6 +2154,41 @@ test("managed SSH disposal: retains a worktree occupied through a path alias unt
   assert.ok(existsSync(cwd), r.out);
   assert.equal(f.show().working_copy.disposal.phase, "retained");
   delete f.env.FAKE_LSOF_PATH;
+  const retry = f.pp("thread", "cleanup", "demo", f.id);
+  assert.ok(retry.ok, retry.out);
+  assert.ok(!existsSync(cwd), retry.out);
+  assert.equal(f.show().working_copy.disposal.phase, "removed");
+});
+
+test("managed SSH disposal: tolerates unreadable open paths outside the worktree but refuses an alias inside", async (t) => {
+  const f = await sshDisposalFixture(t);
+  const { cwd } = f.show();
+  const alias = join(f.root, "unreadable-alias");
+  symlinkSync(cwd, alias);
+  f.env.FAKE_LSOF_PATH = f.env.FAKE_LSOF_DENIED_PATH = join(alias, "unreadable");
+  const r = f.pp("thread", "resolve", "demo", f.id, "--skip-copy");
+  assert.ok(r.ok, r.out);
+  assert.match(r.out, /SSH worktree occupied by process/);
+  assert.ok(existsSync(cwd), r.out);
+  assert.equal(f.show().working_copy.disposal.phase, "retained");
+  f.env.FAKE_LSOF_PATH = f.env.FAKE_LSOF_DENIED_PATH = join(f.root, "unreadable");
+  const retry = f.pp("thread", "cleanup", "demo", f.id);
+  assert.ok(retry.ok, retry.out);
+  assert.ok(!existsSync(cwd), retry.out);
+  assert.equal(f.show().working_copy.disposal.phase, "removed");
+});
+
+test("managed SSH disposal: accepts escaped open paths outside the worktree but refuses an escaped alias inside", async (t) => {
+  const f = await sshDisposalFixture(t);
+  const { cwd } = f.show();
+  symlinkSync(cwd, join(f.root, "alias-é"));
+  f.env.FAKE_LSOF_PATH = join(f.root, String.raw`alias-\xc3\xa9`, "unlinked file");
+  const r = f.pp("thread", "resolve", "demo", f.id, "--skip-copy");
+  assert.ok(r.ok, r.out);
+  assert.match(r.out, /SSH worktree occupied by process/);
+  assert.ok(existsSync(cwd), r.out);
+  assert.equal(f.show().working_copy.disposal.phase, "retained");
+  f.env.FAKE_LSOF_PATH = join(f.root, String.raw`font-\xe3\x83\x92 W6.ttc`);
   const retry = f.pp("thread", "cleanup", "demo", f.id);
   assert.ok(retry.ok, retry.out);
   assert.ok(!existsSync(cwd), retry.out);
@@ -2228,6 +2272,32 @@ test("managed SSH disposal: a new ignored file during the last probe blocks remo
   assert.match(r.out, /SSH checkout changed after inspection/);
   assert.equal(f.show().working_copy.disposal.phase, "retained");
 });
+
+for (const remote of [true, false]) {
+  test(`managed ${remote ? "SSH" : "local"} disposal: native Git catches a late untracked file despite repository config`, async (t) => {
+    const f = remote ? await sshDisposalFixture(t) : await managedFixture(t);
+    if (!remote) assert.ok(f.start().ok);
+    const { cwd, working_copy: w } = f.show();
+    git(f.repo, "config", "status.showUntrackedFiles", "no");
+    const bin = join(f.root, "git-shim");
+    mkdirSync(bin);
+    writeFileSync(join(bin, "git"), `#!/bin/sh
+case " $* " in
+  *" worktree remove "*) printf 'late data\\n' > "$FAKE_GIT_NEW_FILE" || exit 1 ;;
+esac
+exec env PATH="$FAKE_GIT_REAL_PATH" git "$@"
+`, { mode: 0o755 });
+    f.env.FAKE_GIT_NEW_FILE = join(cwd, "late-progress.txt");
+    f.env.FAKE_GIT_REAL_PATH = f.env.PATH;
+    f.env.PATH = `${bin}:${f.env.PATH}`;
+    const r = f.pp("thread", "resolve", "demo", f.id, "--skip-copy");
+    assert.ok(r.ok, r.out);
+    assert.ok(existsSync(f.env.FAKE_GIT_NEW_FILE), r.out);
+    assert.equal(readFileSync(f.env.FAKE_GIT_NEW_FILE, "utf8"), "late data\n");
+    assert.ok(existsSync(w.identity.git_dir), r.out);
+    assert.notEqual(f.show().working_copy.disposal.phase, "removed");
+  });
+}
 
 test("managed SSH disposal: retains a path with a mounted filesystem", async (t) => {
   const f = await sshDisposalFixture(t);

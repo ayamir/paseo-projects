@@ -173,7 +173,7 @@ export async function removeWorktree(h, t, { threadDir = "", discards = [], dryR
     if (!paths.includes(t.cwd) && !paths.includes(canon(t.cwd))) return { ...item, status: "gone" };
     if (dryRun) return { ...item, status: "gone", note: "its registration would be removed" };
     // Only this worktree's registration: never `git worktree prune`, which is repository-wide.
-    const r = h.shell(`git worktree remove -- ${q(t.cwd)}`, t.repo);
+    const r = h.shell(`git -c status.showUntrackedFiles=all worktree remove -- ${q(t.cwd)}`, t.repo);
     return r.ok ? { ...item, status: "gone", note: "its registration removed" } : { ...item, status: "failed", reason: `its folder is gone but git worktree remove failed: ${r.out}` };
   }
   const top = h.shell("pwd -P", t.cwd).stdout.trim();
@@ -190,7 +190,7 @@ export async function removeWorktree(h, t, { threadDir = "", discards = [], dryR
   const reflog = identity && linkedHeadReflogBlocker(top, identity);
   if (reflog) return { ...item, status: "blocked", reason: reflog };
   if (dryRun) return { ...item, status: "would-remove", kib };
-  const r = h.shell(`git worktree remove -- ${q(top)}`, t.repo, undefined, LONG_MS);
+  const r = h.shell(`git -c status.showUntrackedFiles=all worktree remove -- ${q(top)}`, t.repo, undefined, LONG_MS);
   if (!r.ok) return { ...item, status: h.isDir(top) && !r.timedOut ? "kept" : "failed", reason: r.timedOut ? "git worktree remove timed out part way" : r.out };
   return { ...item, status: h.isDir(top) ? "failed" : "removed", kib, ...(h.isDir(top) ? { reason: "still there after git worktree remove" } : {}) };
 }

@@ -98,9 +98,37 @@ function mounts(paths) {
     if (paths.some((root) => inside(normalized, root) || inside(canonicalPrefix(normalized), root))) fail(`SSH worktree contains a mount: ${p}`);
   }
 }
+function lsofPath(text) {
+  const escapes = { "\\": "\\", a: "\x07", b: "\b", f: "\f", n: "\n", r: "\r", t: "\t", v: "\v" };
+  const bytes = text.replace(/\\(?:x([\da-fA-F]{2})|([\s\S])|$)/g, (_, hex, char) => {
+    if (hex && hex !== "00") return String.fromCharCode(Number.parseInt(hex, 16));
+    if (Object.hasOwn(escapes, char)) return escapes[char];
+    fail("SSH occupancy probe returned an ambiguous file path");
+  });
+  return Buffer.from(bytes, "latin1");
+}
 function occupancy(paths) {
   const owned = observedInodes(paths);
-  const r = spawnSync("lsof", ["-nP", "-F0pn"], { encoding: "utf8", maxBuffer: limit, timeout: 45000 });
+  const occupied = (path) => paths.some((p) => inside(path.toString("latin1"), p));
+  const matches = (path) => {
+    for (let p = path; ; p = p.subarray(0, Math.max(1, p.lastIndexOf("/")))) {
+      if (occupied(p)) return true;
+      try {
+        const st = stat(p);
+        if (st) {
+          const real = fs.realpathSync.native(p, { encoding: "buffer" });
+          if (occupied(real)) return true;
+          const current = p.equals(real) ? st : stat(real);
+          if (current) return owned.has(inode(current));
+        }
+      } catch (e) {
+        if (!["EACCES", "EPERM", "ENOENT"].includes(e.code)) throw e;
+      }
+      // Other users' paths can be unreadable. Check the nearest visible ancestor, including aliases.
+      if (p.length === 1) fail("SSH occupancy path has no verifiable ancestor");
+    }
+  };
+  const r = spawnSync("lsof", ["-nP", "-F0pn"], { encoding: "latin1", maxBuffer: limit, timeout: 45000 });
   if (r.status !== 0 || r.error || r.stderr || !r.stdout?.endsWith("\0\n")) fail("SSH occupancy probe failed or unavailable");
   let pid = 0, files = 0;
   const inspected = new Set();
@@ -109,11 +137,12 @@ function occupancy(paths) {
     if (/^p[1-9]\d*$/.test(p) && n === undefined) pid = Number(p.slice(1));
     else if (pid && /^f.+/.test(p) && n?.startsWith("n") && extra === undefined) {
       files++;
-      const path = n.slice(1).replace(/ \(deleted\)$/, "");
-      if (pid === process.pid || !isAbsolute(path) || inspected.has(path)) continue;
-      if (/[\\�]/.test(path)) fail("SSH occupancy probe returned an ambiguous file path");
-      const real = canonicalPrefix(path);
-      if (paths.some((p) => inside(path, p) || inside(real, p)) || owned.has(inode(stat(real)))) fail(`SSH worktree occupied by process ${pid}`);
+      const path = n.slice(1);
+      if (pid === process.pid || !path.startsWith("/") || inspected.has(path)) continue;
+      const bytes = lsofPath(path), deleted = " (deleted)";
+      if (matches(bytes) || (path.endsWith(deleted) && matches(bytes.subarray(0, -deleted.length)))) {
+        fail(`SSH worktree occupied by process ${pid}`);
+      }
       inspected.add(path);
     } else fail("SSH occupancy probe returned malformed output");
   }
@@ -286,7 +315,7 @@ function checkout(request) {
       verifyIdentity();
       for (const p of observed.keys()) observe(p);
       removalStarted = true;
-      git(source, ["-c", `core.excludesFile=${excludes}`, "worktree", "remove", "--", path], "SSH backend worktree removal failed");
+      git(source, ["-c", "status.showUntrackedFiles=all", "-c", `core.excludesFile=${excludes}`, "worktree", "remove", "--", path], "SSH backend worktree removal failed");
       if (stat(path) || stat(gd) || id(common) !== repository || registry(source).some((r) => r.path === path)) fail("SSH backend removal could not be verified");
       return { gone: true };
     } finally { if (id(lock) === lease) fs.rmdirSync(lock); }

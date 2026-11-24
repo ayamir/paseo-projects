@@ -602,7 +602,7 @@ export function dispose(project, t, h, w, options) {
     save({ phase: "removing", blocker: "", evidence: proof });
     phase = "unknown";
     // Only already classified paths enter the per-command exclude file; Git still rejects dirty and new untracked files.
-    git(w.source, ["-c", `core.excludesFile=${join(proof.path, "excludes")}`, "worktree", "remove", "--", path], "backend worktree removal failed");
+    git(w.source, ["-c", "status.showUntrackedFiles=all", "-c", `core.excludesFile=${join(proof.path, "excludes")}`, "worktree", "remove", "--", path], "backend worktree removal failed");
     if (!backendGone(w, manifest)) fail("backend removal could not be verified");
     save({ phase: "removed", blocker: "", evidence: proof });
     return { gone: true, note: `worktree removed: ${path}` };
