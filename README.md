@@ -137,6 +137,7 @@ Cleanup copies the report and the thread's files home. PP can reclaim a managed 
 
 - [docs/README.zh-CN.md](docs/README.zh-CN.md): the full notes in Chinese (ticker, sessions, cutover, thread groups, board).
 - `skill/COORDINATOR.md` and `skill/THREAD.md`: what the coordinator and each thread are told.
+- [pp-backend](skill/pp-backend/SKILL.md): choose a working-copy backend for a thread based on the task and its cache needs.
 - `skill/autoproject/`: a reviewed improvement loop the coordinator can run.
 - `npm test` runs the logic tests; no daemon needed.
 
