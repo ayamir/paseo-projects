@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync, readdirSync } from "node:fs";
 
@@ -25,18 +26,68 @@ export function suiteManifest() {
 
 const identityKeys = ["revision", "candidate", "baseline", "workload"];
 const sameRun = (a, b) => object(a) && object(b) && identityKeys.every((key) => typeof a[key] === "string" && a[key] === b[key]);
-function completeSuite(regression) {
-  let manifest;
-  try { manifest = suiteManifest(); } catch { return false; }
+// Reviewed unfiltered Node 26 inventory; Node can report zero skips under --test-name-pattern.
+const fullSuite = {
+  "test/cleanup.test.mjs": [91, "41f8183a65b16f7a34bb4182a005933b7da4a47ac5285d56069086a2d6387fcf"],
+  "test/cli.test.mjs": [11, "d3b64d0b1723a66174f729240b9d1bacc871ba7dfbd98731cd918a935e1a7b40"],
+  "test/logic.test.mjs": [19, "571fd0496806d9900a54254f0a06e93a50529b145e8d9bfc03b8f347147022bf"],
+  "test/ovnfs-tooling.test.mjs": [4, "6b389acab042826009ab017e708a250892e9215c62ed06770d56616645bda6ed"],
+};
+function completeSuite(regression, revision) {
   const files = regression?.files;
-  if (regression?.status !== "passed" || !object(files) || !Object.keys(manifest).length || Object.keys(files).length !== Object.keys(manifest).length) return false;
-  let total = 0;
-  for (const [name, hash] of Object.entries(manifest)) {
-    const file = files[name];
-    if (file?.sha256 !== hash || !Number.isSafeInteger(file.pass) || file.pass < 1) return false;
-    total += file.pass;
+  if (regression?.status !== "passed" || !object(files) || Object.keys(files).length !== Object.keys(fullSuite).length) return false;
+  try {
+    const manifest = suiteManifest();
+    if (Object.keys(manifest).length !== Object.keys(fullSuite).length) return false;
+    let total = 0;
+    for (const [name, [pass, hash]] of Object.entries(fullSuite)) {
+      if (manifest[name] !== hash || files[name]?.sha256 !== hash || files[name].pass !== pass) return false;
+      total += pass;
+    }
+    if (regression.tests !== total || regression.pass !== total || ["fail", "skipped", "cancelled", "todo"].some((key) => regression[key] !== 0)) return false;
+    const cwd = new URL("../", import.meta.url);
+    const git = (...args) => execFileSync("git", args, {
+      cwd, encoding: "utf8", timeout: 2_000, stdio: ["ignore", "pipe", "ignore"],
+      env: { PATH: process.env.PATH, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_NO_REPLACE_OBJECTS: "1" },
+    });
+    if (git("rev-parse", "--verify", "HEAD").trim() !== revision) return false;
+    const paths = ["orchestrator/promotion.mjs", ...Object.keys(fullSuite)];
+    const tree = new Set(git("ls-tree", "-z", "--full-tree", revision, "--", ...paths).split("\0"));
+    return paths.every((name) => {
+      const bytes = readFileSync(new URL(name, cwd));
+      const blob = createHash("sha1").update(`blob ${bytes.length}\0`).update(bytes).digest("hex");
+      return tree.has(`100644 blob ${blob}\t${name}`) || tree.has(`100755 blob ${blob}\t${name}`);
+    });
+  } catch { return false; }
+}
+
+function validTiming(run, scenario) {
+  const ovnfs = run.backend === "ovnfs";
+  const cycle = (launch, build = launch) => [`${launch} launch preflight`, `${launch} launch`, `${build} build`, `${build} build verification`];
+  const body = {
+    cold: cycle("cold"),
+    hot: ["cache seed preparation", ...cycle("reuse 1"), ...cycle("reuse 2"), "invalidate seed", ...cycle("invalidated", "invalidated cold")],
+    "dirty-derive": ["parent launch preflight", "parent launch", "identical tracked edit", ...(ovnfs ? ["freeze dirty input preflight"] : []),
+      "freeze dirty input", ...cycle("derive 1"), ...cycle("derive 2")],
+  }[scenario];
+  const names = ["fixture setup", "baseline storage preflight", ...(ovnfs ? ["daemon startup"] : []), ...body, "normal resolution and cleanup", "fixture teardown"];
+  const { steps, first_use_ms: first, total_ms: total, inclusive_total_ms: inclusive, startup_ms: startup } = run;
+  if (!Array.isArray(steps) || steps.length !== names.length || !names.every((name, i) =>
+    steps[i]?.name === name && Number.isFinite(steps[i].ms) && steps[i].ms >= 0) || !positive(inclusive)) return false;
+
+  // Stage times are lower bounds: the wall clock also includes bookkeeping between probes.
+  const covers = (elapsed, stages) => elapsed + 1e-6 >= stages;
+  const firstBuild = names.findIndex((name) => name.endsWith(" build"));
+  let before = 0, after = 0, excluded = 0;
+  for (let i = 2; i < steps.length - 2; i++) {
+    const { name, ms } = steps[i];
+    if (/(preflight|verification)$/.test(name)) excluded += ms;
+    else if (i <= firstBuild) before += ms;
+    else after += ms;
   }
-  return regression.tests === total && regression.pass === total && regression.fail === 0 && regression.skipped === 0 && regression.cancelled === 0 && regression.todo === 0;
+  return (ovnfs ? positive(startup) && covers(steps[2].ms, startup) : startup === undefined) &&
+    inclusive >= total &&
+    covers(first, before) && covers(total - first, after) && covers(inclusive - total, excluded);
 }
 
 function load(path) {
@@ -62,7 +113,7 @@ export function promotion(evidencePath, thresholdsPath) {
   const reliabilityStatus = evidence.status !== "present" ? evidence.status
     : !real || !sameRun(reliability?.provenance, provenance) || !sameRun(regression?.provenance, provenance) ||
       cases?.["capture-and-cache"]?.baseline !== provenance.baseline || realCases.some((id) => cases?.[id]?.status === "failed") || regression?.status === "failed" ? "failed"
-    : completeSuite(regression) && realCases.every((id) => cases?.[id]?.status === "passed") ? "passed" : "missing";
+    : completeSuite(regression, provenance.revision) && realCases.every((id) => cases?.[id]?.status === "passed") ? "passed" : "missing";
 
   const limits = thresholds.data?.limits;
   const configured = typeof thresholds.data?.approval === "string" && thresholds.data.approval.trim() &&
@@ -87,7 +138,8 @@ export function promotion(evidencePath, thresholdsPath) {
         const runs = series[id].flat();
         return runs.every((r) => r.baseline === provenance.baseline && r.digests.every((value, i) => value === runs[0].digests[i]));
       });
-      benefit = !matched ? "failed" : !configured ? "measured" : scenarios.every((id) => series[id].every((pair) => {
+      const timing = scenarios.every((id) => series[id].flat().every((run) => validTiming(run, id)));
+      benefit = !timing ? "invalid" : !matched ? "failed" : !configured ? "measured" : scenarios.every((id) => series[id].every((pair) => {
         const [git, ovnfs] = pair.toSorted((a, b) => a.backend.localeCompare(b.backend));
         return Object.entries(limits[id]).every(([name, max]) => metrics[name](ovnfs) / metrics[name](git) <= max);
       })) ? "passed" : "failed";

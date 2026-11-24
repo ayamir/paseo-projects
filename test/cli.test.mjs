@@ -75,9 +75,14 @@ test("promotion checks reliability and every matched comparison independently wi
   const dir = mkdtempSync(join(realpathSync(tmpdir()), "pp-promotion-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const evidencePath = join(dir, "evidence.json"), approvalPath = join(dir, "approval.json"), unusedRoot = join(dir, "untouched");
-  const provenance = { revision: "b".repeat(40), baseline: "1".repeat(40), candidate: `ovnfs/v0.8.0/${"a".repeat(64)}`, workload: "c".repeat(64) };
-  const files = Object.fromEntries(Object.entries(suiteManifest()).map(([name, sha256]) => [name, { sha256, pass: 2 }]));
-  const count = 2 * Object.keys(files).length;
+  const cwd = dirname(dirname(PP));
+  const env = { PATH: process.env.PATH, HOME: dir, PP_CONFIG: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" };
+  const git = spawnSync("git", ["rev-parse", "HEAD"], { cwd, env, encoding: "utf8" });
+  assert.equal(git.status, 0, git.stderr);
+  const provenance = { revision: git.stdout.trim(), baseline: "1".repeat(40), candidate: `ovnfs/v0.8.0/${"a".repeat(64)}`, workload: "c".repeat(64) };
+  const inventory = { "test/cleanup.test.mjs": 91, "test/cli.test.mjs": 11, "test/logic.test.mjs": 19, "test/ovnfs-tooling.test.mjs": 4 };
+  const files = Object.fromEntries(Object.entries(suiteManifest()).map(([name, sha256]) => [name, { sha256, pass: inventory[name] }]));
+  const count = 125;
   const cases = Object.fromEntries(["mount", "capture-and-cache", "experiment-and-derived", "restart", "retention", "explicit-delete", "teardown"].map((key) => [key, { status: "passed" }]));
   cases["capture-and-cache"].baseline = provenance.baseline;
   const evidence = { schema: 2, provenance,
@@ -85,7 +90,22 @@ test("promotion checks reliability and every matched comparison independently wi
     regression: { provenance, status: "passed", files, tests: count, pass: count, fail: 0, skipped: 0, cancelled: 0, todo: 0 },
     reliability: { provenance, cases },
     measurements: { provenance, metric: benchmarkMetric, trials: Object.fromEntries([["cold", 1], ["hot", 3], ["dirty-derive", 2]].map(([scenario, n]) => {
-      const trial = (backend, ms) => ({ backend, status: "passed", cleanup: "removed", first_use_ms: ms, total_ms: ms, retained: { allocated_bytes: 100 }, baseline: provenance.baseline, digests: Array(n).fill("d".repeat(64)) });
+      const trial = (backend, ms) => {
+        const ovnfs = backend === "ovnfs";
+        const launch = (name) => [`${name} launch preflight`, `${name} launch`];
+        const build = (name) => [`${name} build`, `${name} build verification`];
+        const phases = {
+          cold: [...launch("cold"), ...build("cold")],
+          hot: ["cache seed preparation", ...launch("reuse 1"), ...build("reuse 1"), ...launch("reuse 2"), ...build("reuse 2"),
+            "invalidate seed", ...launch("invalidated"), ...build("invalidated cold")],
+          "dirty-derive": [...launch("parent"), "identical tracked edit", ...(ovnfs ? ["freeze dirty input preflight"] : []), "freeze dirty input",
+            ...launch("derive 1"), ...build("derive 1"), ...launch("derive 2"), ...build("derive 2")],
+        }[scenario];
+        return { backend, status: "passed", cleanup: "removed", first_use_ms: ms, total_ms: ms * n + (scenario === "cold" ? 0.001 : 0), inclusive_total_ms: ms * n + 8,
+          steps: ["fixture setup", "baseline storage preflight", ...(ovnfs ? ["daemon startup"] : []), ...phases, "normal resolution and cleanup", "fixture teardown"]
+            .map((name) => ({ name, ms: 1 })), ...(ovnfs ? { startup_ms: 0.75 } : {}),
+          retained: { allocated_bytes: 100 }, baseline: provenance.baseline, digests: Array(n).fill("d".repeat(64)) };
+      };
       return [scenario, [[trial("git-worktree", 100), trial("ovnfs", 80)], [trial("ovnfs", 90), trial("git-worktree", 100)]]];
     })) } };
   const approval = { schema: 2, metric: benchmarkMetric, approval: "synthetic approval for this test only", provenance,
@@ -93,13 +113,17 @@ test("promotion checks reliability and every matched comparison independently wi
   function run(reliability, benefit, thresholds, status, { input = evidence, policy = approval } = {}) {
     writeFileSync(evidencePath, JSON.stringify(input));
     if (policy) writeFileSync(approvalPath, JSON.stringify(policy));
-    const r = spawnSync(process.execPath, [PP, "--root", unusedRoot, "working-copy", "promotion", "--evidence", evidencePath, ...(policy ? ["--thresholds", approvalPath] : [])], {
-      encoding: "utf8", env: { PATH: process.env.PATH, PP_CONFIG: "/dev/null" },
-    });
-    assert.equal(r.status, status, r.stderr);
+    const r = spawnSync(process.execPath, [PP, "--root", unusedRoot, "working-copy", "promotion", "--evidence", evidencePath, ...(policy ? ["--thresholds", approvalPath] : [])], { encoding: "utf8", env });
+    assert.equal(r.status, status, r.stderr || r.stdout);
     assert.deepEqual(JSON.parse(r.stdout), { default_backend: "git-worktree", promotion: status === 0 ? "eligible" : "blocked", reliability, measured_benefit: benefit, thresholds });
     assert.ok(!existsSync(unusedRoot));
   }
+  const mutate = (change) => { const input = JSON.parse(JSON.stringify(evidence)); change(input); return { input }; };
+  run("passed", "invalid", "configured", 1, mutate((input) => {
+    const legacy = input.measurements.trials.cold[0][0];
+    delete legacy.inclusive_total_ms;
+    legacy.steps = legacy.steps.filter(({ name }) => !/(preflight|verification)$/.test(name));
+  }));
   run("passed", "measured", "missing", 1, { policy: null });
   run("passed", "passed", "configured", 0);
   const broken = structuredClone(evidence);
@@ -111,19 +135,43 @@ test("promotion checks reliability and every matched comparison independently wi
   run("passed", "measured", "invalid", 1, { policy: { ...approval, limits: {
     cold: { first_use_ms: 1 }, hot: { total_ms: 1 }, "dirty-derive": { retained_allocated_bytes: 1 },
   } } });
-  const mutate = (change) => { const input = JSON.parse(JSON.stringify(evidence)); change(input); return { input }; };
   run("failed", "failed", "invalid", 1, mutate((input) => delete input.environment.macos));
   run("failed", "failed", "invalid", 1, mutate((input) => { input.environment.ovnfs.version = "v0.7.0"; }));
   run("missing", "passed", "configured", 1, mutate((input) => {
     const name = Object.keys(files)[0];
     Object.assign(input.regression, { tests: 1, pass: 1, files: { [name]: { sha256: files[name].sha256, pass: 1 } } });
   }));
+  const filteredFiles = {};
+  const filters = ["^explicit OVNFS refuses an unavailable pinned backend", "^every option of every usage line", "^parseToml:", "^fixture retains uncertain state"];
+  Object.entries(files).forEach(([name, { sha256 }], index) => {
+    const filtered = spawnSync(process.execPath, ["--test", `--test-name-pattern=${filters[index]}`, name], { cwd, env, encoding: "utf8", timeout: 15_000 });
+    assert.equal(filtered.status, 0, filtered.stderr);
+    assert.match(filtered.stdout, /^ℹ tests 1$/m);
+    assert.match(filtered.stdout, /^ℹ pass 1$/m);
+    assert.match(filtered.stdout, /^ℹ skipped 0$/m);
+    filteredFiles[name] = { sha256, pass: 1 };
+  });
+  run("missing", "passed", "configured", 1, mutate((input) => {
+    Object.assign(input.regression, { files: filteredFiles, tests: filters.length, pass: filters.length });
+  }));
+  const wrongRevision = mutate((input) => {
+    for (const item of [input, input.reliability, input.regression, input.measurements]) item.provenance.revision = "e".repeat(40);
+  });
+  run("missing", "passed", "configured", 1, { ...wrongRevision, policy: { ...approval, provenance: wrongRevision.input.provenance } });
   run("failed", "passed", "configured", 1, mutate((input) => { input.regression.provenance.revision = "e".repeat(40); }));
   run("passed", "failed", "configured", 1, mutate((input) => { input.measurements.provenance.candidate = "wrong binary"; }));
   run("passed", "failed", "configured", 1, mutate((input) => {
     for (const trial of input.measurements.trials.hot.flat()) trial.baseline = "e".repeat(40);
   }));
   run("passed", "invalid", "configured", 1, mutate((input) => { input.measurements.metric = "legacy"; }));
+  run("passed", "invalid", "configured", 1, mutate((input) => {
+    const trial = input.measurements.trials.cold[0][0];
+    trial.inclusive_total_ms = trial.total_ms + 1; // Two separate harness steps cost 1 ms each.
+  }));
+  run("passed", "invalid", "configured", 1, mutate((input) => {
+    const trial = input.measurements.trials.hot[0][0];
+    trial.steps.find(({ name }) => name === "reuse 2 build").ms = trial.total_ms;
+  }));
   run("passed", "measured", "invalid", 1, { policy: { ...approval, metric: "legacy" } });
 });
 

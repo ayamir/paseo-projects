@@ -15,7 +15,7 @@ node bin/pp.mjs working-copy promotion --evidence /absolute/scratch/evidence.jso
 
 可选 `--thresholds FILE` 读取事先审批的 JSON，不调用 PP 配置。文件使用 `schema: 2`、非空审批引用 `approval`、`metric: "useful-build-v2"`、与证据相同的 `provenance`（`revision`、含版本及二进制 SHA-256 的 `candidate`、合成 Git `baseline`、`workload` 摘要），以及 `limits` 下的 `cold`、`hot`、`dirty-derive`。每个场景至少要有一项经审批的上限：`first_use_ms`、`total_ms` 或 `retained_allocated_bytes`，用 OVNFS / Git worktree 的正数比值表示。至少一项须要求严格改善（比值低于 1）；每组配对都须符合适用的上限。这是审批记录的本地一致性检查，不是签名认证。仓库不提供假定的阈值或默认审批。
 
-Schema 2 的验收、匹配测量和全量回归引用同一组 `provenance`；回归逐文件运行无过滤的 `test/*.test.mjs`，门槛校验全部文件的 SHA-256 和通过汇总。主机 OS、架构、Node、Git、文件系统及 OVNFS 版本和架构也必须有记录，且 OVNFS 版本须与候选二进制身份一致。
+Schema 2 的验收、匹配测量和全量回归引用同一组 `provenance`。回归逐文件运行无过滤的 `test/*.test.mjs`；门槛要求同一 Git `HEAD` 的已审文件哈希、逐文件预期通过数及完整汇总，不接受名称过滤结果，即使它显示零跳过。测试文件改动后，须用无过滤回归重新核对并更新 `promotion.mjs` 中的清单。每次配对试验须有对应场景完整的 v2 阶段和可核对的计时，不能混用旧试验。主机 OS、架构、Node、Git、文件系统及 OVNFS 版本和架构也必须有记录，且 OVNFS 版本须与候选二进制身份一致。
 
 ## 测量口径
 
