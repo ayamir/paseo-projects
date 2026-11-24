@@ -191,7 +191,8 @@ export async function accept(f) {
         const after = await f.show(id);
         check(after.cwd === w.path && after.working_copy.nonce === w.nonce && f.agents().length === numberAgents + 1 && f.agents().at(-1)?.cwd === w.path, "restart changed identity or fake Agent cwd");
         check(sameRegistry(registry, await f.registry()), "restart added or removed registered resources");
-        return { outage, startup_ms, device_changed: device !== oldDevice, inode_unchanged: true };
+        check(device !== oldDevice, "ordinary remount kept the NFS device, so the restart after a device change was not exercised");
+        return { outage, startup_ms, device_changed: true, inode_unchanged: inode === oldInode };
       });
     }
     if (f.mounted) await run("explicit-delete", async () => {
