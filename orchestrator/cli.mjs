@@ -25,6 +25,7 @@ const SECTIONS = [
     ["rename <slug> <new-slug> [--name N] [--dry-run]"],
     ["sweep <slug> [--dry-run] [--yes]"],
     ["doctor [--fix]"],
+    ["working-copy promotion [--evidence FILE] [--thresholds FILE]", "read-only OVNFS default promotion check, JSON; exits nonzero when blocked"],
     ["migrate-herdr [HERDR_ROOT] [--dry-run]", "copy herdr-projects projects here (default ~/.herdr-projects)"],
     ["board tasks|routines|settings|memory|resources", "what the board plugin shows, as JSON"],
     ["board thread <slug> <id>", "the board's thread detail, as JSON"],

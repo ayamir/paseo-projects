@@ -29,9 +29,16 @@ const need = (v, usage) => { if (v === undefined || v === "") throw new Error(`u
 async function main() {
   const { pos, flags: f, given, inlined } = parse(process.argv.slice(2));
   check(pos, given, inlined); // before anything runs: an option the command does not declare is an error, not ignored
+  const [cmd, a1, a2, a3] = pos;
+  if (cmd === "working-copy") {
+    const { promotion } = await import("../orchestrator/promotion.mjs");
+    const result = promotion(f.evidence, f.thresholds);
+    console.log(JSON.stringify(result, null, 2));
+    if (result.promotion === "blocked") process.exitCode = 1;
+    return;
+  }
   const root = rootOf({ root: f.root });
   const proj = (slug, usage) => Project.open(root, need(slug, usage));
-  const [cmd, a1, a2, a3] = pos;
 
   switch (cmd) {
     case undefined: case "help": case "-h": process.stdout.write(HELP); return;

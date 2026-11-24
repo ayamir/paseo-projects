@@ -1,0 +1,1020 @@
+{
+  "schema": 1,
+  "environment": {
+    "platform": "darwin",
+    "arch": "arm64",
+    "node": "v26.13.1",
+    "workload": "456c5f9e0bb1f38bc0823926c879ca0c4b3b2bc941de0ea4f0fdf05b5f324019",
+    "unique_physical_bytes": "unknown",
+    "integration": "fa3a57c01547b5977cee08c99225e5db8f09c2f5",
+    "git": "git version 2.56.1",
+    "macos": "27.2.1",
+    "volume": "apfs",
+    "ovnfs": {
+      "version": "v0.8.0",
+      "go": "go1.27.3",
+      "os": "darwin",
+      "arch": "arm64"
+    },
+    "candidate": "ovnfs/v0.8.0/e4aea24c6f2cc770b41fdd53896893a839c6dfba6651ecfe0fbd819d8e892f3d",
+    "background_load": "shared host; trials sequential; OS caches not purged"
+  },
+  "measurements": {
+    "cold": [
+      [
+        {
+          "backend": "git-worktree",
+          "status": "passed",
+          "steps": [
+            {
+              "name": "fixture setup",
+              "ms": 392.2867499999993
+            },
+            {
+              "name": "cold launch",
+              "ms": 529.4622090000012
+            },
+            {
+              "name": "cold build",
+              "ms": 32.85533300000134
+            },
+            {
+              "name": "normal resolution and cleanup",
+              "ms": 1552.723165999998
+            },
+            {
+              "name": "fixture teardown",
+              "ms": 30.627957999997307
+            }
+          ],
+          "baseline": "6d1f60fe81e1063fdf11bbcd0dee50df6d19420b",
+          "baseline_storage": {
+            "logical_bytes": 1028211,
+            "allocated_bytes": 1716224
+          },
+          "first_use_ms": 562.4712499999987,
+          "digests": [
+            "9fc682e5ba908e3f917a91f74dfe679c61e4c12af7a621a3c157ee1eda146e3e"
+          ],
+          "total_ms": 562.4759999999987,
+          "retained": {
+            "logical_bytes": 1046614,
+            "allocated_bytes": 1794048,
+            "storage": {
+              "source": {
+                "logical_bytes": 1028463,
+                "allocated_bytes": 1724416
+              },
+              "pp": {
+                "logical_bytes": 18151,
+                "allocated_bytes": 69632
+              },
+              "backend_state": {
+                "logical_bytes": 0,
+                "allocated_bytes": 0
+              },
+              "git_worktrees": {
+                "logical_bytes": 0,
+                "allocated_bytes": 0
+              }
+            },
+            "git_worktrees": 0
+          },
+          "cleanup": "removed"
+        },
+        {
+          "backend": "ovnfs",
+          "status": "passed",
+          "steps": [
+            {
+              "name": "fixture setup",
+              "ms": 391.9069589999999
+            },
+            {
+              "name": "daemon startup",
+              "ms": 129.20291599999837
+            },
+            {
+              "name": "cold launch",
+              "ms": 854.2518329999984,
+              "to_capture_ready_ms": 367.6279590000013
+            },
+            {
+              "name": "cold build",
+              "ms": 45.28508299999885
+            },
+            {
+              "name": "normal resolution and cleanup",
+              "ms": 874.7908749999988
+            },
+            {
+              "name": "fixture teardown",
+              "ms": 112.25249999999869
+            }
+          ],
+          "baseline": "6d1f60fe81e1063fdf11bbcd0dee50df6d19420b",
+          "baseline_storage": {
+            "logical_bytes": 1028211,
+            "allocated_bytes": 1716224
+          },
+          "startup_ms": 116.54070900000079,
+          "first_use_ms": 1043.2945839999993,
+          "digests": [
+            "9fc682e5ba908e3f917a91f74dfe679c61e4c12af7a621a3c157ee1eda146e3e"
+          ],
+          "total_ms": 1043.3006669999995,
+          "retained": {
+            "logical_bytes": 2080845,
+            "allocated_bytes": 3104768,
+            "storage": {
+              "source": {
+                "logical_bytes": 1028211,
+                "allocated_bytes": 1716224
+              },
+              "pp": {
+                "logical_bytes": 1003565,
+                "allocated_bytes": 1277952
+              },
+              "backend_state": {
+                "logical_bytes": 49069,
+                "allocated_bytes": 110592
+              },
+              "git_worktrees": {
+                "logical_bytes": 0,
+                "allocated_bytes": 0
+              }
+            },
+            "git_worktrees": 0,
+            "checkouts": 1,
+            "snapshots": 0
+          },
+          "cleanup": "removed"
+        }
+      ],
+      [
+        {
+          "backend": "ovnfs",
+          "status": "passed",
+          "steps": [
+            {
+              "name": "fixture setup",
+              "ms": 359.44295799999963
+            },
+            {
+              "name": "daemon startup",
+              "ms": 128.1116669999974
+            },
+            {
+              "name": "cold launch",
+              "ms": 793.6075419999979,
+              "to_capture_ready_ms": 348.42883300000176
+            },
+            {
+              "name": "cold build",
+              "ms": 45.481542000001355
+            },
+            {
+              "name": "normal resolution and cleanup",
+              "ms": 845.4541669999999
+            },
+            {
+              "name": "fixture teardown",
+              "ms": 106.58658300000025
+            }
+          ],
+          "baseline": "6d1f60fe81e1063fdf11bbcd0dee50df6d19420b",
+          "baseline_storage": {
+            "logical_bytes": 1028211,
+            "allocated_bytes": 1716224
+          },
+          "startup_ms": 116.71112500000163,
+          "first_use_ms": 982.4861669999991,
+          "digests": [
+            "9fc682e5ba908e3f917a91f74dfe679c61e4c12af7a621a3c157ee1eda146e3e"
+          ],
+          "total_ms": 982.4886669999978,
+          "retained": {
+            "logical_bytes": 2080845,
+            "allocated_bytes": 3104768,
+            "storage": {
+              "source": {
+                "logical_bytes": 1028211,
+                "allocated_bytes": 1716224
+              },
+              "pp": {
+                "logical_bytes": 1003565,
+                "allocated_bytes": 1277952
+              },
+              "backend_state": {
+                "logical_bytes": 49069,
+                "allocated_bytes": 110592
+              },
+              "git_worktrees": {
+                "logical_bytes": 0,
+                "allocated_bytes": 0
+              }
+            },
+            "git_worktrees": 0,
+            "checkouts": 1,
+            "snapshots": 0
+          },
+          "cleanup": "removed"
+        },
+        {
+          "backend": "git-worktree",
+          "status": "passed",
+          "steps": [
+            {
+              "name": "fixture setup",
+              "ms": 412.5659999999989
+            },
+            {
+              "name": "cold launch",
+              "ms": 560.4094159999986
+            },
+            {
+              "name": "cold build",
+              "ms": 32.04816700000083
+            },
+            {
+              "name": "normal resolution and cleanup",
+              "ms": 1474.221625000002
+            },
+            {
+              "name": "fixture teardown",
+              "ms": 31.558000000000902
+            }
+          ],
+          "baseline": "6d1f60fe81e1063fdf11bbcd0dee50df6d19420b",
+          "baseline_storage": {
+            "logical_bytes": 1028211,
+            "allocated_bytes": 1716224
+          },
+          "first_use_ms": 592.4888749999991,
+          "digests": [
+            "9fc682e5ba908e3f917a91f74dfe679c61e4c12af7a621a3c157ee1eda146e3e"
+          ],
+          "total_ms": 592.4912499999991,
+          "retained": {
+            "logical_bytes": 1046614,
+            "allocated_bytes": 1794048,
+            "storage": {
+              "source": {
+                "logical_bytes": 1028463,
+                "allocated_bytes": 1724416
+              },
+              "pp": {
+                "logical_bytes": 18151,
+                "allocated_bytes": 69632
+              },
+              "backend_state": {
+                "logical_bytes": 0,
+                "allocated_bytes": 0
+              },
+              "git_worktrees": {
+                "logical_bytes": 0,
+                "allocated_bytes": 0
+              }
+            },
+            "git_worktrees": 0
+          },
+          "cleanup": "removed"
+        }
+      ]
+    ],
+    "hot": [
+      [
+        {
+          "backend": "git-worktree",
+          "status": "passed",
+          "steps": [
+            {
+              "name": "fixture setup",
+              "ms": 397.12162499999977
+            },
+            {
+              "name": "cache seed preparation",
+              "ms": 0.3863329999985581
+            },
+            {
+              "name": "reuse 1 launch",
+              "ms": 566.9726659999978
+            },
+            {
+              "name": "reuse 1 build",
+              "ms": 29.549749999998312
+            },
+            {
+              "name": "reuse 2 launch",
+              "ms": 572.9957500000019
+            },
+            {
+              "name": "reuse 2 build",
+              "ms": 31.228124999997817
+            },
+            {
+              "name": "invalidate seed",
+              "ms": 0.23591600000145263
+            },
+            {
+              "name": "invalidated launch",
+              "ms": 558.5580000000009
+            },
+            {
+              "name": "invalidated cold build",
+              "ms": 29.076458999999886
+            },
+            {
+              "name": "normal resolution and cleanup",
+              "ms": 3730.409875000001
+            },
+            {
+              "name": "fixture teardown",
+              "ms": 46.92962500000067
+            }
+          ],
+          "baseline": "6d1f60fe81e1063fdf11bbcd0dee50df6d19420b",
+          "baseline_storage": {
+            "logical_bytes": 1028211,
+            "allocated_bytes": 1716224
+          },
+          "first_use_ms": 597.0251659999994,
+          "digests": [
+            "9fc682e5ba908e3f917a91f74dfe679c61e4c12af7a621a3c157ee1eda146e3e",
+            "9fc682e5ba908e3f917a91f74dfe679c61e4c12af7a621a3c157ee1eda146e3e",
+            "9fc682e5ba908e3f917a91f74dfe679c61e4c12af7a621a3c157ee1eda146e3e"
+          ],
+          "total_ms": 2238.018583000001,
+          "retained": {
+            "logical_bytes": 3258733,
+            "allocated_bytes": 4546560,
+            "storage": {
+              "source": {
+                "logical_bytes": 1045964,
+                "allocated_bytes": 1810432
+              },
+              "pp": {
+                "logical_bytes": 24351,
+                "allocated_bytes": 106496
+              },
+              "backend_state": {
+                "logical_bytes": 0,
+                "allocated_bytes": 0
+              },
+              "git_worktrees": {
+                "logical_bytes": 2188418,
+                "allocated_bytes": 2629632
+              }
+            },
+            "git_worktrees": 2
+          },
+          "cleanup": "removed"
+        },
+        {
+          "backend": "ovnfs",
+          "status": "passed",
+          "steps": [
+            {
+              "name": "fixture setup",
+              "ms": 380.54949999999735
+            },
+            {
+              "name": "daemon startup",
+              "ms": 129.09400000000096
+            },
+            {
+              "name": "cache seed preparation",
+              "ms": 0.405083999998169
+            },
+            {
+              "name": "reuse 1 launch",
+              "ms": 950.2384999999995,
+              "to_capture_ready_ms": 379.78970899999695
+            },
+            {
+              "name": "reuse 1 build",
+              "ms": 47.14012499999808
+            },
+            {
+              "name": "reuse 2 launch",
+              "ms": 928.9648750000015,
+              "to_capture_ready_ms": 391.8817500000041
+            },
+            {
+              "name": "reuse 2 build",
+              "ms": 42.66966700000194
+            },
+            {
+              "name": "invalidate seed",
+              "ms": 0.09587499999906868
+            },
+            {
+              "name": "invalidated launch",
+              "ms": 1111.7380829999965,
+              "to_capture_ready_ms": 464.16083400000207
+            },
+            {
+              "name": "invalidated cold build",
+              "ms": 48.06245900000067
+            },
+            {
+              "name": "normal resolution and cleanup",
+              "ms": 2412.308499999999
+            },
+            {
+              "name": "fixture teardown",
+              "ms": 125.38137500000448
+            }
+          ],
+          "baseline": "6d1f60fe81e1063fdf11bbcd0dee50df6d19420b",
+          "baseline_storage": {
+            "logical_bytes": 1028211,
+            "allocated_bytes": 1716224
+          },
+          "startup_ms": 117.02841599999738,
+          "first_use_ms": 1142.1003749999982,
+          "digests": [
+            "9fc682e5ba908e3f917a91f74dfe679c61e4c12af7a621a3c157ee1eda146e3e",
+            "9fc682e5ba908e3f917a91f74dfe679c61e4c12af7a621a3c157ee1eda146e3e",
+            "9fc682e5ba908e3f917a91f74dfe679c61e4c12af7a621a3c157ee1eda146e3e"
+          ],
+          "total_ms": 3805.496332999999,
+          "retained": {
+            "logical_bytes": 4464215,
+            "allocated_bytes": 6086656,
+            "storage": {
+              "source": {
+                "logical_bytes": 1028234,
+                "allocated_bytes": 1720320
+              },
+              "pp": {
+                "logical_bytes": 3006896,
+                "allocated_bytes": 3772416
+              },
+              "backend_state": {
+                "logical_bytes": 429085,
+                "allocated_bytes": 593920
+              },
+              "git_worktrees": {
+                "logical_bytes": 0,
+                "allocated_bytes": 0
+              }
+            },
+            "git_worktrees": 0,
+            "checkouts": 3,
+            "snapshots": 0
+          },
+          "cleanup": "removed"
+        }
+      ],
+      [
+        {
+          "backend": "ovnfs",
+          "status": "passed",
+          "steps": [
+            {
+              "name": "fixture setup",
+              "ms": 397.1163749999978
+            },
+            {
+              "name": "daemon startup",
+              "ms": 128.65250000000378
+            },
+            {
+              "name": "cache seed preparation",
+              "ms": 0.33741700000246055
+            },
+            {
+              "name": "reuse 1 launch",
+              "ms": 905.4925839999996,
+              "to_capture_ready_ms": 391.26087499999994
+            },
+            {
+              "name": "reuse 1 build",
+              "ms": 45.241000000001804
+            },
+            {
+              "name": "reuse 2 launch",
+              "ms": 1001.971540999999,
+              "to_capture_ready_ms": 378.7766249999986
+            },
+            {
+              "name": "reuse 2 build",
+              "ms": 41.6985829999976
+            },
+            {
+              "name": "invalidate seed",
+              "ms": 0.13299999999435386
+            },
+            {
+              "name": "invalidated launch",
+              "ms": 1050.5609160000022,
+              "to_capture_ready_ms": 539.270457999999
+            },
+            {
+              "name": "invalidated cold build",
+              "ms": 40.49595899999986
+            },
+            {
+              "name": "normal resolution and cleanup",
+              "ms": 4077.962333000003
+            },
+            {
+              "name": "fixture teardown",
+              "ms": 130.9394170000014
+            }
+          ],
+          "baseline": "6d1f60fe81e1063fdf11bbcd0dee50df6d19420b",
+          "baseline_storage": {
+            "logical_bytes": 1028211,
+            "allocated_bytes": 1716224
+          },
+          "startup_ms": 117.27604200000496,
+          "first_use_ms": 1094.1529579999988,
+          "digests": [
+            "9fc682e5ba908e3f917a91f74dfe679c61e4c12af7a621a3c157ee1eda146e3e",
+            "9fc682e5ba908e3f917a91f74dfe679c61e4c12af7a621a3c157ee1eda146e3e",
+            "9fc682e5ba908e3f917a91f74dfe679c61e4c12af7a621a3c157ee1eda146e3e"
+          ],
+          "total_ms": 3760.5002079999977,
+          "retained": {
+            "logical_bytes": 4464216,
+            "allocated_bytes": 6086656,
+            "storage": {
+              "source": {
+                "logical_bytes": 1028234,
+                "allocated_bytes": 1720320
+              },
+              "pp": {
+                "logical_bytes": 3006897,
+                "allocated_bytes": 3772416
+              },
+              "backend_state": {
+                "logical_bytes": 429085,
+                "allocated_bytes": 593920
+              },
+              "git_worktrees": {
+                "logical_bytes": 0,
+                "allocated_bytes": 0
+              }
+            },
+            "git_worktrees": 0,
+            "checkouts": 3,
+            "snapshots": 0
+          },
+          "cleanup": "removed"
+        },
+        {
+          "backend": "git-worktree",
+          "status": "passed",
+          "steps": [
+            {
+              "name": "fixture setup",
+              "ms": 394.79104100000404
+            },
+            {
+              "name": "cache seed preparation",
+              "ms": 0.3311249999969732
+            },
+            {
+              "name": "reuse 1 launch",
+              "ms": 605.2921669999996
+            },
+            {
+              "name": "reuse 1 build",
+              "ms": 31.233625000000757
+            },
+            {
+              "name": "reuse 2 launch",
+              "ms": 587.6211249999978
+            },
+            {
+              "name": "reuse 2 build",
+              "ms": 41.95316699999967
+            },
+            {
+              "name": "invalidate seed",
+              "ms": 0.14329100000031758
+            },
+            {
+              "name": "invalidated launch",
+              "ms": 548.7010000000009
+            },
+            {
+              "name": "invalidated cold build",
+              "ms": 30.03624999999738
+            },
+            {
+              "name": "normal resolution and cleanup",
+              "ms": 3909.180583000001
+            },
+            {
+              "name": "fixture teardown",
+              "ms": 41.519500000002154
+            }
+          ],
+          "baseline": "6d1f60fe81e1063fdf11bbcd0dee50df6d19420b",
+          "baseline_storage": {
+            "logical_bytes": 1028211,
+            "allocated_bytes": 1716224
+          },
+          "first_use_ms": 636.8882909999957,
+          "digests": [
+            "9fc682e5ba908e3f917a91f74dfe679c61e4c12af7a621a3c157ee1eda146e3e",
+            "9fc682e5ba908e3f917a91f74dfe679c61e4c12af7a621a3c157ee1eda146e3e",
+            "9fc682e5ba908e3f917a91f74dfe679c61e4c12af7a621a3c157ee1eda146e3e"
+          ],
+          "total_ms": 2297.780332999995,
+          "retained": {
+            "logical_bytes": 3258733,
+            "allocated_bytes": 4546560,
+            "storage": {
+              "source": {
+                "logical_bytes": 1045964,
+                "allocated_bytes": 1810432
+              },
+              "pp": {
+                "logical_bytes": 24351,
+                "allocated_bytes": 106496
+              },
+              "backend_state": {
+                "logical_bytes": 0,
+                "allocated_bytes": 0
+              },
+              "git_worktrees": {
+                "logical_bytes": 2188418,
+                "allocated_bytes": 2629632
+              }
+            },
+            "git_worktrees": 2
+          },
+          "cleanup": "removed"
+        }
+      ]
+    ],
+    "dirty-derive": [
+      [
+        {
+          "backend": "git-worktree",
+          "status": "passed",
+          "steps": [
+            {
+              "name": "fixture setup",
+              "ms": 369.9555829999954
+            },
+            {
+              "name": "parent launch",
+              "ms": 543.9977919999947
+            },
+            {
+              "name": "identical tracked edit",
+              "ms": 25.58125000000291
+            },
+            {
+              "name": "freeze dirty input",
+              "ms": 27.48162500000035
+            },
+            {
+              "name": "derive 1 launch",
+              "ms": 547.5343750000029
+            },
+            {
+              "name": "derive 1 build",
+              "ms": 29.398958000005223
+            },
+            {
+              "name": "derive 2 launch",
+              "ms": 506.50879200000054
+            },
+            {
+              "name": "derive 2 build",
+              "ms": 29.209291000006488
+            },
+            {
+              "name": "normal resolution and cleanup",
+              "ms": 3715.3387500000026
+            },
+            {
+              "name": "fixture teardown",
+              "ms": 34.08679200000188
+            }
+          ],
+          "baseline": "6d1f60fe81e1063fdf11bbcd0dee50df6d19420b",
+          "baseline_storage": {
+            "logical_bytes": 1028211,
+            "allocated_bytes": 1716224
+          },
+          "first_use_ms": 1174.0469159999993,
+          "digests": [
+            "652bf82c78a405e7aa7c534705eac237e8b8327f720526acdd81a8abb96d1574",
+            "652bf82c78a405e7aa7c534705eac237e8b8327f720526acdd81a8abb96d1574"
+          ],
+          "total_ms": 1709.7926250000019,
+          "retained": {
+            "logical_bytes": 2059337,
+            "allocated_bytes": 3117056,
+            "storage": {
+              "source": {
+                "logical_bytes": 1038153,
+                "allocated_bytes": 1789952
+              },
+              "pp": {
+                "logical_bytes": 37539,
+                "allocated_bytes": 122880
+              },
+              "backend_state": {
+                "logical_bytes": 0,
+                "allocated_bytes": 0
+              },
+              "git_worktrees": {
+                "logical_bytes": 983645,
+                "allocated_bytes": 1204224
+              }
+            },
+            "git_worktrees": 1
+          },
+          "cleanup": "removed"
+        },
+        {
+          "backend": "ovnfs",
+          "status": "failed",
+          "steps": [
+            {
+              "name": "fixture setup",
+              "ms": 358.5477499999979
+            },
+            {
+              "name": "daemon startup",
+              "ms": 132.21033300000272
+            },
+            {
+              "name": "parent launch",
+              "ms": 850.1962910000002,
+              "to_capture_ready_ms": 356.76787499999773
+            },
+            {
+              "name": "identical tracked edit",
+              "ms": 24.854166000004625
+            },
+            {
+              "name": "freeze dirty input",
+              "ms": 426.0195409999942
+            },
+            {
+              "name": "derive 1 launch",
+              "ms": 422.5745410000018
+            },
+            {
+              "name": "normal resolution and cleanup",
+              "ms": 979.3042090000017
+            },
+            {
+              "name": "fixture teardown",
+              "ms": 105.71824999999808
+            }
+          ],
+          "baseline": "6d1f60fe81e1063fdf11bbcd0dee50df6d19420b",
+          "baseline_storage": {
+            "logical_bytes": 1028211,
+            "allocated_bytes": 1716224
+          },
+          "startup_ms": 120.50125000000116,
+          "reason": "derive 1 launch: pp thread start: error: t-0002 did not start: OVNFS checkout generation does not match at <fixture>/mnt/pp-<checkout>; `thread restart fixture t-0002` tries again",
+          "elapsed_to_failure_ms": 1886.9762919999994,
+          "retention_error": "pp thread resolve: error: OVNFS resource identity is not confirmed",
+          "retained": {
+            "logical_bytes": 2118313,
+            "allocated_bytes": 3190784,
+            "storage": {
+              "source": {
+                "logical_bytes": 1028211,
+                "allocated_bytes": 1716224
+              },
+              "pp": {
+                "logical_bytes": 1007768,
+                "allocated_bytes": 1290240
+              },
+              "backend_state": {
+                "logical_bytes": 82334,
+                "allocated_bytes": 184320
+              },
+              "git_worktrees": {
+                "logical_bytes": 0,
+                "allocated_bytes": 0
+              }
+            },
+            "git_worktrees": 0,
+            "checkouts": 2,
+            "snapshots": 1
+          },
+          "cleanup": "removed"
+        }
+      ],
+      [
+        {
+          "backend": "ovnfs",
+          "status": "failed",
+          "steps": [
+            {
+              "name": "fixture setup",
+              "ms": 353.4661669999987
+            },
+            {
+              "name": "daemon startup",
+              "ms": 130.90095800000563
+            },
+            {
+              "name": "parent launch",
+              "ms": 829.1444160000028,
+              "to_capture_ready_ms": 347.0374579999989
+            },
+            {
+              "name": "identical tracked edit",
+              "ms": 24.66554200000246
+            },
+            {
+              "name": "freeze dirty input",
+              "ms": 490.0350829999952
+            },
+            {
+              "name": "derive 1 launch",
+              "ms": 474.450125000003
+            },
+            {
+              "name": "normal resolution and cleanup",
+              "ms": 1095.484083000003
+            },
+            {
+              "name": "fixture teardown",
+              "ms": 107.24304200000188
+            }
+          ],
+          "baseline": "6d1f60fe81e1063fdf11bbcd0dee50df6d19420b",
+          "baseline_storage": {
+            "logical_bytes": 1028211,
+            "allocated_bytes": 1716224
+          },
+          "startup_ms": 119.55550000000221,
+          "reason": "derive 1 launch: pp thread start: error: t-0002 did not start: OVNFS checkout generation does not match at <fixture>/mnt/pp-<checkout>; `thread restart fixture t-0002` tries again",
+          "elapsed_to_failure_ms": 1985.1569999999992,
+          "retention_error": "pp thread resolve: error: OVNFS resource identity is not confirmed",
+          "retained": {
+            "logical_bytes": 2118291,
+            "allocated_bytes": 3190784,
+            "storage": {
+              "source": {
+                "logical_bytes": 1028211,
+                "allocated_bytes": 1716224
+              },
+              "pp": {
+                "logical_bytes": 1007768,
+                "allocated_bytes": 1290240
+              },
+              "backend_state": {
+                "logical_bytes": 82312,
+                "allocated_bytes": 184320
+              },
+              "git_worktrees": {
+                "logical_bytes": 0,
+                "allocated_bytes": 0
+              }
+            },
+            "git_worktrees": 0,
+            "checkouts": 2,
+            "snapshots": 1
+          },
+          "cleanup": "removed"
+        },
+        {
+          "backend": "git-worktree",
+          "status": "passed",
+          "steps": [
+            {
+              "name": "fixture setup",
+              "ms": 380.6431250000023
+            },
+            {
+              "name": "parent launch",
+              "ms": 506.71958299999824
+            },
+            {
+              "name": "identical tracked edit",
+              "ms": 22.748292000003858
+            },
+            {
+              "name": "freeze dirty input",
+              "ms": 26.79983300001186
+            },
+            {
+              "name": "derive 1 launch",
+              "ms": 521.2338749999908
+            },
+            {
+              "name": "derive 1 build",
+              "ms": 30.19458399999712
+            },
+            {
+              "name": "derive 2 launch",
+              "ms": 514.4945000000007
+            },
+            {
+              "name": "derive 2 build",
+              "ms": 30.79787499998929
+            },
+            {
+              "name": "normal resolution and cleanup",
+              "ms": 3691.1113329999935
+            },
+            {
+              "name": "fixture teardown",
+              "ms": 37.06554199999664
+            }
+          ],
+          "baseline": "6d1f60fe81e1063fdf11bbcd0dee50df6d19420b",
+          "baseline_storage": {
+            "logical_bytes": 1028211,
+            "allocated_bytes": 1716224
+          },
+          "first_use_ms": 1107.7447079999984,
+          "digests": [
+            "652bf82c78a405e7aa7c534705eac237e8b8327f720526acdd81a8abb96d1574",
+            "652bf82c78a405e7aa7c534705eac237e8b8327f720526acdd81a8abb96d1574"
+          ],
+          "total_ms": 1653.0713329999999,
+          "retained": {
+            "logical_bytes": 2059337,
+            "allocated_bytes": 3117056,
+            "storage": {
+              "source": {
+                "logical_bytes": 1038153,
+                "allocated_bytes": 1789952
+              },
+              "pp": {
+                "logical_bytes": 37539,
+                "allocated_bytes": 122880
+              },
+              "backend_state": {
+                "logical_bytes": 0,
+                "allocated_bytes": 0
+              },
+              "git_worktrees": {
+                "logical_bytes": 983645,
+                "allocated_bytes": 1204224
+              }
+            },
+            "git_worktrees": 1
+          },
+          "cleanup": "removed"
+        }
+      ]
+    ]
+  },
+  "reliability": {
+    "mount": {
+      "status": "passed",
+      "startup_ms": 120.22824999999995,
+      "transport": "NFSv3 Unix socket"
+    },
+    "capture-and-cache": {
+      "status": "passed",
+      "baseline": "6d1f60fe81e1063fdf11bbcd0dee50df6d19420b",
+      "capture": {
+        "logical_bytes": 998071,
+        "allocated_bytes": 1228800
+      },
+      "registry_source_is_capture": true
+    },
+    "experiment-and-derived": {
+      "status": "failed",
+      "reason": "pp thread start: error: t-0002 did not start: OVNFS checkout generation does not match at <fixture>/mnt/pp-<fixture-id>; `thread restart fixture t-0002` tries again; derivative registry row exists; generation marker belongs to the snapshot source"
+    },
+    "restart": {
+      "status": "failed",
+      "reason": "pp thread restart: error: OVNFS checkout identity does not match at <fixture>/mnt/pp-<fixture-id>; NFS device changed, inode unchanged; no duplicate checkout or Agent"
+    },
+    "retention": {
+      "status": "passed"
+    },
+    "explicit-delete": {
+      "status": "failed",
+      "reason": "error: OVNFS checkout removal unconfirmed: OVNFS v0.8.0 rm: conflict: checkout pp-<fixture-id> holds 1 commit that no branch of <fixture>/pp/.pp-working-copy-inputs/<fixture-id>/repo reaches, 79a37b4bc313 \"private result\"; checkout retained, PP recorded unknown, file and commit independently restored"
+    },
+    "teardown": {
+      "status": "passed"
+    }
+  },
+  "regression": {
+    "status": "passed",
+    "tests": 120,
+    "pass": 120,
+    "fail": 0,
+    "skipped": 0
+  },
+  "targeted_regression": {
+    "status": "passed",
+    "tests": 15,
+    "pass": 15,
+    "fail": 0,
+    "skipped": 0
+  }
+}

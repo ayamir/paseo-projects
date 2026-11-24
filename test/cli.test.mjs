@@ -3,7 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readdirSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -58,6 +58,52 @@ test("an unknown or incomplete command is refused with the usage lines of its na
 test("help is the table: each usage line is in it, and an option names one meaning", () => {
   for (const e of ENTRIES) assert.ok(HELP.includes(e.use), e.use);
   assert.ok(VALUE_FLAGS.has("root") && VALUE_FLAGS.has("text-file") && !VALUE_FLAGS.has("dry-run") && !VALUE_FLAGS.has("fresh"));
+});
+
+test("promotion check blocks without evidence or approved thresholds", () => {
+  const r = spawnSync(process.execPath, [PP, "working-copy", "promotion"], {
+    encoding: "utf8", env: { PATH: process.env.PATH, PP_CONFIG: "/dev/null" },
+  });
+  assert.equal(r.status, 1);
+  assert.deepEqual(JSON.parse(r.stdout), {
+    default_backend: "git-worktree", promotion: "blocked", reliability: "missing", measured_benefit: "missing", thresholds: "missing",
+  });
+});
+
+test("promotion checks reliability and every matched comparison independently without changing the default", (t) => {
+  const dir = mkdtempSync(join(realpathSync(tmpdir()), "pp-promotion-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const evidencePath = join(dir, "evidence.json"), approvalPath = join(dir, "approval.json"), unusedRoot = join(dir, "untouched");
+  const evidence = { schema: 1, environment: { platform: "darwin", node: "v26.13.1", candidate: `ovnfs/v0.8.0/${"a".repeat(64)}`, integration: "b".repeat(40), workload: "c".repeat(64) },
+    regression: { status: "passed", tests: 2, pass: 2, fail: 0, skipped: 0 },
+    reliability: Object.fromEntries(["mount", "capture-and-cache", "experiment-and-derived", "restart", "retention", "explicit-delete", "teardown"].map((key) => [key, { status: "passed" }])),
+    measurements: Object.fromEntries([["cold", 1], ["hot", 3], ["dirty-derive", 2]].map(([scenario, n]) => {
+      const trial = (backend, ms) => ({ backend, status: "passed", cleanup: "removed", first_use_ms: ms, total_ms: ms, retained: { allocated_bytes: 100 }, baseline: "1".repeat(40), digests: Array(n).fill("d".repeat(64)) });
+      return [scenario, [[trial("git-worktree", 100), trial("ovnfs", 80)], [trial("ovnfs", 90), trial("git-worktree", 100)]]];
+    })) };
+  const approval = { schema: 1, approval: "synthetic approval for this test only", candidate: evidence.environment.candidate, workload: evidence.environment.workload,
+    limits: { cold: { first_use_ms: 0.9 }, hot: { total_ms: 0.9 }, "dirty-derive": { retained_allocated_bytes: 1 } } };
+  function run(reliability, benefit, thresholds, status, { input = evidence, policy = approval } = {}) {
+    writeFileSync(evidencePath, JSON.stringify(input));
+    if (policy) writeFileSync(approvalPath, JSON.stringify(policy));
+    const r = spawnSync(process.execPath, [PP, "--root", unusedRoot, "working-copy", "promotion", "--evidence", evidencePath, ...(policy ? ["--thresholds", approvalPath] : [])], {
+      encoding: "utf8", env: { PATH: process.env.PATH, PP_CONFIG: "/dev/null" },
+    });
+    assert.equal(r.status, status, r.stderr);
+    assert.deepEqual(JSON.parse(r.stdout), { default_backend: "git-worktree", promotion: status === 0 ? "eligible" : "blocked", reliability, measured_benefit: benefit, thresholds });
+    assert.ok(!existsSync(unusedRoot));
+  }
+  run("passed", "measured", "missing", 1, { policy: null });
+  run("passed", "passed", "configured", 0);
+  const broken = structuredClone(evidence);
+  broken.measurements.cold[1][0].digests[0] = "e".repeat(64);
+  run("passed", "failed", "configured", 1, { input: broken });
+  run("failed", "passed", "configured", 1, { input: { ...evidence, reliability: { ...evidence.reliability, retention: { status: "failed" } } } });
+  run("passed", "failed", "configured", 1, { policy: { ...approval, limits: { ...approval.limits, cold: { first_use_ms: 0.85 } } } });
+  run("passed", "measured", "invalid", 1, { policy: { ...approval, candidate: "wrong binary" } });
+  run("passed", "measured", "invalid", 1, { policy: { ...approval, limits: {
+    cold: { first_use_ms: 1 }, hot: { total_ms: 1 }, "dirty-derive": { retained_allocated_bytes: 1 },
+  } } });
 });
 
 test("thread start rejects an invalid --reviews URL before allocating a thread", (t) => {
