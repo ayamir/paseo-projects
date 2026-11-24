@@ -1,6 +1,6 @@
 import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { build, dirty, file, initialize, launch, warm, write } from "./ovnfs-acceptance.mjs";
+import { build, dirty, dispatch, file, initialize, verifyBuild, warm, write } from "./ovnfs-acceptance.mjs";
 import { requireThat as check } from "./ovnfs-fixture.mjs";
 
 async function retained(f, backend) {
@@ -20,44 +20,56 @@ async function retained(f, backend) {
 
 export async function measure(f, backend, scenario) {
   const run = { backend, status: "failed", steps: [] };
-  let stage = "fixture setup", base, at, storage;
+  let stage = "fixture setup", base, at, storage, excluded = 0;
   const timed = async (name, fn) => {
     stage = name;
     const start = performance.now();
     try { return await fn(); }
     finally { run.steps.push({ name, ms: performance.now() - start }); }
   };
+  const harness = async (name, fn) => {
+    const start = performance.now();
+    try { return await timed(name, fn); }
+    finally { excluded += performance.now() - start; }
+  };
+  const usefulElapsed = () => performance.now() - at - excluded;
   const captureRoot = join(f.root, ".pp-working-copy-inputs");
   const capturePaths = () => existsSync(captureRoot) ? readdirSync(captureRoot).filter((name) => existsSync(join(captureRoot, name, "repo"))) : [];
   const start = async (name, ...flags) => {
-    const captures = new Set(capturePaths());
+    const captures = await harness(`${name} preflight`, async () => {
+      if (backend === "ovnfs") await f.proveMount();
+      return new Set(capturePaths());
+    });
     let ready;
-    if (backend === "ovnfs") await f.proveMount();
     const launchAt = performance.now();
     // The published capture is a local path. Polling bounds timing resolution, not the capture itself.
     const poll = setInterval(() => {
       if (capturePaths().some((path) => !captures.has(path))) ready ??= performance.now();
     }, 10);
     try {
-      const result = await timed(name, () => launch(f, backend, ...flags));
+      const result = await timed(name, () => dispatch(f, backend, ...flags));
       const step = run.steps.at(-1);
       if (ready !== undefined) step.to_capture_ready_ms = ready - launchAt;
       return result;
     } finally { clearInterval(poll); }
   };
   const useful = async (name, t, options = {}, expectedCache) => {
-    const { digest } = await timed(name, () => build(f, t.agent.cwd, options));
-    run.first_use_ms ??= performance.now() - at;
+    const digest = await timed(name, () => build(f, t.agent.cwd, options));
+    run.first_use_ms ??= usefulElapsed();
+    run.total_ms = usefulElapsed();
     (run.digests ??= []).push(digest);
-    if (expectedCache) {
-      const { working_copy: w } = await f.show(t.id);
-      check(w.cache?.state === expectedCache && w.path === t.agent.cwd, `expected ${expectedCache} cache at the actual Agent cwd`);
-    }
+    await harness(`${name} verification`, async () => {
+      verifyBuild(digest, options);
+      if (expectedCache) {
+        const { working_copy: w } = await f.show(t.id);
+        check(w.cache?.state === expectedCache && w.path === t.agent.cwd, `expected ${expectedCache} cache at the actual Agent cwd`);
+      }
+    });
   };
   try {
     base = await timed("fixture setup", () => initialize(f));
     run.baseline = base;
-    run.baseline_storage = await f.size(f.repo);
+    run.baseline_storage = await timed("baseline storage preflight", () => f.size(f.repo));
     at = performance.now();
     if (backend === "ovnfs") run.startup_ms = await timed("daemon startup", () => f.startOvnfs());
     if (scenario === "cold") {
@@ -70,9 +82,9 @@ export async function measure(f, backend, scenario) {
     } else {
       const parent = await start("parent launch");
       await timed("identical tracked edit", () => write(f, join(parent.agent.cwd, "input.txt"), dirty));
+      if (backend === "ovnfs") await harness("freeze dirty input preflight", () => f.proveMount());
       const flags = await timed("freeze dirty input", async () => {
         if (backend === "ovnfs") {
-          await f.proveMount();
           await f.cli("thread", "snapshot", "fixture", parent.id, "--name", "dirty");
           return ["--from-snapshot", `${parent.id}/dirty`];
         }
@@ -81,7 +93,7 @@ export async function measure(f, backend, scenario) {
       });
       for (let i = 1; i <= 2; i++) await useful(`derive ${i} build`, await start(`derive ${i} launch`, ...flags), { edited: true });
     }
-    run.total_ms = performance.now() - at;
+    run.inclusive_total_ms = performance.now() - at;
     run.status = "passed";
   } catch (e) {
     run.reason = f.scrub(`${stage}: ${e.message}`);

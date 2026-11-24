@@ -1,5 +1,7 @@
 {
   "schema": 1,
+  "metric": "legacy-inclusive-v1",
+  "useful_build_v2": "not measured",
   "environment": {
     "platform": "darwin",
     "arch": "arm64",

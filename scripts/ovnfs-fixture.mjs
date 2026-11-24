@@ -1,6 +1,6 @@
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { closeSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
@@ -34,11 +34,38 @@ function started(bin, args, env, log, cwd) {
   const fd = openSync(log, "a", 0o600);
   const child = spawn(bin, args, { env, cwd, stdio: ["ignore", fd, fd] });
   closeSync(fd);
+  let result;
   const done = new Promise((resolve) => {
-    child.once("exit", (code, signal) => resolve({ code, signal }));
-    child.once("error", (error) => resolve({ error }));
+    child.once("exit", (code, signal) => resolve(result = { code, signal }));
+    child.once("error", (error) => resolve(result = { error }));
   });
-  return { child, done };
+  return { child, done, get result() { return result; } };
+}
+
+async function waitForExit(process, timeout) {
+  let timer;
+  try { return await Promise.race([process.done, new Promise((resolve) => { timer = setTimeout(resolve, timeout); })]); }
+  finally { clearTimeout(timer); process.child.unref(); }
+}
+
+export async function stopOwnedDaemon(daemon, confirm, request) {
+  requireThat(!daemon.result, "fixture daemon exited before ordinary stop; mount and state retained");
+  const status = await confirm();
+  requireThat(status && !daemon.result, "running fixture daemon identity could not be confirmed for stop");
+  await request(status);
+  requireThat((await waitForExit(daemon, 5000))?.code === 0, "fixture daemon did not exit normally after one ordinary stop");
+}
+
+export async function finishFixture(steps, release, remove) {
+  const errors = [];
+  try {
+    for (const step of steps) {
+      try { await step(); }
+      catch (e) { errors.push(e.message); }
+    }
+    requireThat(!errors.length, `${errors.join("; ")}; fixture retained`);
+    await remove();
+  } finally { release(); }
 }
 
 export function tools(ovnfs, git) {
@@ -87,7 +114,7 @@ if [ "$1 $2" = "pr view" ]; then printf '%s\\n' '{"state":"MERGED"}'; else print
   const attempt = (...args) => run(process.execPath, [pp, "--root", root, ...args], 50_000);
   const backend = (verb) => run(binaries.ovnfs, ["--state", state, "--mount", mount, "--json", verb], 1500);
   const fixtureMounts = async () => (await checked("mount table", "/sbin/mount", [], 3000)).split("\n").filter((row) => row.includes(` on ${dir}/`) || row.includes(` on ${dir} (`));
-  let daemon, paseo, mounted = false, stopping = false;
+  let daemon, paseo, occupantUncertain = false, mounted = false, stopping = false;
 
   async function startPaseo() {
     const log = join(dir, "paseo.log");
@@ -95,7 +122,7 @@ if [ "$1 $2" = "pr view" ]; then printf '%s\\n' '{"state":"MERGED"}'; else print
     for (let tries = 0; tries < 100; tries++) {
       const port = readFileSync(log, "utf8").split("\n")[0];
       if (/^\d+$/.test(port)) { env.PASEO_URL = `ws://127.0.0.1:${port}/ws`; return; }
-      if (paseo.child.exitCode !== null) break;
+      if (paseo.result) break;
       await delay(50);
     }
     throw new Error("fake Paseo did not start on loopback");
@@ -131,7 +158,7 @@ if [ "$1 $2" = "pr view" ]; then printf '%s\\n' '{"state":"MERGED"}'; else print
     daemon = started(binaries.ovnfs, ["serve", "--state", state, "--mount", mount, "--proto", "nfs", "--no-git-remotes"], env, log, dir);
     const deadline = at + 25_000;
     let failure;
-    while (performance.now() < deadline && daemon.child.exitCode === null && daemon.child.signalCode === null) {
+    while (performance.now() < deadline && !daemon.result) {
       if (existsSync(join(state, "admin.sock"))) {
         try { await proveMount(); mounted = true; return performance.now() - at; }
         catch (e) { failure = e.message; }
@@ -144,16 +171,12 @@ if [ "$1 $2" = "pr view" ]; then printf '%s\\n' '{"state":"MERGED"}'; else print
 
   async function stopOvnfs() {
     if (!daemon) return;
-    if (daemon.child.exitCode === null && daemon.child.signalCode === null) {
-      requireThat(!stopping, "ordinary fixture stop already attempted; mount and state retained");
-      const status = await bound();
-      requireThat(status, "fixture daemon identity could not be confirmed for stop");
+    requireThat(!stopping, "ordinary fixture stop already attempted; mount and state retained");
+    await stopOwnedDaemon(daemon, bound, async (status) => {
       stopping = true;
       if (status.port === 0) await node("fixture stop", [admin, state, mount, "stop", "{}", "10000"], 11_000);
       else requireThat(daemon.child.kill("SIGTERM"), "could not request ordinary stop of the owned TCP fallback");
-      const exited = await Promise.race([daemon.done, delay(5000, null, { ref: false })]);
-      requireThat(exited?.code === 0, "fixture daemon did not exit normally after one ordinary stop");
-    }
+    });
     requireThat(!(await fixtureMounts()).length, "fixture mount is still present; mount and state retained");
     requireThat(!existsSync(join(state, "admin.sock")), "fixture admin socket persists; state retained");
     daemon = null;
@@ -168,17 +191,17 @@ if [ "$1 $2" = "pr view" ]; then printf '%s\\n' '{"state":"MERGED"}'; else print
   }
 
   async function cleanup() {
-    if (paseo?.child.exitCode === null) {
-      paseo.child.kill("SIGTERM");
-      requireThat(await Promise.race([paseo.done, delay(3000, null, { ref: false })]), "fake Paseo did not exit; fixture retained");
-    }
-    try { await stopOvnfs(); }
-    catch (e) {
+    await finishFixture([async () => {
+      if (!paseo || (paseo.result && !paseo.result.error)) return;
+      requireThat(!paseo.result && paseo.child.kill("SIGTERM"), "could not request fake Paseo stop");
+      requireThat(await waitForExit(paseo, 3000), "fake Paseo did not exit");
+    }, stopOvnfs, async () => {
+      requireThat(!occupantUncertain, "fixture occupant exit not confirmed");
+      requireThat(!(await fixtureMounts()).length && !existsSync(join(state, "admin.sock")), "cannot exclude an active fixture mount or daemon");
+    }], () => {
+      paseo?.child.unref();
       daemon?.child.unref();
-      throw e;
-    }
-    requireThat(!(await fixtureMounts()).length, "cannot exclude an active fixture mount; fixture retained");
-    rmSync(dir, { recursive: true });
+    }, () => checked("remove unmounted fixture", "/bin/rm", ["-r", dir], 15_000));
   }
 
   // Record the backing roots once. du -k reports allocated blocks, which may include shared extents.
@@ -199,8 +222,11 @@ if [ "$1 $2" = "pr view" ]; then printf '%s\\n' '{"state":"MERGED"}'; else print
       requireThat(readFileSync(log, "utf8").includes("ready"), "fixture occupant did not start");
       return await action(occupant.child.pid);
     } finally {
-      occupant.child.kill("SIGTERM");
-      requireThat(await Promise.race([occupant.done, delay(3000, null, { ref: false })]), "fixture occupant did not exit");
+      try {
+        if (!occupant.result) occupant.child.kill("SIGTERM");
+        const result = await waitForExit(occupant, 3000);
+        if (!result || result.error) { occupantUncertain = true; throw new Error("fixture occupant exit not confirmed"); }
+      } finally { occupant.child.unref(); }
     }
   }
 

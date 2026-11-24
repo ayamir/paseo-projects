@@ -39,13 +39,16 @@ export const absent = async (f, path) => (await f.node("inspect fixture path", [
 
 export async function launch(f, backend, ...args) {
   if (backend === "ovnfs") await f.proveMount();
-  const at = performance.now();
+  return dispatch(f, backend, ...args);
+}
+
+export async function dispatch(f, backend, ...args) {
   const output = await f.cli("thread", "start", "fixture", "--kind", backend === "ovnfs" ? "ovnfs" : "worktree", "--repo", f.repo, "--title", "Synthetic task", "--task", "Offline synthetic build", ...args);
   const match = output.match(/^started (t-\d+) .* agent (\S+)$/m);
   check(match, "PP did not report a started thread and Agent");
   const agent = f.agents().find((a) => a.id === match[2]);
   check(agent && agent.cwd !== f.repo && agent.cwd.startsWith(`${f.dir}/`), "fake Paseo did not receive a fixture checkout cwd");
-  return { id: match[1], agent, launch_ms: performance.now() - at };
+  return { id: match[1], agent };
 }
 
 async function checkoutIdentity(f, w) {
@@ -229,9 +232,7 @@ function sameRegistry(a, b) {
     JSON.stringify([b.checkouts.map((r) => r.name).sort(), b.snapshots.map((s) => s.id).sort()]);
 }
 
-export const build = async (f, cwd, { hot = false, edited = false } = {}) => {
-  const at = performance.now();
-  const digest = await f.node("offline synthetic build", ["-e", `
+export const build = (f, cwd, { hot = false } = {}) => f.node("offline synthetic build", ["-e", `
     const { existsSync, readFileSync, readdirSync } = require('node:fs'), { join } = require('node:path');
     const path = process.argv[1], cachePath = join(path, 'node_modules/allowed');
     if (existsSync(cachePath) !== (process.argv[2] === 'hot')) throw new Error('cache state does not match trial');
@@ -241,7 +242,8 @@ export const build = async (f, cwd, { hot = false, edited = false } = {}) => {
     h.update(existsSync(cachePath) ? readFileSync(cachePath) : ${JSON.stringify(cacheLine)}.repeat(4096));
     console.log(h.digest('hex'));
   `, cwd, hot ? "hot" : "cold"], 20_000);
+
+export function verifyBuild(digest, { edited = false } = {}) {
   const expected = sha256([edited ? dirty : clean, lock, ...Object.keys(payload).sort().map((i) => payload[i]), cache].join(""));
   check(digest === expected, "offline build output did not match the known synthetic inputs");
-  return { build_ms: performance.now() - at, digest };
-};
+}
