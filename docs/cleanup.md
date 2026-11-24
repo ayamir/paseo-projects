@@ -2,7 +2,14 @@
 
 线程 resolve 时自动清理它留下的东西。只删能确认属于这个线程、并且确实可以丢掉的东西；拿不准就保留，并写下原因。
 
-resolve 自动触发、`pp thread cleanup` 重试、`--dry-run` 预览和 `pp sweep` 用的是同一份实现：`orchestrator/cleanup.mjs` 里的 `run`。
+已登记工作副本按资源检查回收；下面的旧清理流程仅保留为明确指定历史线程时的兼容行为，不代表接管。针对未接管的旧 Git worktree / OVNFS 线程，ticker 可以记录线程完成，但不会清理、归档其工作区或删除分支。托管资源的回收不运行下文的逐项清理及 Codebase Memory 索引清理。
+
+本机和 SSH 的托管 Git worktree 均须先确认 Agent 已归档、资源没有保留约束，再按资源检查。SSH 回收只使用已配置的连接：
+
+- 在远端核对创建登记、目录和 Git 管理记录，以及同机器路径引用、已登记依赖、挂载、占用、原始 reflog、index 和文件内容。Git 忽略规则不授予删除权限。需要远端 Node.js、Git、`lsof` 及 macOS 的 `mount` 或 Linux 的 `findmnt`。副本内部挂载、探测或读取失败、超出 10,000 项或 32 MiB 的检查和传输预算都阻止删除。
+- 把提交 bundle 和已分类的普通文件传回 PP 所在机器；在副本外独立恢复并校验提交、核对文件字节、同步归档。然后在远端重检，只用非强制 `git worktree remove`。只有原仓库登记、worktree 目录和 Git 管理目录均确认不存在时才记录已回收。SSH 断开时保留未知状态；重试可核对并确认已删除。若副本仍存在，当前没有能证明原请求已结束且不会迟到执行的远端凭据，PP 不重发删除。
+- 不自动删 SSH 分支：缺少分支身份与 reflog 的删除核验。未接管的 SSH worktree、复杂的私有 Git 元数据、依赖替代对象库的仓库和声明 `discard` 也保留；目前没有远端 `discard` 路径与成品验证。`lsof` 只覆盖 SSH 会话可见的进程；对于不可读的路径，只能检查最近可解析的祖先，不能证明不可见的别名或其他机器、命名空间没有占用。最终检查和 Git 删除不是由同一个原子操作完成，不能隔离未登记的外部写入。不要绕过阻碍强制删除。
+- 若远端删除进程异常退出并遗留锁，锁目录是 `<远端 Git common dir>/pp-disposal-<working_copy.nonce>.lock`。用 `git -C <源仓库> rev-parse --path-format=absolute --git-common-dir` 查前半段，用 `pp thread show <slug> <id> --json` 查 nonce。管理员确认该次 SSH 请求和所有相关 Git 进程均已结束、不会再执行后，才可在远端用 `rmdir -- <锁目录>` 移除该空目录。移除锁不会清除 PP 的未知回收状态，也不会让 PP 重发不确定的请求。
 
 ## 归属规则（只有这一条）
 
@@ -51,7 +58,7 @@ worktree 删除前要满足这些条件，任何一条不满足就保留并写�
 - 没有未提交改动、untracked 文件，也没有不认识的 ignored 内容；
 - 用 `lsof` 确认没有进程打开里面的文件。重试 5 次，每次间隔 1 秒，等刚归档的 agent 退出。没有 `lsof` 就保留。
 
-删除只用 `git worktree remove -- <path>`，不加 `--force`，不跑 `git worktree prune`（它会处理整个仓库），也不跑 `submodule deinit`。worktree 目录已经不在时：如果它还登记在 `t.repo` 里，只移除这一条登记，移除失败记为 failed；如果没登记，就记为 gone，它下面的索引不动。
+删除只用 `git -c status.showUntrackedFiles=all worktree remove -- <path>`，不加 `--force`，不跑 `git worktree prune`（它会处理整个仓库），也不跑 `submodule deinit`。worktree 目录已经不在时：如果它还登记在 `t.repo` 里，只移除这一条登记，移除失败记为 failed；如果没登记，就记为 gone，它下面的索引不动。
 
 ## 保留的（写明原因）
 
@@ -99,19 +106,27 @@ worktree 删除前要满足这些条件，任何一条不满足就保留并写�
 - `resolve` 会归档 Paseo agent。工作树已经移除时，也会归档侧边栏里的 workspace。工作树需要保留时，workspace 也保留，因为 Paseo 的 workspace 归档可能删除工作树。`resolve` 和 `thread cleanup` 的输出都会说明 Paseo 归档结果，失败后可以用 `thread cleanup` 重试。
 - 再次 `thread resolve` 会报错，并提示改用 `thread cleanup`。
 - `--dry-run` 会预览 worktree、声明路径和索引，列出 would-remove，不删东西，也不写记录。它不会重新拷贝，所以 library 里的成品可能还没归档。只有 worktree 已经移除时才检查本地分支并归档 workspace。这两项的结果写在命令输出或 resolve 的 inbox 里。
-- `pp sweep` 会对 resolved 线程残留的 worktree 再跑一次 `thread cleanup`，跳过保留的。不属于任何线程的 `pp-<slug>-t-NNNN` worktree 也走同样的 worktree 检查。
+- `pp sweep` 可重试已登记 Git worktree 的回收和待处理的归档，并清理过期的已处理 inbox 项；不删除 OVNFS checkout，也不会按线程状态、目录名或分支名清扫未接管的历史资源。
+- `pp thread discover <slug>` 列出已配置仓库的 Git worktree、历史线程记录及已配置并正在运行的本机 OVNFS 注册表中能与项目关联的条目，不会启动 OVNFS daemon。`pp board resources` 和线程详情显示待确认资源、实际后端、阶段、阻碍和操作。
+- 人确认候选项及实际创建基线后，才可运行 `pp thread adopt <slug> <id> --candidate TOKEN --base OID`。已核对的历史 Git worktree 登记到原线程；无归属的 Git worktree 只能登记到同源的托管线程。接管只写 PP 记录，保留原后端、文件、提交和保留约束；身份或起点证据不足时，先独立保存工作，不要将这个 Git 资源交给 PP 托管。未接管的 OVNFS 和远程资源仅报告阻碍。
+- 对已核对但未接管的历史 Git worktree，显式清理也会检查该工作树自己的 HEAD reflog。任何无法从保留引用到达的提交都会阻止删除，`--dry-run` 同样显示原因，但不写记录。实际清理会记录 `blocked` 而不是人为保留，资源看板显示阻碍，ticker 留下提醒但不自动重试。`archive_scope` 是 `report-and-library`；即使报告和 library 的拷贝完整，`git_history_archive` 仍可能是 `unknown`。没有已登记分支身份时，PP 保留分支和 reflog；接管后的工作树即使已经回收，资源看板仍会显示保留的分支及原因。
+- 接管起点通过工作树 HEAD reflog 和分支 reflog 的创建记录互相核对。这适用于本机单用户模型：reflog 不是认证凭证，同一用户若同时改写两份 reflog 的开头，可能伪造起点。怀疑记录被人为改写时，独立保存工作并保持不托管。
 
 ## OVNFS checkout
 
-`--kind ovnfs` 使用本机 OVNFS v0.8.0 管理 checkout。Paseo 将其作为普通目录 workspace 打开，`pp thread restart` 复用原挂载。OVNFS 进程和挂载需要在启动、重启与清理期间可用。PP 启动 OVNFS daemon 时设置 `OVNFS_GIT_REMOTES=0`，已有 daemon 使用自己的配置。
+`--kind ovnfs` 使用本机 OVNFS v0.8.0 管理 checkout。Paseo 将其作为普通目录 workspace 打开，`pp thread restart` 复用原挂载。OVNFS 进程和挂载需要在启动、重启与清理期间可用。对于 PP 托管的 checkout，先用 `ovnfs serve --no-git-remotes` 启动对应的本机 daemon，并为 PP 指定同一命名空间的 `OVNFS_STATE` 和 `OVNFS_MOUNT`；托管命令不会自动启动 daemon。
 
-`resolve` 或 `thread cleanup` 会确认 OVNFS registry 中的 checkout 身份、Paseo agent 归档结果、成品拷贝和 Git 状态。checkout 空闲后会再次拷贝报告和 library。只有 checkout 仍未被占用，且 Git 提交（包括 reflog 中可恢复的提交）可从源仓库的引用或已核实的合并 PR 找到时，才调用 `ovnfs rm --sticky-snapshots`。源仓库的克隆中尚未抓取的远端提交可能需要先 fetch，清理过程本身不会 fetch。`--keep-worktree` 也适用于 OVNFS，`--dry-run` 可预览保留原因。
+`resolve`、`thread cleanup`、ticker 和 `pp sweep` 可以跟进归档，但不会删除 OVNFS checkout。未接管的历史 OVNFS checkout、工作区及其声明丢弃项也会保留。
 
-OVNFS 线程支持 `--reviews` 和报告中的 `Reviewed-PR:`。因被审 PR 合并而 resolve 时，只有私有分支仍指向启动时记录的提交，且提交可从源仓库引用访问，才移除 checkout。线程有尚未合并的自有 PR 时，被审 PR 合并不会触发 resolve。
+接到清理指示的 Agent 可非交互运行 `pp thread delete-checkout <slug> <id> [--resource NAME]`，每次只处理一项。省略 `--resource` 选中主 checkout；实验用其名称。命令要求线程已完成、Agent 已归档、没有有效保留，且本机命名空间、挂载和登记身份一致。它检查 checkout 和私有 Git 目录的占用、依赖、未知内容和可恢复的私有提交，并在副本外验证并保存所需成果。`--keep-worktree` 也阻止这条命令。快照不能删除，依赖关系不明确时也保留。
+
+依赖包括引用该 checkout 的快照，以及 source 位于该 checkout 或其私有 Git 目录内的其他 checkout。独立归档校验后，PP 用 OVNFS 原生 `apply --branch` 将当前提交保存在经核对的 PP 私有输入仓库，再确认分支指向确切提交并请求保留快照和提交的普通 `rm`。这不会切换分支、改原仓库、推送或合并。原生 `apply` 只保留当前 HEAD 及其历史；其他分支上仍未共享的提交可能使 OVNFS 拒绝删除。PP 不改用强制删除。固定版本的按名 `rm` 无法锁住检查后的外部写入或替换。请让目标保持静止。只有注册表、挂载内路径和私有 Git 路径均确认目标已不存在才记为已删除；未挂载或无法查询不是已删除。失败或不确定时查看命令输出和 `pp thread show <slug> <id> --json`，不会后台重试；再次显式运行可核对此前已删除的目标，但不会重发不确定的 `rm`。PP 不删除 base、快照或底层目录；OVNFS 可回收无引用的内部存储。
+
+OVNFS 线程仍支持 `--reviews` 和报告中的 `Reviewed-PR:`。被审 PR 合并可以触发 resolve，但不会触发 checkout 删除；线程有尚未合并的自有 PR 时，也不会因此 resolve。
 
 ## 和 Paseo 的合并自动归档冲突
 
-Paseo daemon 的 `daemon.autoArchiveAfterMerge`（默认关闭）打开时，会在 PR 合并后自动归档 workspace。触发条件只有这几条：PR 合并、git 不脏、没有领先 origin、worktree 归 Paseo 所有。满足后它用 `git worktree remove --force`、`rm -rf` 和 `git worktree prune` 删掉 worktree。它不看 pp 的保留决定，不看 ignored 内容（`.paseo-project/` 也在其中），也不看占用的进程。pp 的线程 worktree 都是 Paseo 创建的，所以这个设置打开时，删 worktree 的就不止 pp 一家：
+Paseo daemon 的 `daemon.autoArchiveAfterMerge`（默认关闭）打开时，会在 PR 合并后自动归档 workspace。触发条件只有这几条：PR 合并、git 不脏、没有领先 origin、worktree 归 Paseo 所有。满足后它用 `git worktree remove --force`、`rm -rf` 和 `git worktree prune` 删掉 worktree。它不看 pp 的保留决定，不看 ignored 内容（`.paseo-project/` 也在其中），也不看占用的进程。以下冲突涉及以前由 Paseo 创建、未登记工作副本的线程。新线程的 Git worktree 由 pp 登记和创建；身份缺失或不一致时，pp 不会在该目录执行或清理。
 
 - pp 先 resolve、决定保留时：保留守不住。记录里 worktree 的 kept 原因会写明这一点，`pp doctor` 也会提示。
 - 读不到这个设置时（daemon 连不上、拒绝读取，或者回了 SDK 不认的格式），按「未知」处理，不当作关闭：kept 原因写「is unknown (原因)」，`pp doctor` 写「could not be read (原因)」。读设置失败不会挡住清理。

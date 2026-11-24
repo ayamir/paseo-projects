@@ -23,11 +23,38 @@ export const tasksRpc = defineRpc({
   }),
 });
 
-// One thread: its report home and the report's `## Next` lines.
+const workingCopy = z.object({
+  owner: z.string(), backend: z.string(), phase: z.string(), baseline: z.string(), source: z.string(),
+  path: z.string(), machine: z.string(), blocker: z.string(), nonce: z.string().optional(),
+  blockers: z.array(z.string()).optional(), actions: z.array(z.string()).optional(),
+  selection: z.object({ policy: z.string(), reason: z.string() }).optional(),
+  retained_input: z.object({ path: z.string(), reason: z.string() }).optional(),
+  seed: z.object({ oid: z.string().optional() }).optional(),
+  cache: z.object({ state: z.string(), reason: z.string().optional() }).optional(),
+  identity: z.object({ git_dir: z.string().optional(), directory: z.string().optional(), registration: z.string().optional() }).nullable(),
+  disposal: z.object({
+    phase: z.string(), blocker: z.string(),
+    evidence: z.object({ path: z.string(), manifest: z.string(), bundle: z.string() }).optional(),
+  }).optional(),
+});
+
+const resourceSummary = z.object({
+  project: z.string(), owner: z.string(), backend: z.string(), phase: z.string(), path: z.string(),
+  machine: z.string(), source: z.string(), resource: z.string().optional(), baseline: z.string().optional(), branch: z.string().optional(),
+  blockers: z.array(z.string()), actions: z.array(z.string()), candidate: z.string(),
+  disposal: z.object({ phase: z.string(), blocker: z.string() }).optional(),
+});
+export type ResourceSummary = z.infer<typeof resourceSummary>;
+
+// One thread: report, Next lines, and its registered and pending resources.
 export const threadDetailRpc = defineRpc({
   name: "paseo-projects.thread.detail",
   input: z.object({ project: z.string(), id: z.string() }),
-  output: z.object({ report: z.string(), next: z.array(z.string()), cwd: z.string(), status: z.string() }),
+  output: z.object({
+    report: z.string(), next: z.array(z.string()), cwd: z.string(), status: z.string(), error: z.string(),
+    working_copy: workingCopy.nullable(), working_copies: z.array(workingCopy).default([]),
+    reconciliation: z.array(resourceSummary).default([]),
+  }),
 });
 
 // What the board's buttons do: each one is a `pp` command, so the board can do nothing the CLI cannot.
@@ -59,8 +86,8 @@ export const inboxDoneRpc = defineRpc({
   output: z.object({ ok: z.boolean(), message: z.string() }),
 });
 
-// The tasks, routines, settings and memory tabs: `pp board <section>`, as it prints it.
-export const BOARD_SECTIONS = ["tasks", "routines", "settings", "memory"] as const;
+// The board sections use the same query as `pp board <section>`.
+export const BOARD_SECTIONS = ["tasks", "routines", "settings", "memory", "resources"] as const;
 export const boardSectionRpc = defineRpc({
   name: "paseo-projects.board.section",
   input: z.object({ section: z.enum(BOARD_SECTIONS) }),

@@ -1,13 +1,14 @@
 // Project lifecycle: pause, archive, delete, rename; sweep and doctor.
-import { existsSync, mkdirSync, realpathSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { client, autoArchiveAfterMerge, sh, readText, readJson, writeJson, isFile, isDir, secondsSince } from "./lib.mjs";
+import { client, autoArchiveAfterMerge, readText, readJson, writeJson, isFile, isDir, secondsSince } from "./lib.mjs";
 import { CONFIG_PATH, canonical, loadConfig, moveApprovals } from "./config.mjs";
 import { Project, SUBDIRS, TASKS_TEMPLATE, writeAgentsMd, writeSettings, listSlugs } from "./project.mjs";
 import * as threads from "./threads.mjs";
-import * as cleanup from "./cleanup.mjs";
 import * as inbox from "./inbox.mjs";
 import * as ticker from "./ticker.mjs";
+import { withLifecycleLock } from "./lifecycle-lock.mjs";
+export { withLifecycleLock };
 
 /** Every agent Paseo has for a project (thread and coordinator), not archived. */
 async function liveAgents(project) {
@@ -39,6 +40,10 @@ export function unarchive(project) { project.setState({ status: "active" }); }
 
 /** Moves the folder to <root>/.trash/<slug>-<stamp>. */
 export async function remove(project, force) {
+  return withLifecycleLock(project, () => removeLocked(project, force));
+}
+
+async function removeLocked(project, force) {
   const agents = await liveAgents(project);
   if (agents.length && !force) throw new Error(`${agents.length} agent(s) of \`${project.slug}\` are alive; \`delete --force\` archives them first`);
   await archiveAgents(project);
@@ -50,7 +55,11 @@ export async function remove(project, force) {
 }
 
 /** New slug: folder, former slugs, approvals, safety table. The coordinator is archived. */
-export async function rename(project, newSlug, { name, dryRun = false } = {}) {
+export async function rename(project, newSlug, options) {
+  return withLifecycleLock(project, () => renameLocked(project, newSlug, options));
+}
+
+async function renameLocked(project, newSlug, { name, dryRun = false } = {}) {
   const target = new Project(project.root, newSlug);
   if (existsSync(target.dir)) throw new Error(`${target.dir} already exists`);
   const unresolved = threads.list(project).filter(threads.isOpen);
@@ -72,37 +81,12 @@ export async function rename(project, newSlug, { name, dryRun = false } = {}) {
 
 // ------------------------------------------------------------ sweep
 
-/**
- * What is left behind: `pp-<slug>-t-NNNN` worktrees of resolved threads (cleaned up again, the same way
- * resolve does; a kept one stays) and of no thread at all, merged branches of resolved threads, old done items.
- */
+/** Unclaimed and historical resources appear in discovery, not in the sweep plan. */
 export function sweepPlan(project) {
-  const plan = [];
-  const all = threads.list(project);
-  const real = (p) => { try { return realpathSync(p); } catch { return p; } };
-  const byCwd = new Map(all.filter((t) => t.cwd).flatMap((t) => [[t.cwd, t], [real(t.cwd), t]]));
-  for (const repo of project.settings().repos.filter((r) => !r.machine)) {
-    const r = sh(["git", "-C", repo.path, "worktree", "list", "--porcelain"]);
-    if (!r.ok) continue;
-    for (const block of r.stdout.split("\n\n")) {
-      const path = /^worktree (.+)$/m.exec(block)?.[1];
-      const branch = /^branch refs\/heads\/(.+)$/m.exec(block)?.[1];
-      if (!path || !threads.isOwnBranch(project.slug, branch)) continue;
-      const t = byCwd.get(path);
-      if (t && (threads.isOpen(t) || t.kept_worktree)) continue;
-      if (t) plan.push({ what: `clean up ${t.id} again (worktree ${path})`, run: async () => ({ ok: true, out: (await threads.cleanupAgain(project, t.id)).join("; ") }) });
-      else plan.push({ what: `remove worktree ${path} (${branch}), of no thread`, run: async () => {
-        const i = await cleanup.removeWorktree(threads.host(null), { cwd: path, repo: repo.path });
-        return { ok: i.status === "removed", out: i.reason ?? i.status };
-      } });
-    }
-  }
-  for (const t of all.filter((t) => t.kind === "worktree" && t.status === "resolved" && t.branch && t.repo && !t.machine && t.pr_state === "MERGED")) {
-    const tip = sh(["git", "-C", t.repo, "rev-parse", "--verify", "-q", `refs/heads/${t.branch}`]);
-    if (!tip.ok || tip.stdout.trim() !== t.pr_summary?.head_oid) continue;
-    if (isDir(t.cwd)) continue; // its worktree is still there; the worktree step goes first
-    plan.push({ what: `delete merged branch ${t.branch} (${t.id})`, run: () => sh(["git", "-C", t.repo, "branch", "-D", "--", t.branch]) });
-  }
+  const plan = threads.list(project).filter(threads.pendingDisposal).map((t) => ({
+    what: `check managed resources of ${t.id}`,
+    run: async () => ({ ok: true, out: (await threads.cleanupAgain(project, t.id, { scheduled: true })).join("; ") }),
+  }));
   plan.push({ what: "delete handled inbox items older than 30 days", run: () => { inbox.pruneDone(project, 30); return { ok: true }; } });
   return plan;
 }

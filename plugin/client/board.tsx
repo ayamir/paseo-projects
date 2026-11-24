@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import { Pressable, ScrollView, Text, TextInput, View } from "react-native";
 import { openExternal } from "./web";
+import type { ResourceSummary } from "../shared/tasks";
 import { boardActionRpc, boardEditRpc, boardSectionRpc, inboxDoneRpc, inboxListRpc, tasksRpc, threadActionRpc, threadDetailRpc } from "../shared/tasks";
 
 // The thread groups of `pp`, most urgent first.
@@ -20,9 +21,10 @@ const GROUPS = [
 const TABS = [
   { key: "threads", label: "线程" }, { key: "tasks", label: "任务" }, { key: "inbox", label: "Inbox" },
   { key: "routines", label: "Routines" }, { key: "settings", label: "设置" }, { key: "memory", label: "记忆" },
+  { key: "resources", label: "资源" },
 ] as const;
 type Tab = (typeof TABS)[number]["key"];
-type Section = "tasks" | "routines" | "settings" | "memory";
+type Section = Exclude<Tab, "threads" | "inbox">;
 
 type Thread = { project: string; id: string; title: string; group: string; profile: string; branch: string | null; pr: string | null; prState: string | null };
 type Item = { project: string; id: string; kind: string; subject: string; summary: string };
@@ -57,7 +59,8 @@ export function BoardScreen({ theme, layout }: PluginScreenProps) {
   const threads = q.data?.threads ?? [];
   const key = (t: Thread) => `${t.project}/${t.id}`;
   const selected = threads.find((t) => key(t) === open) ?? null;
-  const detail = useQuery({ queryKey: ["pp-detail", open], queryFn: () => detailRpc({ project: open!.split("/")[0], id: open!.split("/")[1] }), enabled: Boolean(open) });
+  const detail = useQuery({ queryKey: ["pp-detail", open], queryFn: () => detailRpc({ project: open!.split("/")[0], id: open!.split("/")[1] }), enabled: Boolean(open), refetchInterval: 5000 });
+  const copies = [...(detail.data?.working_copy ? [detail.data.working_copy] : []), ...(detail.data?.working_copies ?? [])];
   const needsYou = threads.filter((t) => t.group === "waiting-on-you").length;
 
   const action = useMutation({
@@ -148,6 +151,23 @@ export function BoardScreen({ theme, layout }: PluginScreenProps) {
           </View>
           <Text style={styles.title}>{selected.title}</Text>
           <Text style={styles.meta}>{selected.project} · {selected.id} · {selected.profile}{selected.branch ? ` · ${selected.branch}` : ""}</Text>
+          {detail.data?.status ? <Text style={styles.meta}>线程状态：{detail.data.status}</Text> : null}
+          {copies.map((worktree) => (
+            <View key={worktree.nonce || `${worktree.machine}:${worktree.path}`} style={{ marginTop: 8 }}>
+              <Text style={styles.meta}>工作副本：{worktree.backend} · {worktree.phase}{worktree.machine ? ` · ${worktree.machine}` : ""}</Text>
+              <Text style={styles.mono}>{worktree.path}{"\n"}基线：{worktree.baseline}</Text>
+              {worktree.selection ? <Text style={styles.note}>预检回退（{worktree.selection.policy}）：{worktree.selection.reason}</Text> : null}
+              {worktree.seed?.oid ? <Text style={styles.mono}>显式起点：{worktree.seed.oid}</Text> : null}
+              {worktree.retained_input ? <Text style={styles.note}>保留输入：{worktree.retained_input.path}{"\n"}{worktree.retained_input.reason}</Text> : null}
+              {worktree.cache ? <Text style={styles.meta}>缓存：{worktree.cache.state}{worktree.cache.reason ? ` · ${worktree.cache.reason}` : ""}</Text> : null}
+              {worktree.disposal ? <Text style={styles.meta}>回收：{worktree.disposal.phase}</Text> : null}
+              {(worktree.blockers ?? [worktree.blocker, worktree.disposal?.blocker].filter(Boolean)).map((blocker) => <Text key={blocker} style={styles.note}>{blocker}</Text>)}
+              {worktree.actions?.map((action) => <Text key={action} style={styles.mono}>{action}</Text>)}
+              {worktree.disposal?.evidence ? <Text style={styles.mono}>{worktree.disposal.evidence.path}</Text> : null}
+            </View>
+          ))}
+          <ResourceSummaries rows={detail.data?.reconciliation ?? []} styles={styles} />
+          {detail.data?.error ? <Text style={styles.note}>{detail.data.error}</Text> : null}
           <View style={{ flexDirection: "row", flexWrap: "wrap" as const, marginTop: 10 }}>
             <Btn label="Ack 报告" theme={theme} disabled={action.isPending} onPress={() => run("ack", selected)} />
             <Btn label="重启" theme={theme} disabled={action.isPending} onPress={() => run("restart", selected)} />
@@ -172,7 +192,20 @@ export function BoardScreen({ theme, layout }: PluginScreenProps) {
   );
 }
 
-/** The tasks, routines, settings and memory tabs; a tapped row shows its notes, prompt or text. */
+function ResourceSummaries({ rows, styles }: { rows: ResourceSummary[]; styles: any }) {
+  return <>{rows.map((r, i) => (
+    <View key={`${r.project}:${r.owner}:${r.path}:${r.resource ?? ""}:${i}`} style={styles.card}>
+      <Text style={styles.meta}>{r.project}{r.owner ? ` · ${r.owner}` : ""} · {r.backend} · {r.phase}{r.disposal ? ` · cleanup ${r.disposal.phase}` : ""}{r.machine ? ` · ${r.machine}` : ""}</Text>
+      {r.path || r.resource ? <Text style={styles.mono}>{r.path || r.resource}</Text> : null}
+      {r.branch ? <Text style={styles.mono}>分支：{r.branch} ({r.source})</Text> : null}
+      {r.baseline ? <Text style={styles.mono}>基线：{r.baseline}</Text> : null}
+      {r.blockers.map((b) => <Text key={b} style={styles.note}>{b}</Text>)}
+      {r.actions.map((a) => <Text key={a} style={styles.mono}>{a}</Text>)}
+    </View>
+  ))}</>;
+}
+
+/** Board sections; tasks, routines, and settings offer their existing actions. */
 function SectionView({ section, theme, styles }: { section: Section; theme: PluginScreenProps["theme"]; styles: any }) {
   const client = useQueryClient();
   const load = useRpc(boardSectionRpc);
@@ -206,6 +239,7 @@ function SectionView({ section, theme, styles }: { section: Section; theme: Plug
     </>
   );
 
+  if (section === "resources") return data.length ? <ResourceSummaries rows={data} styles={styles} /> : <Text style={styles.empty}>没有待确认或待回收的资源。</Text>;
   if (section === "tasks") {
     if (!data.length) return <Text style={styles.empty}>没有任务。让 coordinator 加一条。</Text>;
     let last = "";

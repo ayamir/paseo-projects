@@ -22,19 +22,26 @@ export function safeSubject(subject) {
  * under the project lock. `event` is a fixed phrase from this program (nudges
  * are built from it, never from the summary); `body` is for routine items.
  */
-export function write(project, kind, subject, event, summary, body = "") {
+export function write(project, kind, subject, event, summary, body = "", key = "") {
   return project.lock(() => {
+    const suffix = `-${kind}-${safeSubject(subject)}${key ? `-${sha256(key)}` : ""}`;
+    if (key) {
+      for (const folder of [dir(project), join(dir(project), "done")]) {
+        const found = readdirSync(folder).find((name) => name.endsWith(`${suffix}.md`));
+        if (found) return found.slice(0, -3);
+      }
+    }
     const counter = project.path(".state", "inbox-counter.json");
     const n = (readJson(counter, 0) ?? 0) + 1;
     writeJson(counter, n);
     const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
     // The counter right after the stamp keeps ids in creation order within one second.
-    const id = `${stamp}-${String(n).padStart(6, "0")}-${kind}-${safeSubject(subject)}`;
+    const id = `${stamp}-${String(n).padStart(6, "0")}${suffix}`;
     const front = [
       tomlLine("id", id), tomlLine("kind", kind), tomlLine("subject", subject), tomlLine("created", now()),
       tomlLine("summary", String(summary).replace(/[\u0000-\u001f\u007f]/g, " ")), tomlLine("event", event),
     ].join("\n");
-    writeAtomic(join(dir(project), `${id}.md`), `+++\n${front}\n+++\n${body ? `\n${body.trimEnd()}\n` : ""}`);
+    writeAtomic(join(dir(project), `${id}.md`), `+++\n${front}\n+++\n${body ? `\n${body.trimEnd()}\n` : ""}`, Boolean(key));
     return id;
   });
 }
@@ -82,6 +89,8 @@ export function pruneDone(project, days) {
   let names = [];
   try { names = readdirSync(d); } catch { return; }
   for (const n of names) {
+    // A handled cleanup exception is the durable receipt for its deduplication key.
+    if (/-cleanup-t-\d{4,}-[a-f0-9]{64}\.md$/.test(n)) continue;
     try { if (Date.now() - statSync(join(d, n)).mtimeMs > days * 86_400_000) rmSync(join(d, n)); } catch {}
   }
 }

@@ -19,7 +19,7 @@ The coordinator never does the work itself, so it's always free to answer you. E
 | herdr-projects | paseo-projects |
 |---|---|
 | coordinator pane | a Paseo agent in the project folder, labelled `project=<slug>, role=coordinator` |
-| thread pane and worktree | a Paseo agent with a `branch-off` worktree, branch `pp-<slug>-t-NNNN-<title>` |
+| thread pane and worktree | a Paseo agent in a Git worktree registered and created by `pp`, branch `pp-<slug>-t-NNNN-<title>` |
 | reading the pane, sending keys | Paseo's structured permission requests: `thread permissions`, `allow`, `deny` |
 | typing a prompt | `send` with `steer`, so a busy agent gets it inside its current turn |
 | SSH machines | remote Paseo daemons (`machines.<name>.url`), plus `ssh` to copy reports home |
@@ -77,7 +77,8 @@ pp thread prompt <slug> <id> --text "…"       # steer a thread
 pp thread permissions|allow|deny <slug> <id>  # answer its permission requests
 pp thread restart <slug> <id> [--fresh]       # bring it back on its old session
 pp thread resolve <slug> <id>                 # report copied home, then cleanup (docs/cleanup.md)
-pp thread cleanup <slug> <id> [--dry-run]     # retry or preview that cleanup
+pp thread cleanup <slug> <id> [--dry-run]     # retry or preview cleanup (never deletes OVNFS)
+pp thread delete-checkout <slug> <id> [--resource NAME] # explicitly delete one eligible managed OVNFS checkout
 pp ticker start|stop|status
 pp doctor [--fix]
 ```
@@ -125,7 +126,7 @@ No. A project is a folder on your machine, `pp` talks to your own Paseo daemons,
 
 ### Will it touch my branches or worktrees on its own?
 
-Cleanup runs after a manual resolve, a resolve triggered by a PR merge, or a resolve after `auto_resolve_days` idle. It copies the report and the thread's files home first. It then removes the worktree with a plain `git worktree remove` once the safety checks pass, along with declared disposable paths and Codebase Memory indexes rooted in removed paths. A merge-triggered resolve can also remove the local branch when its commits are accounted for. Cleanup explains what it keeps. See [docs/cleanup.md](docs/cleanup.md).
+Cleanup copies the report and the thread's files home. PP can reclaim a managed local Git worktree with plain `git worktree remove` only after it independently verifies preservation. A managed SSH worktree goes through the same checks over the configured SSH connection: the evidence is copied home and verified first, the worktree is rechecked remotely, and only then is plain `git worktree remove` run; SSH branches are not deleted. That path has not been run on a real SSH host or on Linux. OVNFS checkouts require a separate, explicit `pp thread delete-checkout` command. Only the compatible legacy cleanup removes declared paths individually and deletes Codebase Memory indexes rooted in paths it verified were removed. A merge-triggered resolve can also remove an eligible local Git branch. See [docs/cleanup.md](docs/cleanup.md).
 
 ### What is known not to work yet?
 

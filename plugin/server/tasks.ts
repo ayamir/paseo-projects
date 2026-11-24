@@ -78,27 +78,10 @@ export function listTasks(_input: RpcInput<typeof tasksRpc>) {
   return { root, threads: threads.filter((t) => t.group !== "resolved" || ++resolved <= 20) };
 }
 
-// The report's `## Next` lines, list markers removed (same rule as pp's `nextLines`).
-function nextLines(report: string): string[] {
-  const out: string[] = [];
-  let inside = false;
-  for (const line of report.split("\n")) {
-    if (line.startsWith("## ")) { inside = line.trim() === "## Next"; continue; }
-    if (line.startsWith("#")) { inside = false; continue; }
-    if (!inside) continue;
-    const t = line.trim().replace(/^(?:[-*] |\d+\. )/, "").trim();
-    if (t) out.push(t);
-  }
-  return out;
-}
-
-export function threadDetail({ project, id }: RpcInput<typeof threadDetailRpc>) {
+export async function threadDetail({ project, id }: RpcInput<typeof threadDetailRpc>) {
   if (!isSlug(project) || !isThread(id)) throw new Error("no such project or thread");
-  const root = rootDir();
-  const t = readJson(join(root, project, "threads", `${id}.json`));
-  if (!t) throw new Error(`no thread ${id} in ${project}`);
-  const report = (() => { try { return readFileSync(join(root, project, "threads", `${id}.md`), "utf8"); } catch { return "(no report yet)"; } })();
-  return { report, next: nextLines(report), cwd: t.cwd ?? "", status: t.status ?? "" };
+  const { message } = await via(`read ${project}/${id}`, pp(rootDir(), "board", "thread", project, id));
+  return JSON.parse(message);
 }
 
 export async function threadAction({ project, id, action, line }: RpcInput<typeof threadActionRpc>) {

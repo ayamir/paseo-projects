@@ -29,9 +29,16 @@ const need = (v, usage) => { if (v === undefined || v === "") throw new Error(`u
 async function main() {
   const { pos, flags: f, given, inlined } = parse(process.argv.slice(2));
   check(pos, given, inlined); // before anything runs: an option the command does not declare is an error, not ignored
+  const [cmd, a1, a2, a3] = pos;
+  if (cmd === "working-copy") {
+    const { promotion } = await import("../orchestrator/promotion.mjs");
+    const result = promotion(f.evidence, f.thresholds);
+    console.log(JSON.stringify(result, null, 2));
+    if (result.promotion === "blocked") process.exitCode = 1;
+    return;
+  }
   const root = rootOf({ root: f.root });
   const proj = (slug, usage) => Project.open(root, need(slug, usage));
-  const [cmd, a1, a2, a3] = pos;
 
   switch (cmd) {
     case undefined: case "help": case "-h": process.stdout.write(HELP); return;
@@ -146,6 +153,13 @@ async function main() {
     case "safety": return safetyCommand(pos.slice(1), f, root, proj);
     case "profile": return profileCommand(pos.slice(1), f, root, proj);
     case "board": {
+      if (a1 === "thread") {
+        const p = proj(a2, "board thread <slug> <id>");
+        const t = threads.load(p, need(a3, "board thread <slug> <id>"));
+        const report = readText(threads.homeReportPath(p, t.id));
+        console.log(JSON.stringify({ report: report || "(no report yet)", next: threads.allNext(p, t.id), cwd: t.cwd ?? "", status: t.status ?? "", error: t.error ?? "", ...threads.resourceView(p, t) }));
+        return;
+      }
       if (a1 === "settings") { const choices = await boardChoices(root); console.log(JSON.stringify({ ...boardData(root, a1, choices.kinds), choices })); return; }
       if (a1 !== "edit") { console.log(JSON.stringify(boardData(root, a1))); return; }
       // Runs the edit as its own command line, so the dialog and the error name that command.
@@ -170,14 +184,29 @@ async function threadCommand([sub, slug, id], f, root, proj) {
         ({ profile, machine } = tasks.launchFor(found, profile, machine));
         task = tasks.delegated(text, f["from-task"], task || found.title);
       }
-      const { thread: t, warnings } = await threads.start(p, { title: f.title, task, repo: f.repo, kind: f.kind, machine: machine ?? undefined, profile: profile ?? undefined, base: f.base, reviews: f.reviews });
+      const { thread: t, warnings } = await threads.start(p, { title: f.title, task, repo: f.repo, kind: f.kind, machine: machine ?? undefined, profile: profile ?? undefined, base: f.base, reviews: f.reviews, from_snapshot: f["from-snapshot"], inherit_dirty: f["inherit-dirty"] });
       warnings.forEach((w) => console.log(`warning: ${w}`));
       console.log(`started ${t.id} (${t.kind}${t.branch ? `, branch ${t.branch}` : ""}, profile ${t.profile}) agent ${t.agent_id}`);
       return;
     }
+    case "experiment":
+    case "snapshot": {
+      const w = threads.ovnfsResource(p, tid(), sub, f.name, { base: f.base, resource: f.resource });
+      console.log(`${id}/${w.resource}: ${sub} ${w.path || w.identity.id}`);
+      return;
+    }
+    case "discover": console.log(JSON.stringify(threads.reconciliation(p))); return;
+    case "adopt": {
+      const w = threads.adopt(p, tid(), f.candidate, f.base);
+      console.log(`${id}: adopted ${w.backend} resource ${w.nonce}; existing lifecycle checks still apply`);
+      return;
+    }
     case "list": {
       const rows = threads.sortRows((await threads.rows(p)).filter((r) => f.all || threads.isOpen(r.t)));
-      if (f.json) { console.log(JSON.stringify(rows.map((r) => threads.rowJson(p, r)), null, 2)); return; }
+      if (f.json) {
+        const discovery = threads.reconciliation(p);
+        console.log(JSON.stringify(rows.map((r) => threads.rowJson(p, r, discovery)), null, 2)); return;
+      }
       for (const r of rows) console.log(`${r.t.id}\t${threads.GROUPS[r.group].label}\t${r.note}\t${r.t.title}`);
       return;
     }
@@ -189,6 +218,22 @@ async function threadCommand([sub, slug, id], f, root, proj) {
       console.log(threads.rowLine(r));
       console.log(`state: ${threads.stateLine(r.live)}`);
       for (const [k, v] of [["kind", t.kind], ["branch", t.branch], ["cwd", t.cwd], ["agent", t.agent_id], ["created", t.created], ["pr", t.pr && `${t.pr} (${t.pr_state}${t.pr_review ? `, ${t.pr_review}` : ""})`], ["error", t.error], ["report", threads.homeReportPath(p, t.id)]]) if (v) console.log(`${k}: ${v}`);
+      const copies = threads.resourceView(p, t);
+      for (const w of [copies.working_copy, ...copies.working_copies].filter(Boolean)) {
+        console.log(`working copy: ${w.backend} (${w.phase}) ${w.path}\nbaseline: ${w.baseline}\nresource: ${w.nonce}`);
+        if (w.selection) console.log(`working copy fallback (${w.selection.policy}): ${w.selection.reason}`);
+        if (w.seed?.oid) console.log(`dirty seed: ${w.seed.oid}`);
+        if (w.retained_input) console.log(`retained input: ${w.retained_input.path} (${w.retained_input.reason})`);
+        if (w.cache) console.log(`working copy cache: ${w.cache.state}${w.cache.reason ? ` (${w.cache.reason})` : ""}`);
+        if (w.disposal) {
+          console.log(`disposal: ${w.disposal.phase}`);
+          if (w.disposal.evidence) console.log(`disposal evidence: ${w.disposal.evidence.path}`);
+        }
+        for (const blocker of w.blockers) console.log(`working copy blocker: ${blocker}`);
+        for (const action of w.actions) console.log(`working copy action: ${action}`);
+      }
+      for (const w of copies.reconciliation) console.log([`reconciliation: ${w.backend} (${w.phase}) ${w.path}`,
+        ...(w.disposal ? [`disposal: ${w.disposal.phase}`] : []), ...w.blockers, ...w.actions].join("\n"));
       threads.allNext(p, t.id).forEach((l, i) => console.log(`next ${i + 1}: ${l}`));
       return;
     }
@@ -214,7 +259,21 @@ async function threadCommand([sub, slug, id], f, root, proj) {
     }
     case "cleanup": {
       const notes = await threads.cleanupAgain(p, tid(), { dryRun: Boolean(f["dry-run"]) });
-      console.log(`${id}${f["dry-run"] ? " cleanup preview" : " cleaned up"}: ${notes.join("; ") || "nothing to clean"}`);
+      console.log(`${id}${f["dry-run"] ? " cleanup preview" : " cleanup checked"}: ${notes.join("; ") || "nothing to clean"}`);
+      return;
+    }
+    case "delete-checkout": {
+      console.log(await threads.deleteCheckout(p, tid(), f.resource));
+      return;
+    }
+    case "hold": {
+      threads.hold(p, tid(), { resource: f.resource, reason: f.reason, until: f.until, untilResolved: f["until-resolved"], indefinite: f.indefinite });
+      console.log(`${id}: hold recorded`);
+      return;
+    }
+    case "release": {
+      threads.release(p, tid(), f.resource);
+      console.log(`${id}: hold released; cleanup still checks all prerequisites`);
       return;
     }
     case "permissions": {
