@@ -91,8 +91,8 @@ export function placeClaudeSession(id, cwd, base = join(homedir(), ".claude", "p
   if (existsSync(join(from, id))) cpSync(join(from, id), join(to, id), { recursive: true }); // subagent and tool-result files
 }
 
-export function sh(tokens, cwd, stdin, { timeout = 60_000, env } = {}) {
-  const r = spawnSync(tokens[0], tokens.slice(1), { encoding: "utf8", cwd, input: stdin, timeout, stdio: lifecycleStdio(), env: env ? { ...process.env, ...env } : undefined });
+export function sh(tokens, cwd, stdin, { timeout = 60_000, env, maxBuffer } = {}) {
+  const r = spawnSync(tokens[0], tokens.slice(1), { encoding: "utf8", cwd, input: stdin, timeout, maxBuffer, stdio: lifecycleStdio(), env: env ? { ...process.env, ...env } : undefined });
   const out = `${r.stdout ?? ""}${r.stderr ?? ""}`.trim();
   return { ok: r.status === 0, code: r.status, timedOut: r.error?.code === "ETIMEDOUT", stdout: r.stdout ?? "", stderr: r.stderr ?? "", out };
 }

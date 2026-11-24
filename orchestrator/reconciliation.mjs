@@ -6,8 +6,11 @@ import { readInventory } from "./managed-ovnfs.mjs";
 import { adoptedGitIdentity, adoptionBase, commitOid, linkedWorktrees, preserveUnmanagedGit, verifyAdoptionBase } from "./working-copy.mjs";
 
 export const isLegacy = (t) => !t.working_copy && ["worktree", "ovnfs"].includes(t.kind);
-export const branchIdentityBlocker = (t) => t.kind === "worktree" && t.branch && (isLegacy(t) || t.working_copy?.adoption)
-  ? `PP has no recorded branch identity; the branch and its reflog are not eligible for removal; ${preserveUnmanagedGit}` : "";
+export function branchIdentityBlocker(t) {
+  if (t.kind !== "worktree" || !t.branch) return "";
+  if (isLegacy(t) || t.working_copy?.adoption) return `PP has no recorded branch identity; the branch and its reflog are not eligible for removal; ${preserveUnmanagedGit}`;
+  return t.machine ? "SSH branch identity and reflog deletion are not verified" : "";
+}
 const real = (p) => { try { return realpathSync(p); } catch { return p; } };
 
 export function* ownershipRecords(project, visit) {

@@ -2055,25 +2055,189 @@ exec sh -c "$4"
   assert.deepEqual(f.board().working_copy, after.working_copy);
 });
 
-test("managed disposal: fake SSH clean worktree is retained when remote evidence cannot be verified", async (t) => {
+async function sshDisposalFixture(t) {
   const f = await managedFixture(t, "off", true);
-  const bin = join(f.root, "bin"), log = join(f.root, "ssh.log");
-  write(join(bin, "ssh"), `#!/bin/sh
-[ "$1" = -o ] && [ "$2" = BatchMode=yes ] && [ "$3" = fake-host ] || exit 1
-printf '%s\\n' "$4" >> ${JSON.stringify(log)}
-exec sh -c "$4"
-`);
-  chmodSync(join(bin, "ssh"), 0o755);
+  const bin = join(f.root, "bin");
+  mkdirSync(bin, { recursive: true });
+  writeFileSync(join(bin, "ssh"), `#!/usr/bin/env node
+const { spawnSync } = require('node:child_process');
+const { existsSync, readFileSync } = require('node:fs');
+const [o, batch, host, command] = process.argv.slice(2);
+if (o !== '-o' || batch !== 'BatchMode=yes' || host !== 'fake-host') process.exit(1);
+const target = process.env.FAKE_SSH_LOSE_REMOVAL;
+const existed = target && existsSync(target);
+const input = process.env.FAKE_SSH_DROP_REMOVAL ? readFileSync(0) : undefined;
+if (input?.includes('"action":"remove"')) process.exit(255);
+const r = spawnSync('sh', ['-c', command], { input, stdio: [input ? 'pipe' : 'inherit', 'pipe', 'pipe'], maxBuffer: 48 * 1024 * 1024 });
+if (existed && !existsSync(target)) process.exit(255);
+let output = r.stdout || '';
+if (process.env.FAKE_SSH_DAMAGE_BUNDLE && String(output).includes('"bundle":')) {
+  const response = JSON.parse(output);
+  response.bundle = Buffer.from('not a Git bundle').toString('base64');
+  output = JSON.stringify(response);
+}
+process.stdout.write(output);
+process.stderr.write(r.stderr || '');
+process.exitCode = r.status ?? 1;
+`, { mode: 0o755 });
+  writeFileSync(join(bin, "lsof"), `#!/bin/sh
+if [ -n "$FAKE_LSOF_NEW_FILE" ]; then
+  if [ -f "$FAKE_LSOF_MARKER" ]; then
+    mkdir -p "$(dirname "$FAKE_LSOF_NEW_FILE")" && printf 'new data\\n' > "$FAKE_LSOF_NEW_FILE" || exit 1
+  else
+    : > "$FAKE_LSOF_MARKER" || exit 1
+  fi
+fi
+printf 'p1\\000\\nfcwd\\000n%s\\000\\n' "\${FAKE_LSOF_PATH:-/}"
+`, { mode: 0o755 });
+  writeFileSync(join(bin, "mount"), `#!/bin/sh
+printf 'fixture on / (fixture)\\n'
+if [ -n "$FAKE_MOUNT_PATH" ]; then
+  printf 'fixture on %s (fixture)\\n' "$FAKE_MOUNT_PATH"
+fi
+`, { mode: 0o755 });
+  writeFileSync(join(bin, "findmnt"), `#!/bin/sh
+printf '/\\n'
+if [ -n "$FAKE_MOUNT_PATH" ]; then
+  printf '%s\\n' "$FAKE_MOUNT_PATH"
+fi
+`, { mode: 0o755 });
   f.env.PATH = `${bin}:${f.env.PATH}`;
   write(f.env.PP_CONFIG, JSON.stringify({ profiles: { fake: { provider: "claude/fake-model" } }, machines: { remote: { url: f.env.PASEO_URL, ssh: "fake-host" } } }));
   const started = f.start("--machine", "remote");
   assert.ok(started.ok, started.out);
-  const { cwd } = f.show();
-  const r = f.pp("thread", "resolve", "demo", f.id);
+  return f;
+}
+
+test("managed SSH disposal: independently restores preserved commits and binary data before verified removal", async (t) => {
+  const f = await sshDisposalFixture(t);
+  const { cwd, branch, thread_dir: td, working_copy: w } = f.show();
+  git(cwd, "switch", "--detach", "HEAD");
+  git(cwd, "commit", "--allow-empty", "-qm", "detached result");
+  const commit = git(cwd, "rev-parse", "HEAD");
+  git(cwd, "switch", branch);
+  write(join(td, "cleanup.json"), JSON.stringify({ commits: [commit] }));
+  const bytes = Buffer.from([0, 255, 128, 10, 12]);
+  write(join(td, "library", "output.bin"), bytes);
+  const r = f.pp("thread", "resolve", "demo", f.id, "--skip-copy");
   assert.ok(r.ok, r.out);
+  assert.ok(!existsSync(cwd), r.out);
+  assert.ok(!existsSync(w.identity.git_dir), r.out);
+  assert.ok(!git(f.repo, "worktree", "list", "--porcelain").includes(cwd), r.out);
+  assert.equal(f.show().working_copy.phase, "removed");
+  const evidence = f.show().working_copy.disposal.evidence.path;
+  const restored = join(f.root, "restored.git");
+  git(f.root, "clone", "--mirror", join(evidence, "commits.bundle"), restored);
+  assert.equal(git(restored, "rev-parse", `refs/heads/saved/${commit}`), commit);
+  assert.deepEqual(readFileSync(join(evidence, "files", relative(cwd, td), "library", "output.bin")), bytes);
+  assert.equal(git(f.repo, "rev-parse", branch), w.baseline);
+});
+
+test("managed SSH disposal: retains a worktree occupied through a path alias until released", async (t) => {
+  const f = await sshDisposalFixture(t);
+  const { cwd } = f.show();
+  const alias = join(f.root, "checkout-alias");
+  symlinkSync(cwd, alias);
+  f.env.FAKE_LSOF_PATH = alias;
+  const r = f.pp("thread", "resolve", "demo", f.id, "--skip-copy");
+  assert.ok(r.ok, r.out);
+  assert.match(r.out, /SSH worktree occupied by process/);
   assert.ok(existsSync(cwd), r.out);
-  assert.match(r.out, /independent evidence verification for remote worktrees is not supported/);
-  assert.doesNotMatch(readFileSync(log, "utf8"), /worktree remove/);
+  assert.equal(f.show().working_copy.disposal.phase, "retained");
+  delete f.env.FAKE_LSOF_PATH;
+  const retry = f.pp("thread", "cleanup", "demo", f.id);
+  assert.ok(retry.ok, retry.out);
+  assert.ok(!existsSync(cwd), retry.out);
+  assert.equal(f.show().working_copy.disposal.phase, "removed");
+});
+
+test("managed SSH disposal: reconciles a lost removal reply and keeps a merged-review branch", async (t) => {
+  const f = await sshDisposalFixture(t);
+  const { cwd, branch, working_copy: w } = f.show();
+  f.env.FAKE_SSH_LOSE_REMOVAL = cwd;
+  const r = f.pp("thread", "resolve", "demo", f.id, "--skip-copy");
+  assert.ok(r.ok, r.out);
+  assert.match(r.out, /SSH cleanup connection or inspection failed/);
+  assert.equal(f.show().working_copy.disposal.phase, "unknown");
+  assert.ok(!existsSync(cwd));
+  assert.ok(!existsSync(w.identity.git_dir));
+  const record = f.p.path("threads", `${f.id}.json`);
+  write(record, JSON.stringify({ ...JSON.parse(readFileSync(record)), resolved_reason: "reviewed PR merged" }));
+  const retry = f.pp("thread", "cleanup", "demo", f.id);
+  assert.ok(retry.ok, retry.out);
+  assert.equal(f.show().working_copy.disposal.phase, "removed");
+  assert.match(retry.out, /SSH worktree removal verified/);
+  assert.match(retry.out, /branch .* kept: SSH branch identity and reflog deletion are not verified/);
+  assert.equal(git(f.repo, "rev-parse", `refs/heads/${branch}`), w.baseline);
+});
+
+test("managed SSH disposal: does not resend an uncertain removal when the checkout still exists", async (t) => {
+  const f = await sshDisposalFixture(t);
+  const { cwd, working_copy: w } = f.show();
+  f.env.FAKE_SSH_DROP_REMOVAL = "1";
+  const r = f.pp("thread", "resolve", "demo", f.id, "--skip-copy");
+  assert.ok(r.ok, r.out);
+  assert.match(r.out, /SSH cleanup connection or inspection failed/);
+  assert.equal(f.show().working_copy.disposal.phase, "unknown");
+  delete f.env.FAKE_SSH_DROP_REMOVAL;
+  const retry = f.pp("thread", "cleanup", "demo", f.id);
+  assert.ok(retry.ok, retry.out);
+  assert.match(retry.out, /will not send another SSH removal/);
+  assert.ok(existsSync(cwd) && existsSync(w.identity.git_dir), retry.out);
+  assert.equal(f.show().working_copy.disposal.phase, "unknown");
+});
+
+test("managed SSH disposal: retains a dependent, unclassified ignored data, or an unrestorable bundle", async (t) => {
+  const f = await sshDisposalFixture(t);
+  const { cwd, working_copy: w } = f.show();
+  const alias = join(f.root, "dependent-alias");
+  symlinkSync(cwd, alias);
+  const legacy = f.p.path("threads", `${f.legacy}.json`), old = readFileSync(legacy);
+  write(legacy, JSON.stringify({ ...JSON.parse(old), machine: "remote", cwd: join(alias, "not-yet-created") }));
+  const dependent = f.pp("thread", "resolve", "demo", f.id, "--skip-copy");
+  assert.match(dependent.out, /SSH dependency uses this worktree/);
+  write(legacy, old);
+  const unknown = join(cwd, "node_modules", "local-progress");
+  write(unknown, "not disposable\n");
+  const retry = () => f.pp("thread", "cleanup", "demo", f.id);
+  const ignored = retry();
+  assert.match(ignored.out, /unclassified SSH file: node_modules\/local-progress/);
+  assert.equal(readFileSync(unknown, "utf8"), "not disposable\n");
+  rmSync(dirname(unknown), { recursive: true });
+  f.env.FAKE_SSH_DAMAGE_BUNDLE = "1";
+  const bad = retry();
+  assert.match(bad.out, /could not independently restore commits/);
+  assert.ok(existsSync(cwd) && existsSync(w.identity.git_dir), bad.out);
+  assert.equal(f.show().working_copy.disposal.evidence, undefined);
+  delete f.env.FAKE_SSH_DAMAGE_BUNDLE;
+  const good = retry();
+  assert.ok(good.ok, good.out);
+  assert.equal(f.show().working_copy.disposal.phase, "removed");
+});
+
+test("managed SSH disposal: a new ignored file during the last probe blocks removal", async (t) => {
+  const f = await sshDisposalFixture(t);
+  const { cwd } = f.show();
+  const newFile = join(cwd, "node_modules", "new-progress");
+  f.env.FAKE_LSOF_NEW_FILE = newFile;
+  f.env.FAKE_LSOF_MARKER = join(f.root, "lsof-first-probe");
+  const r = f.pp("thread", "resolve", "demo", f.id, "--skip-copy");
+  assert.ok(r.ok, r.out);
+  assert.ok(existsSync(newFile), r.out);
+  assert.equal(readFileSync(newFile, "utf8"), "new data\n");
+  assert.match(r.out, /SSH checkout changed after inspection/);
+  assert.equal(f.show().working_copy.disposal.phase, "retained");
+});
+
+test("managed SSH disposal: retains a path with a mounted filesystem", async (t) => {
+  const f = await sshDisposalFixture(t);
+  const { cwd } = f.show();
+  f.env.FAKE_MOUNT_PATH = join(cwd, "tracked.txt");
+  const r = f.pp("thread", "resolve", "demo", f.id, "--skip-copy");
+  assert.ok(r.ok, r.out);
+  assert.match(r.out, /SSH worktree contains a mount: /);
+  assert.ok(existsSync(cwd), r.out);
+  assert.equal(f.show().working_copy.disposal.phase, "retained");
 });
 
 test("managed worktree: failure before Agent dispatch retains a restartable copy and its changes", async (t) => {

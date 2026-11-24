@@ -36,9 +36,9 @@ const q = (s) => `'${String(s).replace(/'/g, "'\\''")}'`;
 export function host(machineName, config = loadConfig()) {
   const m = machineName ? machineOf(config, machineName) : null;
   if (m && !m.ssh) throw new Error(`machine \`${m.name}\` has no \`ssh\` target in config.json; its files cannot be reached`);
-  const shell = (script, cwd, stdin, timeout) => {
+  const shell = (script, cwd, stdin, timeout, maxBuffer) => {
     const full = cwd ? `cd ${q(cwd)} && ${script}` : script;
-    return m ? sh(["ssh", "-o", "BatchMode=yes", m.ssh, full], undefined, stdin, { timeout }) : sh(["sh", "-c", full], undefined, stdin, { timeout });
+    return m ? sh(["ssh", "-o", "BatchMode=yes", m.ssh, full], undefined, stdin, { timeout, maxBuffer }) : sh(["sh", "-c", full], undefined, stdin, { timeout, maxBuffer });
   };
   return {
     remote: Boolean(m), name: m?.name ?? "", url: m?.url || undefined, ssh: m?.ssh ?? "", shell,

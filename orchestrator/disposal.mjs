@@ -35,14 +35,24 @@ function git(cwd, args, what, env, budget) {
   if (!r.ok || r.stderr) fail(`${what}: ${r.out}`);
   return r.stdout;
 }
-function checkDependencies(project, t, w, budget) {
+function checkDependencies(project, t, w, budget, remote) {
   const targets = w.backend === "ovnfs" ? [w.path, w.identity.git_dir] : [w.path];
   const overlaps = (p) => typeof p === "string" && isAbsolute(p) && targets.some((path) => inside(resolve(p), path) || Boolean(stat(p) && inside(realpathSync(p), path)));
+  const uses = (record, ...paths) => {
+    if (!remote) return record.machine === w.machine && paths.some(overlaps);
+    // Check explicit overlaps locally, but only disclose paths scoped to this machine.
+    if (record.machine !== w.machine) return paths.some((p) => typeof p === "string" && isAbsolute(p) && targets.some((path) => inside(resolve(p), path)));
+    for (const p of paths) if (p) {
+      if (!isAbsolute(p)) fail("dependency path is not absolute");
+      remote.add(p);
+    }
+    return false;
+  };
   try {
     let found = false;
     for (const { dir, t: other } of ownershipRecords(project, budget?.visit)) {
       const file = join(dir, "threads", `${other.id}.json`);
-      if (!other.working_copy && other.machine === w.machine && [other.cwd, other.repo].some(overlaps)) fail(`${other.id} uses this worktree`);
+      if (!other.working_copy && uses(other, other.cwd, other.repo)) fail(`${other.id} uses this worktree`);
       for (const r of [...(other.working_copy ? [other.working_copy] : []), ...(other.working_copies ?? [])]) {
         if (!r || r.owner !== other.id || typeof r.nonce !== "string" || typeof r.machine !== "string") fail(`invalid resource record ${file}`);
         if (dir === project.dir && other.id === t.id && r.nonce === w.nonce) {
@@ -53,10 +63,10 @@ function checkDependencies(project, t, w, budget) {
         if (r.phase === "removed" && r.disposal?.phase === "removed") continue;
         const deps = r.depends_on ?? (r.backend === "git-worktree" ? [] : null);
         if (!Array.isArray(deps) || deps.some((id) => typeof id !== "string")) fail(`unconfirmed dependencies in ${file}`);
-        if (deps.includes(w.nonce) || (r.machine === w.machine && [r.path, r.source].some(overlaps))) fail(`${other.id} resource ${r.nonce} depends on this worktree`);
+        if (deps.includes(w.nonce) || uses(r, r.path, r.source)) fail(`${other.id} resource ${r.nonce} depends on this worktree`);
       }
     }
-    if (!found || overlaps(w.source) || overlaps(project.root)) fail("worktree registration, source or independent evidence location cannot be confirmed");
+    if (!found || (!remote && (overlaps(w.source) || overlaps(project.root)))) fail("worktree registration, source or independent evidence location cannot be confirmed");
   } catch (e) { fail(`dependency inspection failed: ${e.message}`); }
 }
 
@@ -92,19 +102,21 @@ function checkOccupancy(paths, budget) {
   if (!files) fail("occupancy probe returned no file records");
 }
 
+const threadDirectory = (t, w) => [w.thread_dir, t.thread_dir].find((dir) => typeof dir === "string" && dir !== w.path && inside(dir, w.path)) ?? null;
+function previousKeep(project, t, w, budget) {
+  const previous = project.path("threads", `${t.id}.cleanup.json`);
+  const saved = t.working_copy?.nonce === w.nonce && stat(previous);
+  if (saved && (!saved.isFile() || realpathSync(previous) !== previous)) fail("unsafe previous cleanup record");
+  if (saved) budget?.visit(saved.size);
+  const recorded = saved ? JSON.parse(readFileSync(previous, "utf8")).declaration : null;
+  if (recorded?.error || (recorded?.keep != null && !Array.isArray(recorded.keep))) fail("previous path keeps could not be confirmed");
+  return w.disposal?.path_keep || Boolean(recorded?.keep?.length);
+}
 function declaration(project, t, w, budget) {
-  const td = [w.thread_dir, t.thread_dir].find((dir) => typeof dir === "string" && dir !== w.path && inside(dir, w.path)) ?? null;
+  const td = threadDirectory(t, w);
   const decl = td ? join(td, "cleanup.json") : null;
   const st = decl && stat(decl);
-  if (!st) {
-    const previous = project.path("threads", `${t.id}.cleanup.json`);
-    const saved = t.working_copy?.nonce === w.nonce && stat(previous);
-    if (saved && (!saved.isFile() || realpathSync(previous) !== previous)) fail("unsafe previous cleanup record");
-    if (saved) budget?.visit(saved.size);
-    const recorded = saved ? JSON.parse(readFileSync(previous, "utf8")).declaration : null;
-    if (recorded?.error || (recorded?.keep != null && !Array.isArray(recorded.keep))) fail("previous path keeps could not be confirmed");
-    return { td, decl, d: {}, keep: w.disposal?.path_keep || Boolean(recorded?.keep?.length) };
-  }
+  if (!st) return { td, decl, d: {}, keep: previousKeep(project, t, w, budget) };
   if (!st.isFile() || realpathSync(decl) !== decl) fail("unsafe cleanup.json path");
   budget?.visit(st.size);
   const d = JSON.parse(readFileSync(decl, "utf8"));
@@ -327,7 +339,7 @@ function flush(path, recursive = false) {
 function verifyBundle(w, root, bundle, manifest) {
   const stage = mkdtempSync(join(root, ".restore-"));
   try {
-    const run = (cwd, args, what) => git(cwd, args, what, w.backend === "ovnfs" ? ovnfsGitEnv : undefined);
+    const run = (cwd, args, what) => git(cwd, args, what, w.backend === "ovnfs" || w.machine ? ovnfsGitEnv : undefined);
     const restored = join(stage, "verify.git");
     run(stage, ["clone", "--quiet", "--mirror", "--", bundle, restored], "could not independently restore commits");
     if (run(restored, ["rev-parse", "HEAD^{commit}"], "could not verify restored HEAD").trim() !== manifest.head) fail("restored commit does not match worktree HEAD");
@@ -337,12 +349,15 @@ function verifyBundle(w, root, bundle, manifest) {
   } finally { rmSync(stage, { recursive: true, force: true }); }
 }
 
-function evidence(project, w, manifest, previous) {
+function evidence(project, w, manifest, previous, transfer) {
   const base = evidencePath(project, w), root = dirname(base);
   const hash = sha256(JSON.stringify(manifest));
   if (previous) {
     storedManifest(previous, base, w.nonce);
-    if (previous.manifest === hash) return previous;
+    if (previous.manifest === hash) {
+      if (transfer) verifyBundle(w, root, join(previous.path, "commits.bundle"), manifest);
+      return previous;
+    }
   }
   // Never replace a published generation, including proof from an earlier failed attempt.
   const generation = `${base}-${hash}`;
@@ -365,17 +380,21 @@ function evidence(project, w, manifest, previous) {
   const stage = mkdtempSync(join(root, ".verify-"));
   try {
     const bundle = join(stage, "commits.bundle");
-    const source = join(stage, "source.git");
-    const run = (cwd, args, what) => git(cwd, args, what, w.backend === "ovnfs" ? ovnfsGitEnv : undefined);
-    run(stage, ["init", "--quiet", "--bare", "--initial-branch=main", `--object-format=${manifest.head.length === 64 ? "sha256" : "sha1"}`, source], "could not prepare bundle");
-    run(source, ["fetch", "--quiet", "--no-tags", "--", w.path, "HEAD:refs/heads/main", ...manifest.commits.map((c) => `${c}:refs/heads/saved/${c}`)], "could not save commits");
-    run(source, ["bundle", "create", bundle, "HEAD", "--all"], "could not create commit bundle");
-    rmSync(source, { recursive: true });
+    if (transfer) writeFileSync(bundle, decodeRemoteBytes(transfer.bundle), { flag: "wx", mode: 0o600 });
+    else {
+      const source = join(stage, "source.git");
+      const run = (cwd, args, what) => git(cwd, args, what, w.backend === "ovnfs" ? ovnfsGitEnv : undefined);
+      run(stage, ["init", "--quiet", "--bare", "--initial-branch=main", `--object-format=${manifest.head.length === 64 ? "sha256" : "sha1"}`, source], "could not prepare bundle");
+      run(source, ["fetch", "--quiet", "--no-tags", "--", w.path, "HEAD:refs/heads/main", ...manifest.commits.map((c) => `${c}:refs/heads/saved/${c}`)], "could not save commits");
+      run(source, ["bundle", "create", bundle, "HEAD", "--all"], "could not create commit bundle");
+      rmSync(source, { recursive: true });
+    }
     verifyBundle(w, root, bundle, manifest);
     for (const rel of Object.keys(manifest.files)) {
       const dst = join(stage, "files", rel);
       mkdirSync(dirname(dst), { recursive: true, mode: 0o700 });
-      copyFileSync(join(w.path, rel), dst, constants.COPYFILE_EXCL);
+      if (transfer) writeFileSync(dst, decodeRemoteBytes(Object.hasOwn(transfer.data, rel) && transfer.data[rel]), { flag: "wx", mode: 0o600 });
+      else copyFileSync(join(w.path, rel), dst, constants.COPYFILE_EXCL);
     }
     const text = JSON.stringify(manifest);
     writeFileSync(join(stage, "manifest.json"), text, { flag: "wx", mode: 0o600 });
@@ -459,6 +478,42 @@ export function deleteOvnfsCheckout(project, t, h, w, save) {
   }
 }
 
+function decodeRemoteBytes(value) {
+  if (typeof value !== "string") fail("missing SSH evidence bytes");
+  const bytes = Buffer.from(value, "base64");
+  if (bytes.toString("base64") !== value) fail("invalid SSH evidence bytes");
+  return bytes;
+}
+
+function remoteManifest(w, manifest) {
+  const digest = /^[a-f0-9]{64}$/;
+  if (!manifest || manifest.nonce !== w.nonce || !/^\d+:\d+$/.test(manifest.repository) || !oid.test(manifest.head) ||
+      !Array.isArray(manifest.commits) || manifest.commits.some((c) => typeof c !== "string" || !oid.test(c) || c.length !== manifest.head.length) ||
+      !manifest.files || typeof manifest.files !== "object" || Array.isArray(manifest.files)) fail("malformed SSH evidence manifest");
+  const files = Object.entries(manifest.files);
+  if (files.length > 10_000 || files.some(([p, hash]) => !digest.test(hash) || /[\x00-\x1f\x7f\\]/.test(p) || p.split("/").some((part) => !part || [".", "..", ".git"].includes(part))) ||
+      JSON.stringify(manifest.ignored) !== JSON.stringify(files.map(([p]) => p))) fail("malformed SSH evidence file list");
+  return manifest;
+}
+
+function remoteDisposal(project, t, h, w, action, expected) {
+  const dependencies = new Set();
+  if (action !== "status") checkDependencies(project, t, w, undefined, dependencies);
+  const { path, source, identity, nonce, baseline, branch } = w;
+  const data = JSON.stringify({ w: { path, source, identity, nonce, baseline, branch }, action, expected, dependencies: [...dependencies],
+    td: threadDirectory(t, w), pathKeep: action !== "status" && previousKeep(project, t, w) });
+  if (Buffer.byteLength(data) >= 1024 * 1024) fail("SSH cleanup request exceeded its budget");
+  const program = readFileSync(new URL("./remote-disposal.cjs", import.meta.url), "utf8");
+  const r = h.shell(`NODE_OPTIONS= NODE_PATH= node -e '${program.replace(/'/g, "'\\''")}'`, undefined, data, 60_000, 48 * 1024 * 1024);
+  if (!r.ok || r.stderr) fail(`SSH cleanup connection or inspection failed${r.timedOut ? " (timeout)" : ""}${r.stderr ? `: ${r.stderr.trim().slice(0, 512)}` : ""}`);
+  let response;
+  try { response = JSON.parse(r.stdout); }
+  catch { fail("invalid SSH cleanup response"); }
+  if (!response || typeof response !== "object" || Array.isArray(response)) fail("invalid SSH cleanup response");
+  if (typeof response.error === "string") fail(response.error.slice(0, 4096));
+  return response;
+}
+
 export function dispose(project, t, h, w, options) {
   if (w.backend === "ovnfs") return retainOvnfs(project, t, h, w, options);
   const { keepWorktree, agentArchived, dryRun, save, holdBlocker } = options;
@@ -480,11 +535,48 @@ export function dispose(project, t, h, w, options) {
   };
   try {
     if (!agentArchived) fail("agent archive unconfirmed");
-    if (h.remote || w.machine !== t.machine) fail("independent evidence verification for remote worktrees is not supported");
+    if (w.machine !== t.machine || h.remote !== Boolean(w.machine)) fail("working-copy machine could not be confirmed");
     if (w.owner !== t.id || w.backend !== "git-worktree" || !w.identity || !/^[a-f0-9-]{36}$/.test(w.nonce)) fail("unsupported or unconfirmed resource identity");
     if (!proof && (phase === "unknown" || w.disposal?.phase === "archived")) {
       phase = "unknown";
       fail("previous disposal has no verified evidence");
+    }
+    if (h.remote) {
+      if (w.adoption) fail("historical SSH worktree provenance cannot be verified");
+      if (phase === "unknown") {
+        const manifest = remoteManifest(w, storedManifest(proof, evidencePath(project, w), w.nonce));
+        const status = remoteDisposal(project, t, h, w, "status", manifest);
+        if (status.gone === true) {
+          if (hold) return retained("");
+          verifyBundle(w, dirname(proof.path), join(proof.path, "commits.bundle"), manifest);
+          if (!dryRun && w.disposal.phase !== "removed") save({ phase: "removed", blocker: "", evidence: proof });
+          return { gone: true, note: `SSH worktree removal verified: ${path}` };
+        }
+        if (status.gone !== false) fail("SSH backend removal could not be verified");
+        fail("previous removal is unconfirmed; will not send another SSH removal without a fenced attempt result");
+      }
+      if (w.phase !== "ready") fail("SSH worktree is not ready for cleanup");
+      const transfer = remoteDisposal(project, t, h, w, dryRun || hold ? "inspect" : "capture");
+      pathKeep = transfer.pathKeep === true;
+      if (pathKeep) fail("explicit path keep applies to this SSH worktree");
+      const manifest = remoteManifest(w, transfer.manifest);
+      if (hold) return retained("");
+      if (dryRun) return { gone: false, note: `SSH worktree would be archived and removed if evidence verifies: ${path}` };
+      if (!transfer.data || typeof transfer.data !== "object" || typeof transfer.bundle !== "string") fail("missing SSH evidence transfer");
+      proof = evidence(project, w, manifest, proof, transfer);
+      verifyEvidence(proof, proof.path, manifest, { durable: true });
+      save({ phase: "archived", blocker: "", evidence: proof });
+      save({ phase: "removing", blocker: "", evidence: proof });
+      phase = "unknown";
+      const result = remoteDisposal(project, t, h, w, "remove", manifest);
+      pathKeep = result.pathKeep === true;
+      if (pathKeep || typeof result.blocked === "string") {
+        phase = "retained";
+        fail(pathKeep ? "explicit path keep applies to this SSH worktree" : result.blocked.slice(0, 4096));
+      }
+      if (result.gone !== true) fail("SSH backend removal could not be verified");
+      save({ phase: "removed", blocker: "", evidence: proof });
+      return { gone: true, note: `SSH worktree removed: ${path}` };
     }
     if (phase === "unknown" && !stat(path)) {
       const manifest = storedManifest(proof, evidencePath(project, w), w.nonce);
