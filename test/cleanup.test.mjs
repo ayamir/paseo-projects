@@ -14,7 +14,8 @@ import { createHash, randomUUID } from "node:crypto";
 const TMP = realpathSync(tmpdir());
 const BASE = mkdtempSync(join(TMP, "pp-cleanup-"));
 process.env.PP_CONFIG = join(BASE, "config.json");
-const { create, writeSettings } = await import("../orchestrator/project.mjs");
+const { Project, create, writeSettings } = await import("../orchestrator/project.mjs");
+const inbox = await import("../orchestrator/inbox.mjs");
 const PP = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "pp.mjs");
 
 const FAKE_CBM = join(BASE, "fake-cbm.mjs");
@@ -1477,6 +1478,29 @@ async function managedFixture(t, mode = "off", withProject = false) {
   return { ...f, id, start, show: (tid = id) => query("thread", "show", "demo", tid, "--json"),
     board: (tid = id) => query("board", "thread", "demo", tid), legacy: f.id };
 }
+
+test("resolve from the coordinator directory retains inbox history but only nudges for cleanup problems", async (t) => {
+  const f = await managedFixture(t);
+  const resolveFrom = (cwd, id) => {
+    const r = spawnSync(process.execPath, [PP, "--root", f.root, "thread", "resolve", "demo", id], { cwd, env: f.env, encoding: "utf8", timeout: 45_000 });
+    assert.equal(r.status, 0, `${r.stdout}${r.stderr}${r.error ?? ""}`);
+  };
+  const ids = [f.id, `t-${Number(f.id.slice(2)) + 1}`, `t-${Number(f.id.slice(2)) + 2}`];
+  for (const id of ids) {
+    const started = f.start();
+    assert.ok(started.ok, started.out);
+    if (id === ids[1]) write(join(f.board(id).cwd, "unclassified.txt"), "must be kept\n");
+    resolveFrom(id === ids[2] ? f.root : f.p.dir, id);
+  }
+  const resolved = (items) => items.filter((i) => i.event === "resolved");
+  const history = resolved(inbox.unhandled(f.p));
+  assert.deepEqual(history.map((i) => i.subject), ids);
+  assert.equal(history[0].silent, true);
+  assert.match(history[1].summary, /unclassified.txt/);
+  const pending = resolved(inbox.pendingNudges(f.p));
+  assert.deepEqual(pending.map((i) => i.subject), ids.slice(1));
+  assert.ok(!inbox.nudgeText(pending).includes(ids[0]));
+});
 
 test("managed preflight: Git stays default, policy fallback is visible, and actual Git allocations respect the budget", async (t) => {
   const f = await managedFixture(t);
@@ -3272,6 +3296,7 @@ test("CLI and ticker: follow reviewed PRs and resolve only the merged, finished 
   assert.equal(ownResolved.resolved_reason, "merged");
   assert.equal(existsSync(both.row.cwd), false);
   assert.equal(git(repo, "branch", "--list", both.row.branch), "");
+  assert.ok(inbox.pendingNudges(new Project(root, "demo")).some((i) => i.subject === ownResolved.id && i.event === "resolved"));
   const digest = context();
   assert.ok(digest.includes(`${ownUrl} merged`));
   for (const { kind, url, row } of cases.filter(({ kind }) => kind !== "both")) {

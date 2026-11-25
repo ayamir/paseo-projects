@@ -369,8 +369,7 @@ async function runRoutines(project, state) {
 
 /** One `[pp inbox]` line per new set of unseen items, to an idle coordinator. */
 async function nudge(project, settings, state) {
-  const seen = inbox.seen(project);
-  const fresh = inbox.unhandled(project).filter((i) => !seen.has(i.id));
+  const fresh = inbox.pendingNudges(project);
   if (!fresh.length) { delete state.nudge_hash; return; }
   const h = inbox.hashIds(fresh.map((i) => i.id));
   if (h === state.nudge_hash) return;

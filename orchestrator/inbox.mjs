@@ -22,7 +22,7 @@ export function safeSubject(subject) {
  * under the project lock. `event` is a fixed phrase from this program (nudges
  * are built from it, never from the summary); `body` is for routine items.
  */
-export function write(project, kind, subject, event, summary, body = "", key = "") {
+export function write(project, kind, subject, event, summary, body = "", key = "", { silent = false } = {}) {
   return project.lock(() => {
     const suffix = `-${kind}-${safeSubject(subject)}${key ? `-${sha256(key)}` : ""}`;
     if (key) {
@@ -40,6 +40,7 @@ export function write(project, kind, subject, event, summary, body = "", key = "
     const front = [
       tomlLine("id", id), tomlLine("kind", kind), tomlLine("subject", subject), tomlLine("created", now()),
       tomlLine("summary", String(summary).replace(/[\u0000-\u001f\u007f]/g, " ")), tomlLine("event", event),
+      ...(silent ? [tomlLine("silent", true)] : []),
     ].join("\n");
     writeAtomic(join(dir(project), `${id}.md`), `+++\n${front}\n+++\n${body ? `\n${body.trimEnd()}\n` : ""}`, Boolean(key));
     return id;
@@ -54,6 +55,12 @@ export function unhandled(project) {
 }
 
 export const seen = (project) => new Set(readJson(project.path(".state", "inbox-seen.json"), []) ?? []);
+
+/** Silent items stay in the inbox but never trigger or appear in a nudge. */
+export function pendingNudges(project) {
+  const read = seen(project);
+  return unhandled(project).filter((i) => i.silent !== true && !read.has(i.id));
+}
 
 /** Records that `context` showed these items, so each is nudged once. */
 export function markSeen(project, ids) {

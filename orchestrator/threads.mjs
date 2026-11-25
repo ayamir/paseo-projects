@@ -1078,9 +1078,9 @@ async function archiveWorkspace(url, id) {
     const c = await client(url);
     const { archivedAt, error } = await c.workspaces.archive(id);
     if (error || !archivedAt) throw new Error(error ?? "Paseo did not confirm the archive");
-    return "Paseo workspace archived";
+    return { ok: true, note: "Paseo workspace archived" };
   } catch (e) {
-    return `Paseo workspace not archived: ${e.message}`;
+    return { ok: false, note: `Paseo workspace not archived: ${e.message}` };
   }
 }
 
@@ -1301,20 +1301,26 @@ const unconfirmedAllocation = (w) => w && !w.identity && ["planned", "creating"]
 const allocationBlocker = "working-copy allocation is unconfirmed; retained without copying or deleting";
 
 async function clean(project, t, { keepWorktree = false, copyComplete = true, archive, mergedHead = "", dryRun = false, scheduled = false } = {}) {
-  if (unconfirmedAllocation(t.working_copy)) return [allocationBlocker];
+  if (unconfirmedAllocation(t.working_copy)) return { notes: [allocationBlocker], needsAttention: true };
   const notes = [];
+  let needsAttention = false;
+  const archiveSpace = async (url) => {
+    const status = await archiveWorkspace(url, t.workspace_id);
+    notes.push(status.note);
+    if (!status.ok) needsAttention = true;
+  };
   let h;
   try { h = host(t.machine); }
-  catch (e) { return [e.message]; }
+  catch (e) { return { notes: [e.message], needsAttention: true }; }
   let legacyGit;
   if (isLegacy(t) && t.kind === "worktree") {
     legacyGit = () => verifyLegacyGit(project, t);
     try { legacyGit(); }
-    catch { return (await cleanup.run(project, t, h, { archive, dryRun, legacyGit })).notes; }
+    catch { return { notes: (await cleanup.run(project, t, h, { archive, dryRun, legacyGit })).notes, needsAttention: true }; }
   }
   if (isLegacy(t) && t.kind === "ovnfs" && t.cwd) {
     try { ovnfs.mounted(t); }
-    catch { return (await cleanup.run(project, t, h, { archive, dryRun })).notes; }
+    catch { return { notes: (await cleanup.run(project, t, h, { archive, dryRun })).notes, needsAttention: true }; }
   }
   const managed = Boolean(t.working_copy);
   const readOnlyOvnfs = managed && t.kind === "ovnfs" && scheduled;
@@ -1337,10 +1343,11 @@ async function clean(project, t, { keepWorktree = false, copyComplete = true, ar
       if (!readOnlyOvnfs) notes.push("agent archived");
     } catch (e) {
       notes.push(`agent not archived: ${e.message}`);
+      needsAttention = true;
     }
   }
   // Only a tab's workspace can be archived while keeping its checkout.
-  if (t.kind === "tab" && t.workspace_id && !dryRun) notes.push(await archiveWorkspace(h.url, t.workspace_id));
+  if (t.kind === "tab" && t.workspace_id && !dryRun) await archiveSpace(h.url);
   // Paseo's merge auto-archive removes a workspace's worktree whatever pp keeps, so a kept one says so (or that it is unknown).
   const paseoAutoArchive = t.kind === "worktree" && t.workspace_id ? await autoArchiveAfterMerge(h.url) : { on: false };
   const refreshArchive = t.kind === "ovnfs" ? () => finalCopy(project, t) : undefined;
@@ -1365,29 +1372,34 @@ async function clean(project, t, { keepWorktree = false, copyComplete = true, ar
             if (w.backend !== "ovnfs" && reason && reason !== hold) cleanupException(project, t, w, reason);
             if (w.backend !== "ovnfs" && hold.includes("hold is unknown;")) cleanupException(project, t, w, hold);
           }
-          return result;
+          return { ...result, needsAttention: result.needsAttention || (!result.gone && hold.includes("hold is unknown;")) };
         } catch (e) {
           if (!dryRun && w.backend !== "ovnfs") cleanupException(project, t, w, e.message);
-          return { gone: false, note: `resource cleanup failed: ${e.message}` };
+          return { gone: false, needsAttention: true, note: `resource cleanup failed: ${e.message}` };
         }
       });
       done = { notes: results.map((r) => r.note), worktreeGone: results.every((r) => r.gone) };
+      if (results.some((r) => r.needsAttention)) needsAttention = true;
       if (!done.worktreeGone && t.workspace_id && paseoAutoArchive.on !== false) {
         done.notes.push(paseoAutoArchive.on ? "Paseo merge auto-archive is on and can remove the worktree" : "Paseo merge auto-archive is unknown");
+        needsAttention = true;
       }
-    } else done = await cleanup.run(project, t, h, { keepWorktree, copyComplete, archive, refreshArchive, agentArchived, dryRun, paseoAutoArchive, legacyGit });
+    } else {
+      done = await cleanup.run(project, t, h, { keepWorktree, copyComplete, archive, refreshArchive, agentArchived, dryRun, paseoAutoArchive, legacyGit });
+      if (done.items.some((i) => ["failed", "blocked", "kept"].includes(i.status))) needsAttention = true;
+    }
   }
-  catch (e) { return [...notes, `cleanup failed: ${e.message}; \`thread cleanup ${project.slug} ${t.id}\` retries`]; }
+  catch (e) { return { notes: [...notes, `cleanup failed: ${e.message}; \`thread cleanup ${project.slug} ${t.id}\` retries`], needsAttention: true }; }
   notes.push(...done.notes);
   const branchBlocker = branchIdentityBlocker(t);
   if (branchBlocker && (mergedHead || t.resolved_reason === "reviewed PR merged")) notes.push(`branch ${t.branch} kept: ${branchBlocker}`);
-  if (dryRun || t.kind !== "worktree") return notes;
+  if (dryRun || t.kind !== "worktree") return { notes, needsAttention };
   if (!done.worktreeGone) {
     if (t.workspace_id) notes.push("Paseo workspace kept: archiving it could delete the worktree");
-    return notes;
+    return { notes, needsAttention };
   }
-  if (t.workspace_id) notes.push(await archiveWorkspace(h.url, t.workspace_id));
-  if (branchBlocker) return notes;
+  if (t.workspace_id) await archiveSpace(h.url);
+  if (branchBlocker) return { notes, needsAttention };
   if (mergedHead && t.branch) {
     const tip = h.shell(`git rev-parse --verify -q ${q(`refs/heads/${t.branch}`)}`, t.repo);
     if (!tip.ok) notes.push("no local branch left");
@@ -1396,7 +1408,7 @@ async function clean(project, t, { keepWorktree = false, copyComplete = true, ar
   } else if (t.resolved_reason === "reviewed PR merged" && t.branch) {
     notes.push(cleanReviewBranch(h, t));
   }
-  return notes;
+  return { notes, needsAttention };
 }
 
 function cleanReviewBranch(h, t) {
@@ -1427,7 +1439,7 @@ export async function resolve(project, id, options) {
   return withLifecycleLock(project, () => resolveLocked(project, id, options));
 }
 
-async function resolveLocked(project, id, { keepWorktree = false, force = false, skipCopy = false, reason = "user", mergedHead = "", why } = {}) {
+async function resolveLocked(project, id, { keepWorktree = false, force = false, skipCopy = false, reason = "user", mergedHead = "", why, fromCoordinator = false } = {}) {
   let t = load(project, id);
   if (t.status === "resolved") throw new Error(`${id} is already resolved; \`thread cleanup ${project.slug} ${id}\` cleans what is left of it`);
   const resolveWithoutCheckout = unconfirmedAllocation(t.working_copy) && reason === "user" && skipCopy;
@@ -1449,9 +1461,12 @@ async function resolveLocked(project, id, { keepWorktree = false, force = false,
     if (copied.hash) r.report_hash = copied.hash;
     if (resolveWithoutCheckout) r.working_copy.disposal = { phase: "retained", blocker: allocationBlocker };
   });
-  const notes = resolveWithoutCheckout ? [allocationBlocker] : retainLegacy ? ["legacy resource retained pending confirmation; background resolution does not clean it"] :
-    [...copied.notes, ...(await clean(project, resolved, { keepWorktree: keepWorktree || (isLegacy(resolved) && legacyHold(resolved)), copyComplete: copied.outcome === "complete" || force, archive: skipCopy ? { outcome: "skipped" } : copied, mergedHead }))];
-  inbox.write(project, "thread-state", id, "resolved", `${id} "${t.title}" ${why ?? "was resolved"}: ${notes.join("; ")}`);
+  const cleaned = resolveWithoutCheckout ? { notes: [allocationBlocker], needsAttention: true }
+    : retainLegacy ? { notes: ["legacy resource retained pending confirmation; background resolution does not clean it"], needsAttention: true }
+    : await clean(project, resolved, { keepWorktree: keepWorktree || (isLegacy(resolved) && legacyHold(resolved)), copyComplete: copied.outcome === "complete" || force, archive: skipCopy ? { outcome: "skipped" } : copied, mergedHead });
+  const notes = [...copied.notes, ...cleaned.notes];
+  const silent = fromCoordinator && reason === "user" && !skipCopy && copied.outcome === "complete" && !cleaned.needsAttention;
+  inbox.write(project, "thread-state", id, "resolved", `${id} "${t.title}" ${why ?? "was resolved"}: ${notes.join("; ")}`, "", "", { silent });
   return notes;
 }
 
@@ -1491,7 +1506,8 @@ async function cleanupLocked(project, id, { dryRun = false, scheduled = false } 
     notes.push(...copied.notes, ...(copied.error ? [`the copy home failed: ${copied.error}`] : []));
   } else if (dryRun) notes.push("preview: assumes the final copy completes");
   const mergedHead = t.kind === "ovnfs" && t.resolved_reason === "merged" && t.pr_summary?.state === "MERGED" ? t.pr_summary.head_oid : "";
-  return [...notes, ...(await clean(project, t, { keepWorktree: t.status === "resolved" && legacyHold(t), copyComplete: !copied || copied.outcome === "complete", archive: copied, mergedHead, dryRun, scheduled }))];
+  const cleaned = await clean(project, t, { keepWorktree: t.status === "resolved" && legacyHold(t), copyComplete: !copied || copied.outcome === "complete", archive: copied, mergedHead, dryRun, scheduled });
+  return [...notes, ...cleaned.notes];
 }
 
 export function reopen(project, id) {

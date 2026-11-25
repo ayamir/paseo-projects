@@ -267,7 +267,9 @@ async function threadCommand([sub, slug, id], f, root, proj) {
     }
     case "resolve": {
       if (f.reopen) { threads.reopen(p, tid()); console.log(`${id} is open again; \`thread restart\` gives it an agent`); return; }
-      const notes = await threads.resolve(p, tid(), { keepWorktree: Boolean(f["keep-worktree"]), skipCopy: Boolean(f["skip-copy"]), force: Boolean(f.force) });
+      // The coordinator works from the project home; this is a notification hint, not authorization.
+      const fromCoordinator = canonical(process.cwd()) === canonical(p.dir);
+      const notes = await threads.resolve(p, tid(), { keepWorktree: Boolean(f["keep-worktree"]), skipCopy: Boolean(f["skip-copy"]), force: Boolean(f.force), fromCoordinator });
       console.log(`${id} resolved: ${notes.join("; ") || "nothing to clean"}`);
       return;
     }

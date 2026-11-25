@@ -39,6 +39,8 @@ Say what you want once. The coordinator proposes threads and waits for your go-a
 
 Agents report their own progress, so a thread that asked you something shows `needs you` even when it looks idle. A background ticker copies reports home, writes inbox items when a thread changes state, follows pull requests (failing checks and review comments go back to the thread; `pr_checks = false` ignores CI results), resolves a thread when its pull request is merged, runs routines, and nudges the coordinator when its inbox has something new.
 
+A successful `pp thread resolve` from the PP project directory keeps its inbox record without nudging the coordinator again. Automatic resolutions and cleanup problems can still nudge it.
+
 For a review thread, pass `--reviews <GitHub PR URL>` to `pp thread start` or add `Reviewed-PR: <URL>` in the first paragraph of its report. The flag takes precedence. The ticker reads the reviewed PR's state independently of the thread's own PR. It resolves a finished review after merge and writes one inbox reminder if the PR closes without merging. Cleanup removes an empty review branch once its worktree is safely gone and the branch still points to the commit recorded at creation. Branches with their own commits or an unknown starting point are kept, as are worktrees explicitly marked for retention.
 
 ### 🔁 Pick up where an agent left off

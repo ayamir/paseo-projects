@@ -443,7 +443,7 @@ function retainOvnfs(project, t, h, w, { keepWorktree, holdBlocker, agentArchive
   if (hold) Object.assign(next, { hold_blocker: hold, check_blocker: check });
   if (!dryRun && !uncertain && JSON.stringify(next) !== JSON.stringify(disposal)) save(next);
   const detail = [...new Set([hold, check, reason].filter(Boolean))].join("; ");
-  return { gone: false, note: `OVNFS ${resource} kept: ${w.path || w.identity?.id || w.nonce}: ${detail}` };
+  return { gone: false, needsAttention: uncertain || check !== reason, note: `OVNFS ${resource} kept: ${w.path || w.identity?.id || w.nonce}: ${detail}` };
 }
 
 // Called only by the explicit command under the PP lifecycle lock, never by dispose().
@@ -534,7 +534,7 @@ export function dispose(project, t, h, w, options) {
     const blocker = hold || check;
     const detail = [...new Set([hold, check].filter(Boolean))].join("; ");
     if (!dryRun) save({ phase, blocker, ...(hold ? { hold_blocker: hold, check_blocker: check } : {}), ...(pathKeep ? { path_keep: true } : {}), ...(proof ? { evidence: proof } : {}) });
-    return { gone: false, note: `worktree kept: ${path}: ${detail}; thread cleanup retries` };
+    return { gone: false, needsAttention: Boolean(check), note: `worktree kept: ${path}: ${detail}; thread cleanup retries` };
   };
   const withoutHold = () => {
     const d = declaration(project, t, w);
